@@ -39,9 +39,17 @@ curl -sS "https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${OFFSET}&ti
 
 For each new message: parse what Sir wants.
 
-Sir's command vocabulary (case-insensitive):
-- `y`, `Y`, `👍` (in reply to a decomposition message) → **dispatch the gated issue**
-- `n`, `N`, `👎` → mark the gate as skipped; don't dispatch
+Sir's command vocabulary (case-insensitive). **`y`/`n` mean "do/don't do the
+action that gate proposed"** — which is NOT always "dispatch". Read the gate's
+`triage` field:
+- For a `skip` gate, the proposed action is *close the issue*, so `y #N` → close it.
+- For a `scoped-feature`/`epic`/`trivial-fix`/`research` gate, the proposed
+  action is *dispatch*, so `y #N` → dispatch.
+- Always phrase the gate's Telegram message to match (e.g. "Reply `y #N` to
+  close it" for skip gates, "Reply `y #N` to dispatch" for work gates).
+
+- `y`, `Y`, `👍` → **do the gate's proposed action** (dispatch, or close-if-skip). Mark the gate terminal.
+- `n`, `N`, `👎` → **don't** do it; for work gates mark `skipped`, for skip gates leave the issue open and mark the gate `closed`.
 - `?<question>` → respond with the answer; leave the gate open
 - `status` or `status #N` → report current state
 - `merge #N` → run `gh pr merge N --squash` (subject to the smoke-evidence hook)
@@ -59,7 +67,30 @@ SINCE=$(cat ~/.alfred-code-state/last-issue-poll 2>/dev/null || date -u -v-1H +%
 gh issue list --state open --limit 30 --search "created:>$SINCE" --json number,title,body,labels,createdAt
 ```
 
-For each new issue: 
+**MANDATORY dedup guard — this is what stops the every-5-min spam.** Before
+triaging or posting ANYTHING, load the state files and compute the set of
+issue numbers already handled:
+
+```bash
+cat ~/.alfred-code-state/pending-gates.json 2>/dev/null | jq -r '.[] | select(.status != "closed" and .status != "skipped") | .issue'
+cat ~/.alfred-code-state/dispatched.json    2>/dev/null | jq -r '.[].issue // empty'
+```
+
+For each candidate issue, **SKIP it entirely** (no triage, no Telegram post,
+no gate write) if **either**:
+- a gate already exists for that issue in `pending-gates.json` with a
+  non-terminal status (`awaiting | approved | dispatching | dispatched`), or
+- the issue already appears in `dispatched.json`.
+
+The timestamp filter is only a coarse pre-filter. **The gate-existence check
+is the authoritative dedup** — never rely on `last-issue-poll` alone, because
+GitHub search time-rounding plus the stateless-per-run nature of this command
+mean the same issue resurfaces across runs. The state files are the source of
+truth, and you MUST persist the new gate to `pending-gates.json` in the SAME
+run you post it (write the file *before* you exit, even if the Telegram send
+is the last thing you do).
+
+For each genuinely-new issue (no live gate, not dispatched): 
 
 - **Triage** by reading the body. Categories:
   - `trivial-fix` — one-liner, no decomposition needed, dispatch single Lane I/II/III agent
