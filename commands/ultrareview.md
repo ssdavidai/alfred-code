@@ -53,6 +53,11 @@ Synthesize a single recommendation. Three buckets:
 - **HOLD** — at least one reviewer flagged something fixable. Post a PR comment summarising what needs to change, do not merge.
 - **REJECT** — fundamental contract break or smoke theater. Post a PR comment explaining, recommend the lane be re-dispatched.
 
+### Post the verdict in BOTH places (always)
+
+1. **On the PR** (`gh pr comment $1`) — the per-PR verdict (contract/smoke/code + the one most important thing).
+2. **On the parent issue** — Sir tracks the *feature* on the issue, not the PRs. Derive the parent issue number from the PR body (look for `Closes #N` / `#N`), then `gh issue comment <N>` with a consolidated table row for this PR's verdict + the cross-PR merge order + any post-merge live-test gate. If a consolidated comment for this issue already exists this run, append to your synthesis rather than duplicating. This is mandatory — a review that only lands on the PR is invisible to the issue's reader.
+
 Use `AskUserQuestion` to surface the recommendation to Sir as a Y/N gate before any merge:
 ```
 "PR #$1 review complete: SHIP / HOLD / REJECT (<one-line reason>). Proceed?"
