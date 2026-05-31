@@ -27,6 +27,8 @@ otherwise drifts).
 | `acme-email` | Operator email used in `init-signup` + LE cert reg on every tenant | the operator-email convention (`david@sabo.tech`) | n/a |
 | `vaultwarden-master` | `home.alfred.black` Vaultwarden master password | Set during onboarding | when leaked |
 | `github-pat` | Fallback only — `gh auth login` is the primary path | GitHub → Settings → Developer settings → PATs | 90d |
+| `telegram-bot-token` | BotFather token for the Sir-facing alert bot (Tier 2 autonomous loop) | @BotFather → `/newbot` → reply contains the token | when leaked |
+| `telegram-chat-id` | Sir's chat_id with the bot (captured automatically from `getUpdates`) | First message Sir sends to the bot | n/a (immutable) |
 
 ## File paths (not values — just where the file lives)
 
