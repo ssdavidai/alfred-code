@@ -67,9 +67,14 @@ one-liner: `☀️ Alfred-code brief — all clear. N open issues, nothing needs
 TG=$(secret get telegram-bot-token); CID=$(secret get telegram-chat-id)
 curl -sS -X POST "https://api.telegram.org/bot${TG}/sendMessage" \
   --data-urlencode "chat_id=${CID}" \
-  --data-urlencode "text=${MESSAGE}" \
-  --data-urlencode "parse_mode=Markdown"
+  --data-urlencode "text=${MESSAGE}"
+# NOTE: send PLAIN TEXT — do NOT use parse_mode=Markdown. Branch names and
+# slugs contain underscores (e.g. channel_identity) that break Markdown
+# parsing → sendMessage returns ok:false. Drop the * around the title too.
 ```
+
+Don't wrap the title in `*...*` — plain text only. (If you want emphasis later,
+use `parse_mode=MarkdownV2` AND escape every `_ * [ ] ( ) ~ \` > # + - = | { } . !` — not worth it for a digest.)
 
 Then stop. Do not take any action on anything in the brief — that's Sir's call
 during his checkpoint. Never echo secret values.
