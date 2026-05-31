@@ -1,75 +1,120 @@
 # alfred-code
 
-**Sir's lane-orchestrated, smoke-gated, fleet-aware Claude Code rig.**
+**Autonomous-loop Claude Code rig. File a GitHub issue, tap Y in Telegram, the work ships.**
 
-A plug-and-play install of hooks, slash commands, subagent personas, and
-Telegram-channel orchestration patterns. Codifies the workflow that ships
-multi-lane work without losing functional verification.
+```
+                        ┌──────────────────────────────────────────┐
+                        │  You file a GH issue (~30s)              │
+                        └──────┬─────────────────────────────────────┘
+                               │
+                               ↓
+                        ┌──────────────────────────────────────────┐
+                        │  Within ~5 min:                          │
+                        │  • Triaged                               │
+                        │  • Lanes decomposed                      │
+                        │  • Decomposition → Telegram with Y/N     │
+                        └──────┬─────────────────────────────────────┘
+                               │ (you tap 👍 in Telegram)
+                               ↓
+                        ┌──────────────────────────────────────────┐
+                        │  Within 15-90 min:                       │
+                        │  • Lane workers dispatched in worktrees  │
+                        │  • Each opens a PR with smoke evidence   │
+                        │  • Telegram pings on each PR             │
+                        └──────┬─────────────────────────────────────┘
+                               │ (you tap merge in GH UI)
+                               ↓
+                        ┌──────────────────────────────────────────┐
+                        │  Within ~3 min:                          │
+                        │  • CI builds + publishes :latest         │
+                        │  • Fleet auto-rolls all 6 tenants        │
+                        │  • Telegram rollout summary              │
+                        └──────────────────────────────────────────┘
 
-## What it gives you
-
-| Layer | Files | What it does |
-|---|---|---|
-| **Hooks** | `hooks/*.sh` | 6 deterministic guardrails. Block `env` dumps, block dead SSH aliases, force `git fetch` before reading, enforce worktree isolation on `Agent` dispatch, propose memory candidates on session end, require smoke-evidence in PR bodies. |
-| **Slash commands** | `commands/*.md` | `/lane-out`, `/lane-smoke`, `/cut-release`, `/fleet-pull`, `/cleanup-memory`, `/ultrareview`. Each removes the boilerplate of a workflow you'd otherwise retype. |
-| **Subagent personas** | `agents/*.md` | `lane-worker.md` + `lane-orchestrator.md`. Inherited persona files with all the repo conventions, smoke gates, and gotchas baked in once. |
-| **Smoke templates** | `smoke-templates/*.md` | Copy-paste recipes for the five recurring smoke shapes — channel-token-route, workflow-trigger, migration-roundtrip, mcp-server-tool, wasp-op. |
-| **GitHub workflows** | `workflows/*.yml` | Auto-PR-review (opt-in, API key), PR-review-gate (smoke-evidence required), deploy-fleet (auto-roll on `:latest` push). |
-| **Cron + bridge** | `cron/*.sh`, `bridge/` | Native Claude Code Channel plugin install for Telegram; daily digest via Scheduled tasks. |
-| **Docs** | `docs/` | Operations manual, decision-log convention, lane protocol formalised. |
-
-## Two install paths
-
-### A. Plugin install (recommended, when supported by your Claude Code version)
-
-```bash
-# Inside Claude Code:
-/plugin install ssdavidai/alfred-code
-
-# Hooks, commands, agents auto-merge into ~/.claude/
-# Extras stay opt-in:
-~/.claude/plugins/alfred-code/install-tier-2.sh
+Total Sir-time: ~30s to file + 1 tap to dispatch + 1 tap per merge.
+Total Anthropic spend: $0/month (uses your Claude.ai subscription).
 ```
 
-### B. Drop-in install (works on any Claude Code version)
+## What's in the package
+
+| Layer | Tier | Files |
+|---|---|---|
+| **6 deterministic hooks** | 1 | `hooks/block-env-dump.sh`, `block-dead-ssh-aliases.sh`, `force-fetch-before-read.sh`, `enforce-worktree-isolation.sh`, `propose-memory-candidates.sh`, `require-smoke-evidence.sh` |
+| **2 polish hooks** | 3 | `hooks/kill-criteria.sh`, `token-budget-warn.sh` |
+| **11 slash commands** | 1+2+3 | `/lane-out`, `/lane-smoke`, `/cut-release`, `/fleet-pull`, `/cleanup-memory`, `/ultrareview` (Tier 1) + `/poll-and-act`, `/triage-issue`, `/setup-telegram` (Tier 2) + `/file-adr`, `/pm-dashboard` (Tier 3) |
+| **4 subagent personas** | 1+2 | `agents/lane-worker.md`, `lane-orchestrator.md` (Tier 1) + `triage-bot.md`, `pr-reviewer.md` (Tier 2) |
+| **5 smoke templates** | 2 | `smoke-templates/channel-token-route.md`, `workflow-trigger.md`, `migration-roundtrip.md`, `mcp-server-tool.md`, `wasp-op.md` |
+| **3 GitHub Actions** | 2 | `workflows/notify-telegram.yml`, `pr-review-gate.yml`, `deploy-fleet.yml` |
+| **1 desktop scheduled task** | 2 | `cron/alfred-code-poll.SKILL.md` |
+| **5 docs** | all | `docs/smoke-as-truth.md`, `lane-protocol.md`, `setup-tutorial.md`, `autonomous-loop.md`, `operations-manual.md` |
+| **ADR scaffolding** | 3 | `docs/decisions/` template + index |
+
+## Install
 
 ```bash
+# Tier 1 (this works on its own — hooks + commands + agents):
 git clone https://github.com/ssdavidai/alfred-code ~/.claude/alfred-code
 ~/.claude/alfred-code/install.sh
-# symlinks hooks/ commands/ agents/ into your ~/.claude/
-# merges settings.json.template into your settings.json
+
+# Tier 2 (Telegram + GH Actions + autonomous loop):
+~/.claude/alfred-code/install-tier-2.sh
+
+# Tier 3 (polish: kill criteria, token budget, ADRs, PM dashboard):
+~/.claude/alfred-code/install-tier-3.sh
 ```
 
-## Quick start: ship a real lane in 60 seconds
+Each tier is self-contained. Run only what you need. **Tier 1 alone delivers the worktree-isolation + smoke-gate + slash-command-vocabulary wins**, before you wire any Telegram.
 
-After install:
+## Read first
 
-```bash
-# In Claude Code, on any GitHub repo:
-/lane-out 220     # reads issue #220, drafts lane decomposition, asks Y/N, dispatches
-```
-
-The `lane-out` command will:
-1. Fetch the issue body + the open-PR landscape
-2. Decompose per the lane protocol (`docs/lane-protocol.md`)
-3. Define contracts (file ownership, shared schemas, env-var names)
-4. Surface a 3-bullet "here's what I'll do" via `AskUserQuestion`
-5. On `Y`: dispatch lane subagents in **isolated worktrees** (mandatory; the hook blocks it otherwise)
-6. Each subagent inherits `agents/lane-worker.md` — all the boilerplate is gone
-7. Smoke is the close gate, not lint
-
-## Tier breakdown
-
-| Tier | Setup time | What it gives you |
-|---|---|---|
-| 1 (install) | ~15 min | Hooks + commands + agents working in your terminal |
-| 2 (Telegram) | ~1 evening | Text the bot from your phone → Claude reacts in your laptop terminal → all your slash commands and hooks apply |
-| 3 (GitHub flow) | ~1 day | GitHub webhooks → Telegram notifications; daily digest via Scheduled tasks; fleet auto-rollout; PR-review-gate requires smoke evidence |
+- **[docs/setup-tutorial.md](docs/setup-tutorial.md)** — 30-minute walkthrough, zero to autonomous
+- **[docs/autonomous-loop.md](docs/autonomous-loop.md)** — architecture of the loop
+- **[docs/operations-manual.md](docs/operations-manual.md)** — troubleshooting when something breaks
+- **[docs/smoke-as-truth.md](docs/smoke-as-truth.md)** — why functional smoke gates everything
+- **[docs/lane-protocol.md](docs/lane-protocol.md)** — how multi-PR issues decompose
 
 ## Why this exists
 
 Sir was shipping `#120 Multi-Profile Hermes` in 7 lanes across 3 hours and 22 PRs. Half the friction was retyping the same boilerplate in every subagent prompt. The other half was forgetting to add `isolation: "worktree"` until two agents collided on `migrate.ts`. This package codifies the lessons so the next 100 lanes go smoothly.
 
+The autonomous loop on top of it means Sir's not even the orchestrator anymore — he's the architect. He files an issue, taps Y, taps merge. The agents do the rest.
+
 ## Status
 
-`v0.1.0` — Tier 1 implementation. Tested on `ssdavidai/alfred`.
+- **v0.1.0** — Tier 1 (hooks + commands + agents)
+- **v0.2.0** — Tier 2 (Telegram channel + GH Actions + autonomous loop)
+- **v0.3.0** — Tier 3 (kill criteria + token budget + ADRs + PM dashboard)
+
+All three tiers shipped 2026-05-31.
+
+## Costs
+
+| Component | Monthly cost |
+|---|---|
+| Claude on your Mac (interactive + scheduled task) | $0 — uses your existing Claude.ai sub |
+| GitHub Actions runs | $0 — under free tier @ moderate volume |
+| Telegram bot | $0 — Telegram is free |
+| Fleet SSH deployments | $0 — your own VMs |
+| **Total** | **$0** |
+
+## When you'd want to pay for API tokens
+
+- You want the autonomous loop running **while your Mac is asleep** → swap the Desktop scheduled task for an Anthropic Cloud Routine (~$5-30/mo at moderate volume)
+- You want `claude-code-action` to auto-review every PR on GitHub's runners → API key + ~$5-20/mo
+
+Neither is required. The free tier works.
+
+## License
+
+MIT. Take it, fork it, customize it for your own monorepo.
+
+## Sources
+
+The patterns in this package are distilled from:
+
+- [How Boris Uses Claude Code](https://howborisusesclaudecode.com/) — Boris Cherny's daily habits with Claude Code
+- [The Code Agent Orchestra](https://addyosmani.com/blog/code-agent-orchestra/) — Addy Osmani on multi-agent orchestration
+- [Claude Code Channels](https://code.claude.com/docs/en/channels) — the Telegram/Discord/iMessage channel plugin system
+- [Claude Code Desktop scheduled tasks](https://code.claude.com/docs/en/desktop-scheduled-tasks) — the always-on heartbeat primitive
+- [Claude Code subagents](https://code.claude.com/docs/en/sub-agents) — the inherited-persona pattern
+- The lived experience of shipping issue #120 in 7 lanes on 2026-05-30/31
