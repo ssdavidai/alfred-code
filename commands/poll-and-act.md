@@ -144,9 +144,38 @@ Register the gate in `~/.alfred-code-state/pending-gates.json`:
 
 After processing, update `last-issue-poll` to now.
 
-### 3. For each pending gate Sir approved in step 1 — dispatch (DETACHED)
+### 3. Drain the queue, then dispatch (DETACHED)
 
-For each gate with `status="approved"`:
+**FIRST — promote unblocked queued gates (this is the fix for the stuck-queue bug).**
+Gates can be parked in two non-dispatchable states:
+
+- `approved-queued` — approved by Sir, but serialized behind another issue
+  because they **share files** (e.g. #205 edits the same `profiles.ts` /
+  `ProfileDetailPage.tsx` as #204). The blocker is named in the gate's `note`.
+- `approved-blocked` — approved, but needs a Sir decision before it can build
+  (e.g. #189 restic-vs-Hetzner). These stay put until Sir answers; do NOT
+  auto-promote them.
+
+For each `approved-queued` gate, check whether its blocker has cleared:
+
+```bash
+# the blocker issue number is in the note; resolve its dispatched.json status
+```
+
+- If the blocker shares files (the common case) → it clears only when the
+  blocker is **`merged`** (its changes are on `main`, so this gate branches
+  off the right base). `pr-open` is NOT enough — building now would branch off
+  a stale `main` and collide at merge time.
+- If the blocker was pure ordering (no file overlap) → `pr-open` clears it.
+- When cleared: flip the gate `approved-queued → approved` and let the dispatch
+  loop below pick it up. If still blocked, leave it and move on (no Telegram
+  noise).
+
+Run this promotion check **every poll** — that's what makes the queue actually
+drain instead of sitting forever (the hour-1 bug: #205/#206 never advanced
+after #204 finished because nothing promoted them).
+
+**THEN — dispatch.** For each gate with `status="approved"`:
 
 - Set the gate `status="dispatching"` in `pending-gates.json`.
 - **Launch the build detached** — do NOT run `/lane-out` inline. Inline work

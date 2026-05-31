@@ -69,6 +69,18 @@ Process:
 2. Decompose into lanes, write /tmp/orchestrator-${ISSUE}-contracts.md, and
    dispatch each lane via the Agent tool with isolation:"worktree" (mandatory —
    the hook enforces it). Lanes may run in parallel.
+   **IDEMPOTENT DISPATCH (no duplicate PRs):** before firing a lane agent,
+   check whether that lane already has work in flight —
+     gh pr list --repo ${REPO} --state open --json number,headRefName \\
+       | jq -r '.[].headRefName' | grep -E 'lane.*${ISSUE}|${ISSUE}.*lane'
+     git -C $(pwd) branch -a | grep -E '${ISSUE}'
+   If a branch/PR for this lane already exists, DO NOT dispatch it again —
+   adopt the existing one. Maintain a ledger at
+   /tmp/orchestrator-${ISSUE}-dispatched.json mapping lane→{branch,pr,agent_id}
+   and consult it before every Agent call. Use the canonical branch name
+   'lane-<N>/${ISSUE}-<slug>' (NOT a generic 'lane/${ISSUE}-*'). The hour-1
+   bug was one build firing each lane TWICE (4 PRs for a 2-lane issue) — the
+   ledger + pre-flight branch/PR check is what prevents it.
 3. Each lane writes a REAL smoke test (6 sections) and opens a PR with a
    '## Smoke evidence' block. Verify each PR stayed in its file lane and the
    smoke is real, not theatre. Re-dispatch partials with the gap named.
