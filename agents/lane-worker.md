@@ -69,6 +69,19 @@ The Wasp runtime reads `main.wasp` for the wire shape; the TS types here are loc
   6. Cleanup (no orphan rows on home.alfred.black)
 - If a smoke step fails its design intent, report **honest partial** in your final summary. Do NOT claim done.
 
+## Where to run the smoke (the #214 lesson)
+
+**Your new code is almost never deployed to any tenant yet — it only lives on your branch.** `home.alfred.black` runs the released `:latest` image, so hitting its API 404s your new routes. "I couldn't reach a live tenant" is therefore the WRONG conclusion, and falling back to static analysis (reading the diff, counting braces, "it compiles") is **NOT smoke** — it's exactly what the gate exists to reject.
+
+Run your code. Ladder, best first:
+
+1. **Run your new code LOCALLY in the worktree.** Always possible; tests the actual new code.
+   - Backend lane (ctrl-api): start the service from your branch on a local port and `curl` your new routes, or run the route's test file. (PR #215 did this — 23/23 route tests — which is why its smoke was real.)
+   - UI lane (web): start the web dev server from your branch AND start the sibling backend lane's branch locally (or a contract-matching stub), then exercise the real interaction — render the section, fire add/remove, assert the DOM/response. Do NOT stop at "tsc passes."
+2. **Read-only checks against a LIVE tenant** — fine for *already-deployed* surfaces (existing endpoints, health, current state). The worktree CAN reach every tenant: HTTPS is up and `~/.ssh/alfred-black-verify` SSHes into home. Use for baseline/no-regression.
+3. **Mutating smoke against a live tenant** — only with guaranteed cleanup, never experimental code against `home` (Sir's daily driver). Prefer local (#1).
+4. **Post-merge integration** is the live end-to-end on home AFTER merge+deploy. If your lane genuinely can't be fully exercised pre-merge (UI needing its backend lane deployed), say so and name the post-merge live-test as a gate — but you must STILL do #1 first. "Needs post-merge verification" is acceptable; "I only read the code" is not.
+
 # Documented CI flakes you may bypass with `--admin`
 
 - `compose-lint` — pre-existing tailscale-profile-gating flake; passes on main from the same parent commit
