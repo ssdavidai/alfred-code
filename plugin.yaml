@@ -1,0 +1,33 @@
+name: alfred-code
+version: 0.1.0
+author: ssdavidai
+description: >
+  Lane-orchestrated, smoke-gated, fleet-aware Claude Code rig. Plug-and-play
+  install of hooks, slash commands, subagent personas, and Telegram-channel
+  orchestration patterns. Codifies the workflow that ships multi-lane work
+  without losing functional verification.
+homepage: https://github.com/ssdavidai/alfred-code
+license: MIT
+
+# Native Claude Code consumption: hooks + commands + agents drop into your
+# `.claude/` and become available everywhere Claude Code runs.
+hooks: ./hooks/
+commands: ./commands/
+agents: ./agents/
+
+# Extras that ship in the repo but aren't part of the Claude Code plugin
+# proper. Install them as needed via `./install-tier-2.sh` etc.
+extras:
+  smoke-templates: ./smoke-templates/
+  workflows: ./workflows/
+  cron: ./cron/
+  docs: ./docs/
+  bridge: ./bridge/
+
+requires:
+  claude-code: ">=2.1.80"  # Channels feature
+  gh-cli: ">=2.50"
+  jq: ">=1.6"
+  bun: ">=1.0"             # for the Telegram channel plugin
+
+settings-template: ./settings.json.template

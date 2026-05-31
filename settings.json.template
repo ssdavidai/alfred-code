@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "command": "$CLAUDE_HOME/hooks/block-env-dump.sh"
+      },
+      {
+        "matcher": "Bash",
+        "command": "$CLAUDE_HOME/hooks/block-dead-ssh-aliases.sh"
+      },
+      {
+        "matcher": "Bash",
+        "command": "$CLAUDE_HOME/hooks/require-smoke-evidence.sh"
+      },
+      {
+        "matcher": "Agent",
+        "command": "$CLAUDE_HOME/hooks/enforce-worktree-isolation.sh"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "$CLAUDE_HOME/hooks/force-fetch-before-read.sh"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "$CLAUDE_HOME/hooks/propose-memory-candidates.sh"
+      }
+    ]
+  }
+}
