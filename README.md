@@ -48,6 +48,7 @@ Total Anthropic spend: $0/month (uses your Claude.ai subscription).
 | **1 desktop scheduled task** | 2 | `cron/alfred-code-poll.SKILL.md` |
 | **5 docs** | all | `docs/smoke-as-truth.md`, `lane-protocol.md`, `setup-tutorial.md`, `autonomous-loop.md`, `operations-manual.md` |
 | **ADR scaffolding** | 3 | `docs/decisions/` template + index |
+| **Secrets broker** | 4 | `bin/secret`, `bin/secret-set`, `hooks/inject-secrets-registry.sh`, `commands/secrets-bootstrap.md`, `commands/secrets-status.md`, `docs/secrets-registry.md`, `docs/secrets-broker.md` |
 
 ## Install
 
@@ -61,6 +62,9 @@ git clone https://github.com/ssdavidai/alfred-code ~/.claude/alfred-code
 
 # Tier 3 (polish: kill criteria, token budget, ADRs, PM dashboard):
 ~/.claude/alfred-code/install-tier-3.sh
+
+# Tier 4 (secrets broker — Claude stops asking for tokens):
+~/.claude/alfred-code/install-tier-4.sh
 ```
 
 Each tier is self-contained. Run only what you need. **Tier 1 alone delivers the worktree-isolation + smoke-gate + slash-command-vocabulary wins**, before you wire any Telegram.
@@ -84,8 +88,9 @@ The autonomous loop on top of it means Sir's not even the orchestrator anymore �
 - **v0.1.0** — Tier 1 (hooks + commands + agents)
 - **v0.2.0** — Tier 2 (Telegram channel + GH Actions + autonomous loop)
 - **v0.3.0** — Tier 3 (kill criteria + token budget + ADRs + PM dashboard)
+- **v0.4.0** — Tier 4 (secrets broker — Keychain-backed `secret get/set/list`)
 
-All three tiers shipped 2026-05-31.
+All four tiers shipped 2026-05-31.
 
 ## Costs
 
