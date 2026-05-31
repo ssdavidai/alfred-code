@@ -77,10 +77,21 @@ cat ~/.alfred-code-state/dispatched.json    2>/dev/null | jq -r '.[].issue // em
 ```
 
 For each candidate issue, **SKIP it entirely** (no triage, no Telegram post,
-no gate write) if **either**:
+no gate write) if **any**:
 - a gate already exists for that issue in `pending-gates.json` with a
-  non-terminal status (`awaiting | approved | dispatching | dispatched`), or
-- the issue already appears in `dispatched.json`.
+  non-terminal status (`awaiting | approved | dispatching`), or
+- the issue is **in-flight** in `dispatched.json` — i.e. it has a
+  `dispatched.json` entry whose `status` is `building` or `pr-open`. A
+  `building` entry means a detached build process is actively working it
+  (check `kill -0 <pid>`); a `pr-open` entry means PRs are up awaiting Sir's
+  merge. **Either way, do not re-dispatch and do not re-post a gate.** At most,
+  if it's `building` and the pid is dead (crashed), note that to Sir once and
+  mark it `failed` so the next poll can offer a re-dispatch.
+
+**In-flight builds are the normal case, not an error.** A feature build runs
+detached for as long as it needs (minutes to hours) via `alfred-code-dispatch`.
+The poll's job for an in-flight issue is to *observe*, not to act: glance at
+its PR landscape (step 4) and stay quiet unless something changed.
 
 The timestamp filter is only a coarse pre-filter. **The gate-existence check
 is the authoritative dedup** — never rely on `last-issue-poll` alone, because
@@ -133,24 +144,57 @@ Register the gate in `~/.alfred-code-state/pending-gates.json`:
 
 After processing, update `last-issue-poll` to now.
 
-### 3. For each pending gate Sir approved in step 1 — dispatch
+### 3. For each pending gate Sir approved in step 1 — dispatch (DETACHED)
 
 For each gate with `status="approved"`:
 
-- Set `status="dispatching"` in the state file
-- Invoke `/lane-out <issue#>` with the auto-dispatch flag (so it skips the AskUserQuestion since Sir already approved via Telegram)
-- Set `status="dispatched"` after the lane-out command completes
+- Set the gate `status="dispatching"` in `pending-gates.json`.
+- **Launch the build detached** — do NOT run `/lane-out` inline. Inline work
+  dies when this short poll session ends. Instead:
 
-### 4. For each issue currently `dispatched` — check PR landscape
+  ```bash
+  ~/.claude/bin/alfred-code-dispatch <issue#>
+  ```
 
-For each issue in `dispatched.json`:
+  This spawns an independent headless `claude -p` process (via `nohup` +
+  `disown`) that runs the full lane-out orchestration for **as long as the
+  work needs** — it is not bound to this 5-min poll. It records itself in
+  `dispatched.json` with `status="building"` + its pid, and notifies Sir on
+  the bot when the PRs are up.
+- After launching, set the gate `status="dispatched"` (terminal for the gate —
+  the `dispatched.json` entry now owns the lifecycle). The next poll will see
+  the issue is `building` and leave it alone.
+
+**Why detached:** Sir's directive — feature builds take as long as they need.
+The poll is a short-lived dispatcher + status-reporter, never the host of the
+build itself. One detached process per issue; they run concurrently in
+isolated worktrees.
+
+### 4. For each in-flight issue in `dispatched.json` — observe (don't act)
+
+For each entry, branch on `status`:
+
+- **`building`** — a detached build is running. Check liveness:
+  ```bash
+  kill -0 <pid> 2>/dev/null && echo alive || echo dead
+  ```
+  - alive → **stay quiet.** It's working. Do NOT re-dispatch, do NOT ping Sir.
+    (Optional: if it's been building > 2h, tail its log
+    `~/.alfred-code-state/runs/<issue>.log` and post one progress note.)
+  - dead (crashed before reaching `pr-open`) → mark `status="failed"`, post
+    one Telegram note with the last ~10 log lines, and let Sir decide whether
+    to re-dispatch (`y #<issue>` re-runs it).
+
+- **`pr-open`** — the build finished and opened PRs (it already pinged Sir).
+  Verify the PRs still exist + smoke evidence is present. If a PR has been
+  open > 30 min untouched, optionally run `/ultrareview <n>` and post the
+  verdict. Otherwise stay quiet — the ball is in Sir's court to merge.
+
+- **`merged`/`failed`** — terminal; skip (house-keeping trims these).
 
 ```bash
 gh pr list --state open --search "in:body #<issue>" --json number,title,headRefName,mergeable
 ```
-
-If a new PR appeared since last poll:
-- Post to Telegram: "🟢 PR #<n> opened for #<issue>: <title>. Reply `review #<n>` for an ultrareview."
 
 If a PR has been open for >30 min with no body update:
 - Run `/ultrareview <n>` autonomously and post the result to Telegram

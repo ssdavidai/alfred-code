@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# alfred-code-dispatch <issue#> — launch a DETACHED, long-running headless
+# Claude build for one issue. The key property: this process is decoupled
+# from whatever session called it (the 5-min poll), so the build runs as
+# long as it needs — minutes or hours — without being orphaned when the
+# poll session ends.
+#
+# State: records the run in ~/.alfred-code-state/dispatched.json so the
+# next poll sees "this issue is in-flight, skip it" instead of re-dispatching.
+#
+# Safety rails that make unattended builds acceptable (none of these are
+# permission prompts — they fire regardless of --dangerously-skip-permissions):
+#   • PreToolUse hooks: block-env-dump, block-dead-ssh-aliases,
+#     enforce-worktree-isolation, require-smoke-evidence
+#   • Each lane runs in an isolated git worktree (no cross-lane stomping)
+#   • MERGE stays manual — the build only opens PRs; Sir merges.
+#
+# Usage:
+#   alfred-code-dispatch 189
+#   alfred-code-dispatch 189 --scope "just the backup cron, skip restore UI"
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.alfred-code-state"
+RUNS_DIR="${STATE_DIR}/runs"
+DISPATCHED="${STATE_DIR}/dispatched.json"
+PERM_MODE="${ALFRED_CODE_DISPATCH_PERM:---dangerously-skip-permissions}"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+ISSUE="${1:-}"
+[[ -z "$ISSUE" ]] && die "usage: alfred-code-dispatch <issue#> [--scope <hint>]"
+shift || true
+SCOPE_HINT="${*:-}"
+
+[[ -f "$STATE_DIR/.env" ]] || die "missing $STATE_DIR/.env — run Tier 2 install first"
+# shellcheck disable=SC1090
+source "$STATE_DIR/.env"
+REPO_PATH="${ALFRED_CODE_REPO_PATH:-/Users/ssd/dev/alfred}"
+REPO="${ALFRED_CODE_REPO:-ssdavidai/alfred}"
+[[ -d "$REPO_PATH/.git" ]] || die "ALFRED_CODE_REPO_PATH ($REPO_PATH) is not a git repo"
+
+mkdir -p "$RUNS_DIR"
+[[ -f "$DISPATCHED" ]] || echo '{}' > "$DISPATCHED"
+
+# --- guard: already in-flight? ----------------------------------------
+EXISTING_PID=$(jq -r --arg i "$ISSUE" '.[$i].pid // empty' "$DISPATCHED" 2>/dev/null || true)
+EXISTING_STATUS=$(jq -r --arg i "$ISSUE" '.[$i].status // empty' "$DISPATCHED" 2>/dev/null || true)
+if [[ -n "$EXISTING_PID" && "$EXISTING_STATUS" == "building" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+  echo "already building #$ISSUE (pid $EXISTING_PID, status $EXISTING_STATUS) — not re-dispatching"
+  exit 0
+fi
+
+LOG="${RUNS_DIR}/${ISSUE}.log"
+NOW=$(date -u +%FT%TZ)
+
+# --- the orchestration prompt (self-contained; detached session is fresh) ---
+read -r -d '' PROMPT <<PROMPT_EOF || true
+You are an autonomous build orchestrator for GitHub issue #${ISSUE} in ${REPO}.
+You were launched detached by alfred-code-dispatch and may run as long as the
+work genuinely needs — do not rush, do not stub, do not mock. Build the real
+feature end to end.
+
+Process:
+1. Run the /lane-out ${ISSUE} orchestration exactly as defined in
+   ~/.claude/commands/lane-out.md and ~/.claude/agents/lane-orchestrator.md.
+   Sir ALREADY approved this issue via Telegram — DO NOT ask a Y/N gate;
+   proceed straight to decompose + dispatch (auto-dispatch mode).
+2. Decompose into lanes, write /tmp/orchestrator-${ISSUE}-contracts.md, and
+   dispatch each lane via the Agent tool with isolation:"worktree" (mandatory —
+   the hook enforces it). Lanes may run in parallel.
+3. Each lane writes a REAL smoke test (6 sections) and opens a PR with a
+   '## Smoke evidence' block. Verify each PR stayed in its file lane and the
+   smoke is real, not theatre. Re-dispatch partials with the gap named.
+4. ${SCOPE_HINT:+Scope hint from Sir: ${SCOPE_HINT}}
+5. DO NOT merge anything — merge is Sir's manual gate. Only open PRs.
+
+When all lanes have open PRs (or you hit a hard blocker):
+  - Update ~/.alfred-code-state/dispatched.json: set ."${ISSUE}".status to
+    "pr-open" (or "failed" + a one-line reason), and add a "prs" array of the
+    PR numbers you opened.
+  - Send ONE Telegram summary to Sir:
+      TG=\$(${HOME}/.claude/bin/secret get telegram-bot-token)
+      CID=\$(${HOME}/.claude/bin/secret get telegram-chat-id)
+      curl -sS -X POST "https://api.telegram.org/bot\${TG}/sendMessage" \\
+        --data-urlencode "chat_id=\${CID}" \\
+        --data-urlencode "text=<your summary: #${ISSUE} built — PRs #a #b, smoke green, ready for your merge>"
+  - Then exit.
+
+If you cannot decompose cleanly, set status "failed" with the blocker and
+Telegram Sir the specific blocker. Honesty beats a broken half-build.
+PROMPT_EOF
+
+# --- launch detached -------------------------------------------------
+cd "$REPO_PATH"
+nohup claude -p "$PROMPT" "$PERM_MODE" > "$LOG" 2>&1 &
+PID=$!
+disown "$PID" 2>/dev/null || true
+
+# --- record state ----------------------------------------------------
+tmp=$(mktemp)
+jq --arg i "$ISSUE" --arg pid "$PID" --arg now "$NOW" --arg log "$LOG" --arg repo "$REPO" '
+  .[$i] = {issue: ($i|tonumber), status: "building", pid: ($pid|tonumber),
+           started_at: $now, log: $log, repo: $repo}
+' "$DISPATCHED" > "$tmp" && mv "$tmp" "$DISPATCHED"
+
+echo "dispatched #$ISSUE detached (pid $PID), log: $LOG"
