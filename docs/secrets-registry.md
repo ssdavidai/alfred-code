@@ -22,6 +22,8 @@ otherwise drifts).
 | `openai-api-key` | Codex CLI, Whisper, gpt-realtime | OpenAI platform → API keys | when leaked |
 | `anthropic-api-key` | Cloud Routines (Tier 4 only — laptop runs use subscription) | Anthropic console → Settings → API Keys | when leaked |
 | `groq-api-key` | OMI transcript pipeline | Groq Cloud → Keys | when leaked |
+| `composio-api-key` | Composio integrations (Gmail/Calendar OAuth in onboarding) | Composio dashboard → API Keys | when leaked |
+| `composio-webhook-secret` | Composio webhook HMAC verification | Composio dashboard | when leaked |
 | `paperclip-api-key` | Paperclip board key (used by Hermes paperclip adapter) | Paperclip dashboard → MCP / Bootstrap | **30 days** |
 | `pypi-token` | `alfred-vault` PyPI publishes (trusted-publishing target) | PyPI → Account settings → Tokens | when used |
 | `acme-email` | Operator email used in `init-signup` + LE cert reg on every tenant | the operator-email convention (`david@sabo.tech`) | n/a |
