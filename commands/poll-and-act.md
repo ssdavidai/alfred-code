@@ -232,11 +232,27 @@ If all of the issue's lanes have merged:
 - Verify the issue's acceptance criteria are met
 - Auto-close the issue with a summary comment
 - Mark the gate `status="closed"`
+- **Reap that issue's lane worktrees** — the build left an isolated worktree
+  per lane; now that the PRs are merged they're dead weight:
+  ```bash
+  ~/.claude/bin/alfred-code-reap-worktrees --issue <issue#> --apply
+  ```
+  This only removes worktrees whose PR is MERGED/CLOSED (or empty scratch) and
+  whose working tree is clean — dirty or un-landed worktrees are left intact.
 
 ### 5. House-keeping
 
 - Delete expired gates (older than 24h, not approved)
 - Trim `pending-gates.json` and `dispatched.json` to the last 30 days
+- **GC orphaned worktrees** — a periodic safety net for worktrees the
+  per-issue reap (step 4) missed: stale lanes from abandoned/closed PRs and the
+  harness's ephemeral `claude/<name-hash>` scratch checkouts. Run the full sweep:
+  ```bash
+  ~/.claude/bin/alfred-code-reap-worktrees --apply
+  ```
+  It removes ONLY worktrees that are clean AND (PR merged/closed OR empty
+  scratch with no open PR); dirty or un-landed worktrees are always kept. Safe
+  to run every poll — it's a no-op when there's nothing to reap.
 
 ## Honest reporting rules
 

@@ -26,8 +26,11 @@ The procedure, in order:
    to Telegram AND persist it to `pending-gates.json` in the same run.
 3. **Dispatch** approved gates via `/lane-out <issue#>` (auto-dispatch flag).
 4. **Verify** dispatched issues' PR landscape; post status; auto-close when all
-   lanes merged + acceptance criteria met.
-5. **House-keep** — expire stale gates, trim state files.
+   lanes merged + acceptance criteria met. On close, reap that issue's merged
+   lane worktrees (`alfred-code-reap-worktrees --issue <n> --apply`).
+5. **House-keep** — expire stale gates, trim state files, and GC orphaned
+   worktrees (`~/.claude/bin/alfred-code-reap-worktrees --apply` — clean +
+   merged/closed/empty only; dirty/un-landed always kept).
 
 **Exit quietly if nothing happened.** Only message Sir when there's something
 for him to see — never an "all clear" ping every 5 min.

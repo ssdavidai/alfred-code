@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# alfred-code-reap-worktrees — garbage-collect lane worktrees whose work is done.
+#
+# WHY THIS EXISTS: every dispatched lane runs in an isolated git worktree
+# (Agent isolation:"worktree"), and the Claude Code harness also leaves behind
+# ephemeral `claude/<adjective-name-hash>` scratch worktrees. Nothing reaped
+# them when issues closed, so they piled up (224 worktrees / ~6 GB observed
+# 2026-06-01). This closes that lifecycle gap.
+#
+# SAFETY MODEL — a worktree is REAPABLE only if its working tree is clean AND
+# one of:
+#   • its branch's PR is MERGED or CLOSED (work landed / abandoned on purpose), OR
+#   • it has zero commits not on origin/main AND no open PR (empty scratch).
+# A worktree is KEPT (never touched) if:
+#   • it has uncommitted changes (dirty), OR
+#   • it holds commits not on origin/main with no merged/closed PR (un-landed
+#     work — a squash-merge rewrites history so we trust the PR state, not
+#     `merge-base`, as the "landed" signal), OR
+#   • it is locked (a live agent is using it).
+# The main checkout (REPO_PATH itself) is always skipped.
+#
+# Default is DRY-RUN. Pass --apply to actually remove. Pass --issue <N> to
+# limit reaping to worktrees whose branch references that issue number.
+#
+# Usage:
+#   alfred-code-reap-worktrees                 # dry-run, full sweep
+#   alfred-code-reap-worktrees --apply         # reap all safe worktrees
+#   alfred-code-reap-worktrees --issue 120 --apply   # reap only #120's lanes
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.alfred-code-state"
+APPLY=0
+ISSUE_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1; shift ;;
+    --issue) ISSUE_FILTER="${2:-}"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Resolve the repo the loop operates on (same source as alfred-code-dispatch).
+REPO_PATH="/Users/ssd/dev/alfred"
+if [[ -f "$STATE_DIR/.env" ]]; then
+  # shellcheck disable=SC1090
+  source "$STATE_DIR/.env"
+  REPO_PATH="${ALFRED_CODE_REPO_PATH:-$REPO_PATH}"
+fi
+[[ -d "$REPO_PATH/.git" ]] || { echo "not a git repo: $REPO_PATH" >&2; exit 1; }
+
+cd "$REPO_PATH"
+git fetch origin main -q 2>/dev/null || true
+
+have_gh=0; command -v gh >/dev/null 2>&1 && have_gh=1
+
+# git forbids the same branch in two worktrees, so each branch is queried at
+# most once across the sweep — no cache needed.
+pr_state_for() {  # echoes MERGED|CLOSED|OPEN|NONE for a branch
+  local br="$1"
+  [[ -z "$br" || "$br" == "(detached)" ]] && { echo "NONE"; return; }
+  [[ $have_gh -eq 1 ]] || { echo "NONE"; return; }
+  local st
+  st=$(gh pr list --head "$br" --state all --json state --limit 1 2>/dev/null \
+         | jq -r '.[0].state // "NONE"' 2>/dev/null || echo "NONE")
+  [[ -z "$st" || "$st" == "null" ]] && st="NONE"
+  echo "$st"
+}
+
+reaped=0; kept=0; skipped=0
+declare -a REAP_LIST
+
+# Parse `git worktree list --porcelain` into (path, branch, locked) tuples.
+wt=""; br=""; locked=0
+flush() {
+  [[ -z "$wt" ]] && return
+  # never the main checkout
+  if [[ "$wt" == "$REPO_PATH" ]]; then wt=""; br=""; locked=0; return; fi
+  # issue filter
+  if [[ -n "$ISSUE_FILTER" && "$br" != *"$ISSUE_FILTER"* ]]; then
+    wt=""; br=""; locked=0; return
+  fi
+  local base; base=$(basename "$wt")
+  if [[ $locked -eq 1 ]]; then
+    echo "  KEEP   (locked — live agent)         $base"
+    kept=$((kept+1)); wt=""; br=""; locked=0; return
+  fi
+  local dirty; dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$dirty" -gt 0 ]]; then
+    echo "  KEEP   (dirty: $dirty uncommitted)        $base  [$br]"
+    kept=$((kept+1)); wt=""; br=""; locked=0; return
+  fi
+  local uniq; uniq=$(git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo "?")
+  local prs; prs=$(pr_state_for "$br")
+  if [[ "$prs" == "MERGED" || "$prs" == "CLOSED" ]]; then
+    echo "  REAP   (PR $prs, clean)              $base  [$br]"
+    REAP_LIST+=("$wt"); reaped=$((reaped+1))
+  elif [[ "$uniq" == "0" && "$prs" == "NONE" ]]; then
+    echo "  REAP   (empty scratch, 0 commits)     $base  [$br]"
+    REAP_LIST+=("$wt"); reaped=$((reaped+1))
+  elif [[ "$prs" == "OPEN" ]]; then
+    echo "  KEEP   (PR still OPEN)                $base  [$br]"
+    kept=$((kept+1))
+  else
+    echo "  KEEP   ($uniq un-landed commits, no merged PR)  $base  [$br]"
+    kept=$((kept+1))
+  fi
+  wt=""; br=""; locked=0
+}
+
+while IFS= read -r line; do
+  case "$line" in
+    worktree\ *) flush; wt="${line#worktree }" ;;
+    branch\ *)   br="${line#branch refs/heads/}" ;;
+    detached)    br="(detached)" ;;
+    locked*)     locked=1 ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null)
+flush
+
+echo ""
+echo "  ── ${reaped} reapable · ${kept} kept ──"
+
+if [[ $APPLY -eq 1 && $reaped -gt 0 ]]; then
+  echo ""
+  echo "  applying:"
+  for w in "${REAP_LIST[@]}"; do
+    if git worktree remove "$w" 2>/dev/null; then
+      echo "    removed $(basename "$w")"
+    else
+      echo "    SKIPPED $(basename "$w") (remove refused — left intact)"; skipped=$((skipped+1))
+    fi
+  done
+  git worktree prune 2>/dev/null || true
+  echo "  done — $((reaped - skipped)) removed, $skipped left intact."
+elif [[ $reaped -gt 0 ]]; then
+  echo "  (dry-run — re-run with --apply to remove the ${reaped} reapable worktrees)"
+fi

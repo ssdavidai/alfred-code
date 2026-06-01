@@ -35,7 +35,7 @@ say "$(green ✓) Tier 1 detected."
 echo
 echo "  → bin/"
 mkdir -p "$TARGET/bin"
-for b in secret secret-set; do
+for b in secret secret-set alfred-code-dispatch alfred-code-reap-worktrees; do
   src="$ALFRED_CODE_HOME/bin/$b"
   dst="$TARGET/bin/$b"
   if [[ ! -f "$src" ]]; then
