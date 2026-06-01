@@ -24,6 +24,7 @@ otherwise drifts).
 | `groq-api-key` | OMI transcript pipeline | Groq Cloud → Keys | when leaked |
 | `composio-api-key` | Composio integrations (Gmail/Calendar OAuth in onboarding) | Composio dashboard → API Keys | when leaked |
 | `composio-webhook-secret` | Composio webhook HMAC verification | Composio dashboard | when leaked |
+| `agentmail-master-api-key` | AgentMail inbox provisioning + per-profile inbound/outbound email (fleet master key) | AgentMail dashboard → API Keys | when leaked |
 | `paperclip-api-key` | Paperclip board key (used by Hermes paperclip adapter) | Paperclip dashboard → MCP / Bootstrap | **30 days** |
 | `pypi-token` | `alfred-vault` PyPI publishes (trusted-publishing target) | PyPI → Account settings → Tokens | when used |
 | `acme-email` | Operator email used in `init-signup` + LE cert reg on every tenant | the operator-email convention (`david@sabo.tech`) | n/a |
