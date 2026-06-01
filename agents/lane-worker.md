@@ -91,6 +91,22 @@ Run your code. Ladder, best first:
 
 **Only after the smoke is green** may you admin-merge through these documented flakes. If a non-documented check fails, fix it.
 
+# CI lessons ledger — compound engineering (READ + APPEND)
+
+Before you write code, **read `~/.claude/alfred-code/docs/ci-lessons.md`** — it
+lists every CI-failure class we've already hit and the rule that prevents each.
+This is how the rig compounds: past failures become guardrails so you don't
+re-trip them.
+
+After you root-cause and fix ANY real (non-flake) CI failure, **append one line**
+to that ledger:
+```
+- YYYY-MM-DD · <check that failed> · <root cause> · <the rule that prevents it>
+```
+If a failure class recurs, promote it into the gotchas above (e.g. the Wasp
+`Promise<T>` trap) so it's in every agent's inherited persona. A fix that
+doesn't write the rule back is half a fix.
+
 # Never echo
 
 - **Secret values.** Lengths and 6-8 char prefixes only.

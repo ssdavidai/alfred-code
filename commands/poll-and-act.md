@@ -215,9 +215,35 @@ For each entry, branch on `status`:
     to re-dispatch (`y #<issue>` re-runs it).
 
 - **`pr-open`** — the build finished and opened PRs (it already pinged Sir).
-  Verify the PRs still exist + smoke evidence is present. If a PR has been
-  open > 30 min untouched, optionally run `/ultrareview <n>` and post the
-  verdict. Otherwise stay quiet — the ball is in Sir's court to merge.
+  For EACH open PR of this issue:
+
+  1. **Auto-fix red CI** (capped, autonomous — Sir approved 2026-06-01):
+     ```bash
+     gh pr checks <pr> --json name,state,conclusion 2>/dev/null
+     ```
+     If any check is `failure`/`cancelled`/`timed_out` AND its name is NOT a
+     documented flake (`compose-lint`, `test-voice-bridge` — see
+     `docs/ci-lessons.md`), dispatch a detached, attempt-capped CI repair:
+     ```bash
+     ~/.claude/bin/alfred-code-fix-pr <pr>
+     ```
+     It self-caps at 2 attempts per PR (tracked in
+     `~/.alfred-code-state/ci-fixes.json`); after the cap it escalates to Sir
+     on Telegram instead of looping. The fix agent pushes to the PR branch,
+     **never merges**, and appends a one-line root-cause→rule entry to
+     `docs/ci-lessons.md` (the compound ledger). Do NOT also re-dispatch the
+     whole issue — the fix agent owns the PR-green lifecycle. If a PR already
+     has a live `fixing` entry in `ci-fixes.json`, leave it alone.
+
+  2. **Post a review** (every PR gets one, not just stale ones): if this PR
+     has not yet been reviewed this cycle (track reviewed PR numbers in the
+     `dispatched.json` entry's `reviewed_prs` array), run `/ultrareview <pr>`
+     once — it posts the verdict as a **PR comment** + a consolidated **issue
+     comment**, then a Telegram line. Record the PR number in `reviewed_prs`
+     so it isn't re-reviewed every poll (re-review only if the PR's head SHA
+     changed since last review).
+
+  3. Otherwise stay quiet — the ball is in Sir's court to merge.
 
 - **`merged`/`failed`** — terminal; skip (house-keeping trims these).
 
@@ -225,8 +251,9 @@ For each entry, branch on `status`:
 gh pr list --state open --search "in:body #<issue>" --json number,title,headRefName,mergeable
 ```
 
-If a PR has been open for >30 min with no body update:
-- Run `/ultrareview <n>` autonomously and post the result to Telegram
+Reviews are now posted on **first sighting** of every PR (see the `pr-open`
+step above), not gated on a 30-min wait. Re-review a PR only if its head SHA
+changed (a CI-fix push or a manual update) since the last review.
 
 If all of the issue's lanes have merged:
 - Verify the issue's acceptance criteria are met

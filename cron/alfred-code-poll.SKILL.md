@@ -29,6 +29,10 @@ The procedure, in order:
    lanes merged + acceptance criteria met. On close, reap that issue's finished
    lane worktrees (`alfred-code-reap-worktrees --issue <n> --reap-merged --apply`
    — force-clears dirty/locked lanes whose PR landed; never touches un-landed work).
+   For each open PR: **auto-fix red CI** (`alfred-code-fix-pr <pr>` — capped at
+   2 attempts, skips documented flakes, appends to `docs/ci-lessons.md`) and
+   **post a review** (`/ultrareview <pr>` → PR + issue comment) on first sighting
+   or after a head-SHA change.
 5. **House-keep** — expire stale gates, trim state files, and GC orphaned
    worktrees (`~/.claude/bin/alfred-code-reap-worktrees --apply` — clean +
    merged/closed/empty only; dirty/un-landed always kept).
