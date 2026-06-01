@@ -22,10 +22,17 @@
 # Default is DRY-RUN. Pass --apply to actually remove. Pass --issue <N> to
 # limit reaping to worktrees whose branch references that issue number.
 #
+# --reap-merged ADDITIONALLY reaps worktrees whose PR is MERGED/CLOSED even when
+# dirty or locked — at that point the build is finished, so the lock is stale and
+# the dirt is post-merge scratch (node_modules, leftover edits). Still never
+# touches a worktree with no merged/closed PR, so genuine un-landed work (dirty
+# with no PR, or an OPEN PR) is always kept. Use on issue-close / manual sweeps.
+#
 # Usage:
 #   alfred-code-reap-worktrees                 # dry-run, full sweep
-#   alfred-code-reap-worktrees --apply         # reap all safe worktrees
-#   alfred-code-reap-worktrees --issue 120 --apply   # reap only #120's lanes
+#   alfred-code-reap-worktrees --apply         # reap clean+merged / empty only
+#   alfred-code-reap-worktrees --reap-merged --apply        # also force stale dirty/locked merged
+#   alfred-code-reap-worktrees --issue 120 --reap-merged --apply  # only #120's finished lanes
 
 set -euo pipefail
 
@@ -37,9 +44,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply) APPLY=1; shift ;;
     --issue) ISSUE_FILTER="${2:-}"; shift 2 ;;
+    --reap-merged) REAP_MERGED=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+REAP_MERGED="${REAP_MERGED:-0}"
 
 # Resolve the repo the loop operates on (same source as alfred-code-dispatch).
 REPO_PATH="/Users/ssd/dev/alfred"
@@ -82,18 +91,36 @@ flush() {
     wt=""; br=""; locked=0; return
   fi
   local base; base=$(basename "$wt")
-  if [[ $locked -eq 1 ]]; then
-    echo "  KEEP   (locked — live agent)         $base"
-    kept=$((kept+1)); wt=""; br=""; locked=0; return
-  fi
   local dirty; dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  local prs; prs=$(pr_state_for "$br")
+  local terminal=0
+  [[ "$prs" == "MERGED" || "$prs" == "CLOSED" ]] && terminal=1
+
+  # --reap-merged: a worktree whose PR already landed/closed is finished, so its
+  # lock is stale and any dirt is post-merge scratch (node_modules, leftover
+  # edits). Force-reap it. Without the flag we stay conservative and keep it.
+  if [[ $locked -eq 1 ]]; then
+    if [[ $REAP_MERGED -eq 1 && $terminal -eq 1 ]]; then
+      echo "  REAP   (locked, PR $prs — stale lock)  $base  [$br]"
+      REAP_LIST+=("$wt"); reaped=$((reaped+1))
+    else
+      echo "  KEEP   (locked — live agent)         $base"
+      kept=$((kept+1))
+    fi
+    wt=""; br=""; locked=0; return
+  fi
   if [[ "$dirty" -gt 0 ]]; then
-    echo "  KEEP   (dirty: $dirty uncommitted)        $base  [$br]"
-    kept=$((kept+1)); wt=""; br=""; locked=0; return
+    if [[ $REAP_MERGED -eq 1 && $terminal -eq 1 ]]; then
+      echo "  REAP   (dirty:$dirty, PR $prs — scratch)  $base  [$br]"
+      REAP_LIST+=("$wt"); reaped=$((reaped+1))
+    else
+      echo "  KEEP   (dirty: $dirty uncommitted)        $base  [$br]"
+      kept=$((kept+1))
+    fi
+    wt=""; br=""; locked=0; return
   fi
   local uniq; uniq=$(git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo "?")
-  local prs; prs=$(pr_state_for "$br")
-  if [[ "$prs" == "MERGED" || "$prs" == "CLOSED" ]]; then
+  if [[ $terminal -eq 1 ]]; then
     echo "  REAP   (PR $prs, clean)              $base  [$br]"
     REAP_LIST+=("$wt"); reaped=$((reaped+1))
   elif [[ "$uniq" == "0" && "$prs" == "NONE" ]]; then
@@ -126,7 +153,11 @@ if [[ $APPLY -eq 1 && $reaped -gt 0 ]]; then
   echo ""
   echo "  applying:"
   for w in "${REAP_LIST[@]}"; do
-    if git worktree remove "$w" 2>/dev/null; then
+    # Everything in REAP_LIST was gated safe at classification time (clean+merged,
+    # empty scratch, or --reap-merged terminal-PR). unlock first so locked stale
+    # dirs remove cleanly; --force covers post-merge scratch dirt.
+    git worktree unlock "$w" 2>/dev/null || true
+    if git worktree remove --force "$w" 2>/dev/null; then
       echo "    removed $(basename "$w")"
     else
       echo "    SKIPPED $(basename "$w") (remove refused — left intact)"; skipped=$((skipped+1))

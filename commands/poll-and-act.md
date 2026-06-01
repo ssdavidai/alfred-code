@@ -235,10 +235,12 @@ If all of the issue's lanes have merged:
 - **Reap that issue's lane worktrees** — the build left an isolated worktree
   per lane; now that the PRs are merged they're dead weight:
   ```bash
-  ~/.claude/bin/alfred-code-reap-worktrees --issue <issue#> --apply
+  ~/.claude/bin/alfred-code-reap-worktrees --issue <issue#> --reap-merged --apply
   ```
-  This only removes worktrees whose PR is MERGED/CLOSED (or empty scratch) and
-  whose working tree is clean — dirty or un-landed worktrees are left intact.
+  `--reap-merged` is right here because the build is provably finished: it
+  force-removes the issue's lanes even when they're dirty (leftover
+  node_modules) or still hold a stale agent lock, as long as their PR is
+  MERGED/CLOSED. Worktrees with no merged PR or an OPEN PR are never touched.
 
 ### 5. House-keeping
 
