@@ -28,6 +28,21 @@ If `~/.alfred-code-state/.env` is missing, **stop and tell Sir to run `/setup-te
 
 ## Process (run in order, stop after each step's work is done)
 
+### 0. Acquire the single-flight lock (FIRST — prevents duplicate sends)
+
+A poll run that takes >5 min overlaps the next scheduled run; with no lock,
+overlapping runs each see the same new issue and all post → the "1 issue → 3
+Telegram sends" bug. So before anything else:
+
+```bash
+~/.claude/bin/alfred-code-poll-lock acquire
+```
+
+If it exits non-zero / prints `HELD`, **another poll is already running — STOP
+immediately and do nothing this cycle** (exit quietly, no Telegram). Only
+proceed past this point if it printed `ACQUIRED` / `ACQUIRED-STOLEN`. Release
+it in step 5 (and the 15-min TTL auto-frees it if this run crashes).
+
 ### 1. Poll Telegram for Sir's recent replies
 
 ```bash
@@ -110,7 +125,12 @@ For each genuinely-new issue (no live gate, not dispatched):
   - `research` — needs investigation before code; dispatch a research agent (sandbox, no PR)
   - `skip` — already covered by an open PR, or a duplicate, or out of scope
 - **For non-skip**: draft a 3-bullet decomposition per the lane protocol (`docs/lane-protocol.md`)
-- **Post to Telegram** with the decomposition + a Y/N gate
+- **Register the gate in `pending-gates.json` FIRST, THEN post to Telegram.**
+  Write-before-send is mandatory: persisting the gate (status `awaiting`,
+  `tg_message_id: null`) before the send means any racing/retried run sees it
+  in the dedup check and skips — so a slow send or a second poll can't double-post.
+  After the send succeeds, backfill `tg_message_id`. (The step-0 lock already
+  serializes polls; this ordering is the belt-and-suspenders.)
 
 Telegram post shape:
 
@@ -282,6 +302,10 @@ If all of the issue's lanes have merged:
   It removes ONLY worktrees that are clean AND (PR merged/closed OR empty
   scratch with no open PR); dirty or un-landed worktrees are always kept. Safe
   to run every poll — it's a no-op when there's nothing to reap.
+- **Release the single-flight lock** (last thing, always):
+  ```bash
+  ~/.claude/bin/alfred-code-poll-lock release
+  ```
 
 ## Honest reporting rules
 

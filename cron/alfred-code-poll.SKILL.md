@@ -16,6 +16,10 @@ detail. The earlier circular-reference stub was a bug.)
 
 The procedure, in order:
 
+0. **Single-flight lock** — `~/.claude/bin/alfred-code-poll-lock acquire`. If it
+   prints `HELD`, another poll is mid-run; STOP and do nothing this cycle (this
+   is what prevents the "1 issue → 3 Telegram sends" overlap bug). Release it at
+   the end.
 1. **Telegram in** — `getUpdates` since `last-tg-update-id`; parse Sir's replies
    (`y #N` / `n #N` / `status` / `merge #N` / `skip #N` / `pause` / `resume`).
    `y`/`n` mean "do / don't do the action that gate proposed" — for a `skip`

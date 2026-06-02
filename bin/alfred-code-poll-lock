@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# alfred-code-poll-lock — single-flight guard for the 5-min poll.
+#
+# The poll runs every 5 min as a Desktop Scheduled Task, but a run that takes
+# longer than 5 min (triage + dispatch + review) overlaps the next one. With
+# no lock, two/three overlapping runs each see the same new issue BEFORE any
+# of them has persisted its gate, so they all post → duplicate Telegram sends
+# (the "1 issue → 3 sends" bug). This makes the poll single-flight.
+#
+# Uses an atomic `mkdir` lock (POSIX-atomic) with a PID + timestamp inside and
+# a staleness TTL, so a crashed poll's lock auto-expires instead of wedging
+# the loop forever.
+#
+# Usage:
+#   alfred-code-poll-lock acquire   # prints ACQUIRED / ACQUIRED-STOLEN (exit 0) or HELD (exit 1)
+#   alfred-code-poll-lock release   # always exit 0
+#
+# Contract for poll-and-act: run `acquire` FIRST; if it exits non-zero (HELD),
+# another poll is live — do nothing this cycle and exit quietly. Run `release`
+# at the very end.
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.alfred-code-state"
+LOCK="${STATE_DIR}/poll.lock"          # a directory (atomic mkdir)
+META="${LOCK}/meta"
+TTL="${ALFRED_CODE_POLL_LOCK_TTL:-900}"  # 15 min — longer than any healthy poll
+mkdir -p "$STATE_DIR"
+
+now() { date +%s; }
+
+case "${1:-}" in
+  acquire)
+    if mkdir "$LOCK" 2>/dev/null; then
+      printf 'pid=%s\nts=%s\n' "$$" "$(now)" > "$META"
+      echo "ACQUIRED"; exit 0
+    fi
+    # Lock exists — is it stale (holder dead, or older than TTL)?
+    held_pid=$(sed -n 's/^pid=//p' "$META" 2>/dev/null || true)
+    held_ts=$(sed -n 's/^ts=//p' "$META" 2>/dev/null || echo 0)
+    age=$(( $(now) - ${held_ts:-0} ))
+    alive=0
+    [[ -n "$held_pid" ]] && kill -0 "$held_pid" 2>/dev/null && alive=1
+    if [[ "$alive" -eq 0 || "$age" -ge "$TTL" ]]; then
+      rm -rf "$LOCK"
+      if mkdir "$LOCK" 2>/dev/null; then
+        printf 'pid=%s\nts=%s\n' "$$" "$(now)" > "$META"
+        echo "ACQUIRED-STOLEN (prev pid=${held_pid:-?} age=${age}s alive=${alive})"; exit 0
+      fi
+    fi
+    echo "HELD (pid=${held_pid:-?} age=${age}s)"; exit 1
+    ;;
+  release)
+    rm -rf "$LOCK" 2>/dev/null || true
+    echo "RELEASED"; exit 0
+    ;;
+  *)
+    echo "usage: alfred-code-poll-lock {acquire|release}" >&2; exit 2
+    ;;
+esac
