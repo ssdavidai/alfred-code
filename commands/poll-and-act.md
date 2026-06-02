@@ -43,6 +43,32 @@ immediately and do nothing this cycle** (exit quietly, no Telegram). Only
 proceed past this point if it printed `ACQUIRED` / `ACQUIRED-STOLEN`. Release
 it in step 5 (and the 15-min TTL auto-frees it if this run crashes).
 
+### 0.5 Reconcile against GitHub — MANDATORY, every poll (GitHub is the source of truth)
+
+**Do this before anything else (after the lock). GitHub — never `dispatched.json`
+— is the authority for what's merged, open, or red.** The loop's local memory
+drifts the moment work happens outside it (a human merge, a direct push, an
+operator acting manually), so each poll must re-derive truth from GitHub:
+
+```bash
+~/.claude/bin/alfred-code-reconcile
+```
+
+It pulls live state (open PRs + their CI + linked issue, PRs merged/closed in
+the last 36h, open-issue count), self-heals local gates (any gate whose issue is
+CLOSED on GitHub is marked closed), writes the authoritative snapshot to
+`~/.alfred-code-state/gh-truth.json`, and prints:
+- a **`Δ since last poll`** block — if non-empty, **post it to Sir's Telegram**
+  (this is how he sees merges/closes/new-PRs/now-red-CI that happened since last
+  time, including ones the loop didn't do itself). If it says `(no change)`,
+  stay quiet.
+- the **current authoritative summary** — use THIS (not `dispatched.json`) as the
+  truth for steps 3–4: an issue GitHub says is closed is done; a PR GitHub says
+  is merged is merged; a PR GitHub shows RED is what `alfred-code-fix-pr` acts on.
+
+If `gh-truth.json` and `dispatched.json` disagree, **GitHub wins** — correct the
+local file, never the reverse.
+
 ### 1. Poll Telegram for Sir's recent replies
 
 ```bash

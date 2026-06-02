@@ -20,6 +20,10 @@ The procedure, in order:
    prints `HELD`, another poll is mid-run; STOP and do nothing this cycle (this
    is what prevents the "1 issue → 3 Telegram sends" overlap bug). Release it at
    the end.
+0.5 **Reconcile against GitHub (source of truth) — MANDATORY** —
+   `~/.claude/bin/alfred-code-reconcile`. Post its `Δ since last poll` to
+   Telegram if non-empty; trust its GitHub snapshot over `dispatched.json` for
+   the rest of the run. GitHub always wins over local memory.
 1. **Telegram in** — `getUpdates` since `last-tg-update-id`; parse Sir's replies
    (`y #N` / `n #N` / `status` / `merge #N` / `skip #N` / `pause` / `resume`).
    `y`/`n` mean "do / don't do the action that gate proposed" — for a `skip`
