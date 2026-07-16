@@ -31,9 +31,8 @@ Plans include the issue-body hash and pinned base SHA. Regeneration, issue edits
 Read [the executable v2 architecture](docs/control-plane-v2.md) for the full authority and state model. Run the test suite with:
 
 ```bash
-python3 -m pip install -e .
 python3 -m compileall -q src tests
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 ## Legacy v1 Telegram package
