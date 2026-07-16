@@ -519,6 +519,9 @@ class Controller:
                 {"job": job_id, "pr": pr.url, "sha": pr.head_sha},
             )
             return
+        if job.get("review_sha") == pr.head_sha and job.get("review_requested_at"):
+            self.database.update_job(job_id, state="reviewing")
+            return
         review_name = self._review_workspace_name(pr.number, pr.head_sha)
         existing = self.superset.workspace_by_name(review_name)
         if existing:
@@ -535,11 +538,14 @@ class Controller:
             review_sha=pr.head_sha,
             review_requested_at=utcnow(),
         )
+        review_branch = f"review/{pr.number}-{pr.head_sha[:12]}"
+        self._prepare_exact_branch(review_branch, pr.head_sha)
         project_id = self.superset.ensure_project(self.config.repo_path)
         workspace, agent_id = self.superset.create_review_workspace(
             project_id,
             pr.number,
             review_name,
+            review_branch,
             self.reviewer_prompt(issue, plan, job, pr),
         )
         self.database.update_job(
@@ -563,6 +569,19 @@ class Controller:
             raise AuthorityUnavailable(
                 f"existing branch {branch} is not descended from approved base {base_sha[:12]}"
             ) from exc
+
+    def _prepare_exact_branch(self, branch: str, head_sha: str) -> None:
+        repo = self.config.repo_path
+        run(["git", "cat-file", "-e", f"{head_sha}^{{commit}}"], cwd=repo)
+        try:
+            existing = run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo).strip()
+        except CommandError:
+            run(["git", "update-ref", f"refs/heads/{branch}", head_sha, ""], cwd=repo)
+            return
+        if existing != head_sha:
+            raise AuthorityUnavailable(
+                f"existing review branch {branch} is {existing[:12]}, expected {head_sha[:12]}"
+            )
 
     def _worker_progress_timed_out(
         self,

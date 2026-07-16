@@ -195,7 +195,14 @@ class SupersetClient:
             return str(identifier) if identifier else None
         return None
 
-    def create_review_workspace(self, project_id: str, pr_number: int, name: str, prompt: str) -> tuple[Workspace, str | None]:
+    def create_review_workspace(
+        self,
+        project_id: str,
+        pr_number: int,
+        name: str,
+        branch: str,
+        prompt: str,
+    ) -> tuple[Workspace, str | None]:
         result = self._json(
             [
                 "workspaces",
@@ -205,8 +212,10 @@ class SupersetClient:
                 project_id,
                 "--name",
                 name,
-                "--pr",
-                str(pr_number),
+                "--branch",
+                branch,
+                "--base-branch",
+                "main",
                 "--agent",
                 self.config.reviewer_agent.lower(),
                 "--prompt",
@@ -220,7 +229,7 @@ class SupersetClient:
         workspace = Workspace(
             id=self._id(data),
             name=str(data.get("name") or name),
-            branch=str(data.get("branch") or data.get("branchName") or ""),
+            branch=str(data.get("branch") or data.get("branchName") or branch),
             url=data.get("url") or data.get("deeplink") or data.get("webUrl"),
         )
         agent_data = result.get("agent") if isinstance(result.get("agent"), dict) else {}

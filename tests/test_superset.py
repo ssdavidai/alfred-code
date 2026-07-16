@@ -51,6 +51,23 @@ class SupersetTests(unittest.TestCase):
         self.assertEqual(lane["controller_job"], "api")
         self.assertEqual(lane["allowed"], ["api/**"])
 
+    def test_review_workspace_uses_a_distinct_exact_sha_branch(self):
+        client = FakeSuperset()
+
+        workspace, agent = client.create_review_workspace(
+            "project-1",
+            293,
+            "alfred-code-review-293-dc011023",
+            "review/293-dc0110232f22",
+            "review",
+        )
+
+        self.assertEqual(workspace.branch, "review/293-dc0110232f22")
+        self.assertEqual(agent, "agent-1")
+        create = next(call for call in client.calls if call[:2] == ["workspaces", "create"])
+        self.assertEqual(create[create.index("--branch") + 1], "review/293-dc0110232f22")
+        self.assertNotIn("--pr", create)
+
 
 if __name__ == "__main__":
     unittest.main()

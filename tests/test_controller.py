@@ -119,9 +119,9 @@ class FakeSuperset:
     def ensure_project(self, repo_path):
         return "project"
 
-    def create_review_workspace(self, project_id, pr_number, name, prompt):
+    def create_review_workspace(self, project_id, pr_number, name, branch, prompt):
         self.review_creates += 1
-        workspace = Workspace(f"r-{pr_number}-{self.review_creates}", name, "review", f"superset://{name}")
+        workspace = Workspace(f"r-{pr_number}-{self.review_creates}", name, branch, f"superset://{name}")
         self.workspaces_by_name[name] = workspace
         return workspace, f"review-agent-{self.review_creates}"
 
@@ -212,6 +212,7 @@ class ControllerTests(unittest.TestCase):
             DurableNotifier(self.db, self.channel),
             audit=AuditLog(self.root / "audit.jsonl"),
         )
+        self.controller._prepare_exact_branch = lambda branch, head_sha: None
 
     def tearDown(self):
         self.db.close()
@@ -345,6 +346,18 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         self.assertEqual(self.superset.worker_creates, 1)
 
+    def test_prepare_exact_review_branch_is_pinned_and_immutable(self):
+        branch = f"review/5-{self.sha[:12]}"
+        Controller._prepare_exact_branch(self.controller, branch, self.sha)
+        actual = subprocess.run(
+            ["git", "rev-parse", branch],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(actual, self.sha)
+
     def test_clean_worker_workspace_times_out_and_releases_lane(self):
         self.controller.run_once()
         self.approve()
@@ -405,6 +418,7 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         self.assertEqual(self.db.get_job("api-12")["state"], "reviewing")
         self.assertEqual(self.superset.review_creates, 1)
+        self.superset.workspaces_by_name.clear()
         self.controller.run_once()
         self.assertEqual(self.superset.review_creates, 1)
         self.github.verdicts[(5, green.head_sha)] = "pass"
