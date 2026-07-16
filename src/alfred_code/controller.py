@@ -45,18 +45,71 @@ class Controller:
         self.audit.write(kind, **detail)
 
     def observe_issues(self) -> list[dict[str, Any]]:
-        intake = {int(issue["number"]): issue for issue in self.github.intake_issues()}
-        for tracked in self.database.list_issues():
-            number = int(tracked["number"])
-            if number not in intake:
-                intake[number] = self.github.issue(number)
-        observed = []
-        for number in sorted(intake):
-            local = self.database.upsert_issue(intake[number])
-            observed.append(local)
-            self.database.observe("github", f"issue:{number}", intake[number])
-        self._record("github.issues_refreshed", count=len(observed))
-        return observed
+        open_issues = {int(issue["number"]): issue for issue in self.github.open_issues()}
+        tracked = {int(issue["number"]): issue for issue in self.database.list_issues()}
+        live = dict(open_issues)
+        for number, issue in tracked.items():
+            if issue["github_state"] == "OPEN" and number not in live:
+                live[number] = self.github.issue(number)
+
+        project_ready = bool(
+            self.config.apply and self.project and self.config.github.project_number
+        )
+        if project_ready:
+            try:
+                self.project.refresh(int(self.config.github.project_number))
+            except AuthorityUnavailable as exc:
+                project_ready = False
+                self._record("project.refresh_failed", error=str(exc))
+
+        candidates: list[dict[str, Any]] = []
+        intake_label = self.config.github.intake_label
+        for number in sorted(live):
+            previous = tracked.get(number)
+            local = self.database.upsert_issue(live[number])
+            self.database.observe("github", f"issue:{number}", live[number])
+            jobs = self.database.list_jobs(number)
+            current = self.database.current_plan(number)
+
+            if (
+                previous
+                and previous["github_state"] == "CLOSED"
+                and local["github_state"] == "OPEN"
+                and local["controller_state"] == "closed"
+                and not current
+                and not jobs
+            ):
+                self.database.set_issue_state(number, "observed", {"reason": "GitHub issue reopened"})
+                local = self.database.get_issue(number) or local
+            elif local["github_state"] == "CLOSED" and local["controller_state"] == "observed":
+                self.database.set_issue_state(number, "closed", {"reason": "GitHub issue closed"})
+                local = self.database.get_issue(number) or local
+
+            if project_ready:
+                self._sync_project(number)
+
+            labels = {
+                str(label.get("name") or "")
+                for label in live[number].get("labels", [])
+                if isinstance(label, dict)
+            }
+            enrolled = local["github_state"] == "OPEN" and (
+                not intake_label or intake_label in labels
+            )
+            active = bool(current or jobs) or local["controller_state"] not in {
+                "observed",
+                "closed",
+                "completed",
+            }
+            if enrolled or active:
+                candidates.append(local)
+
+        self._record(
+            "github.issues_refreshed",
+            count=len(candidates),
+            backlog_count=len(open_issues),
+        )
+        return candidates
 
     def run_once(self) -> dict[str, Any]:
         started = utcnow()

@@ -25,6 +25,9 @@ class ProjectBoard:
     def __init__(self, config: GitHubConfig, binary: str = "gh"):
         self.config = config
         self.binary = binary
+        self._projects: dict[int, dict[str, Any]] = {}
+        self._fields: dict[int, dict[str, dict[str, Any]]] = {}
+        self._items: dict[int, dict[str, dict[str, Any]]] = {}
 
     def _json(self, args: list[str]) -> Any:
         try:
@@ -92,11 +95,14 @@ class ProjectBoard:
             if options:
                 args.extend(["--single-select-options", ",".join(options)])
             self._json(args)
+        self._fields.pop(number, None)
         return self._json(
             ["project", "view", str(number), "--owner", self.config.owner, "--format", "json"]
         )
 
     def fields(self, number: int) -> dict[str, dict[str, Any]]:
+        if number in self._fields:
+            return self._fields[number]
         values = self._values(
             self._json(
                 [
@@ -113,9 +119,15 @@ class ProjectBoard:
             ),
             "fields",
         )
-        return {str(field.get("name")): field for field in values}
+        self._fields[number] = {str(field.get("name")): field for field in values}
+        return self._fields[number]
 
-    def _item(self, number: int, issue_url: str) -> dict[str, Any] | None:
+    def refresh(self, number: int) -> None:
+        self._projects[number] = self._json(
+            ["project", "view", str(number), "--owner", self.config.owner, "--format", "json"]
+        )
+        self._fields.pop(number, None)
+        self.fields(number)
         values = self._values(
             self._json(
                 [
@@ -132,11 +144,38 @@ class ProjectBoard:
             ),
             "items",
         )
+        self._items[number] = {
+            str((item.get("content") or {}).get("url")): item
+            for item in values
+            if (item.get("content") or {}).get("url")
+        }
+
+    def _item(self, number: int, issue_url: str) -> dict[str, Any] | None:
+        if number in self._items:
+            return self._items[number].get(issue_url)
+        values = self._values(
+            self._json(
+                [
+                    "project",
+                    "item-list",
+                    str(number),
+                    "--owner",
+                    self.config.owner,
+                    "--limit",
+                    "500",
+                    "--format",
+                    "json",
+                ]
+            ),
+            "items",
+        )
+        self._items[number] = {}
         for item in values:
             content = item.get("content") or {}
-            if content.get("url") == issue_url:
-                return item
-        return None
+            url = content.get("url")
+            if url:
+                self._items[number][str(url)] = item
+        return self._items[number].get(issue_url)
 
     def _edit(self, project_id: str, item_id: str, field: dict[str, Any], value: str) -> None:
         args = [
@@ -172,9 +211,12 @@ class ProjectBoard:
         lanes: list[str] | None = None,
         runtime: str = "",
     ) -> None:
-        project = self._json(
-            ["project", "view", str(project_number), "--owner", self.config.owner, "--format", "json"]
-        )
+        project = self._projects.get(project_number)
+        if project is None:
+            project = self._json(
+                ["project", "view", str(project_number), "--owner", self.config.owner, "--format", "json"]
+            )
+            self._projects[project_number] = project
         item = self._item(project_number, issue_url)
         if item is None:
             item = self._json(
@@ -190,6 +232,7 @@ class ProjectBoard:
                     "json",
                 ]
             )
+            self._items.setdefault(project_number, {})[issue_url] = item
         fields = self.fields(project_number)
         values = {
             "Control stage": PROJECT_STATUS.get(controller_state, "Inbox"),
@@ -200,4 +243,8 @@ class ProjectBoard:
         }
         for name, value in values.items():
             if value and name in fields:
+                key = name.lower()
+                if str(item.get(key) or "") == value:
+                    continue
                 self._edit(str(project["id"]), str(item["id"]), fields[name], value)
+                item[key] = value

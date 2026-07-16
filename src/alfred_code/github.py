@@ -71,6 +71,25 @@ class GitHubClient:
             ]
         )
 
+    def open_issues(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        result = self._json(
+            [
+                "issue",
+                "list",
+                "--repo",
+                self.config.repo,
+                "--state",
+                "open",
+                "--limit",
+                str(limit),
+                "--json",
+                "id,number,title,body,state,url,labels,updatedAt",
+            ]
+        )
+        if not isinstance(result, list):
+            raise AuthorityUnavailable("GitHub issue list returned a non-array response")
+        return result
+
     def intake_issues(self, *, limit: int = 100) -> list[dict[str, Any]]:
         arguments = [
             "issue",

@@ -28,6 +28,7 @@ class RecordingChannel:
 class FakeGitHub:
     def __init__(self, issue, sha):
         self.issue_value = issue
+        self.extra_issues = {}
         self.sha = sha
         self.approval = None
         self.prs = {}
@@ -37,8 +38,14 @@ class FakeGitHub:
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
 
+    def open_issues(self):
+        issues = [self.issue_value, *self.extra_issues.values()]
+        return [copy.deepcopy(issue) for issue in issues if issue["state"] == "OPEN"]
+
     def issue(self, number):
-        return copy.deepcopy(self.issue_value)
+        if number == int(self.issue_value["number"]):
+            return copy.deepcopy(self.issue_value)
+        return copy.deepcopy(self.extra_issues[number])
 
     def default_branch_sha(self):
         return self.sha
@@ -108,6 +115,18 @@ class FakeSuperset:
 
     def delete_workspace(self, workspace_id):
         self.deleted.append(workspace_id)
+
+
+class FakeProject:
+    def __init__(self):
+        self.refreshes = []
+        self.synced = {}
+
+    def refresh(self, number):
+        self.refreshes.append(number)
+
+    def sync_issue(self, **values):
+        self.synced[values["issue_url"]] = copy.deepcopy(values)
 
 
 class ControllerTests(unittest.TestCase):
@@ -203,6 +222,44 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         self.assertEqual(self.planner.calls, 0)
         self.assertEqual(self.db.get_issue(12)["controller_state"], "observed")
+
+    def test_open_backlog_is_projected_without_enrolling_unlabeled_issues(self):
+        backlog = {
+            "id": "I_13",
+            "number": 13,
+            "title": "Backlog item",
+            "body": "Keep visible without execution",
+            "state": "OPEN",
+            "url": "https://example/issues/13",
+            "labels": [{"name": "bug"}],
+        }
+        self.github.extra_issues[13] = backlog
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+
+        result = self.controller.run_once()
+
+        self.assertEqual([item["number"] for item in result["issues"]], [12])
+        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(self.db.get_issue(13)["controller_state"], "observed")
+        self.assertEqual(project.refreshes, [3])
+        self.assertEqual(
+            project.synced["https://example/issues/13"]["controller_state"],
+            "observed",
+        )
+        self.assertIsNone(self.db.current_plan(13))
+
+        self.github.extra_issues[13]["state"] = "CLOSED"
+        self.controller.run_once()
+        self.assertEqual(self.db.get_issue(13)["controller_state"], "closed")
+        self.assertEqual(
+            project.synced["https://example/issues/13"]["controller_state"],
+            "closed",
+        )
 
     def test_approval_launches_once_and_restart_adopts_workspace(self):
         self.controller.run_once()
