@@ -278,11 +278,17 @@ class GitHubClient:
             return False
         if body.startswith("## Alfred Code spec"):
             return False
-        control_prefixes = (
-            f"{self.config.approval_command} ",
-            f"{self.config.rejection_command} ",
+        control_commands = (
+            self.config.approval_command,
+            self.config.rejection_command,
         )
-        return not body.startswith(control_prefixes)
+        for command in control_commands:
+            if body == command:
+                return False
+            suffix = body[len(command) :] if body.startswith(command) else ""
+            if suffix and suffix[0].isspace():
+                return False
+        return True
 
     def default_branch_sha(self) -> str:
         repo = self._json(

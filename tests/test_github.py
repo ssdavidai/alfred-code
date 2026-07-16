@@ -92,6 +92,18 @@ class GitHubTests(unittest.TestCase):
                 "user": {"login": "owner"},
                 "created_at": "2026-01-01T00:02:00Z",
             },
+            {
+                "id": 3,
+                "body": "/approve-plan",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:03:00Z",
+            },
+            {
+                "id": 4,
+                "body": f"/reject-plan\t{digest[:12]}",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:04:00Z",
+            },
         ]
 
         self.assertIsNone(client.find_feedback(5, after="2026-01-01T00:00:00Z"))
