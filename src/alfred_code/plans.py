@@ -90,6 +90,7 @@ class PlanValidator:
         issue_number: int,
         base_sha: str,
         issue_body_hash: str = "",
+        decision_context_hash: str | None = None,
     ) -> tuple[dict[str, Any], str]:
         problems: list[str] = []
         if not isinstance(raw, dict):
@@ -236,4 +237,6 @@ class PlanValidator:
             "risk": str(raw.get("risk") or "medium").strip().lower(),
             "jobs": normalized_jobs,
         }
+        if decision_context_hash is not None:
+            normalized["decision_context_hash"] = decision_context_hash
         return normalized, content_hash(normalized)

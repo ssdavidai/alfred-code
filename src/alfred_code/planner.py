@@ -133,7 +133,13 @@ class Planner:
         text = run(["git", "show", f"{base_sha}:{relative}"], cwd=self.config.repo_path, timeout=30)
         return LanePolicy.from_text(Path(f"{base_sha}:{relative}"), text), text
 
-    def prompt(self, issue: dict[str, Any], base_sha: str, policy_text: str) -> str:
+    def prompt(
+        self,
+        issue: dict[str, Any],
+        base_sha: str,
+        policy_text: str,
+        decision_comments: list[dict[str, str]],
+    ) -> str:
         open_prs = self.github.open_prs()
         evidence = self.repository_evidence(base_sha)
         return f"""You are specifying GitHub issue #{issue['number']} for deterministic multi-agent execution.
@@ -145,6 +151,9 @@ ISSUE TITLE:
 
 ISSUE BODY:
 {issue.get('body', '')}
+
+OPERATOR DECISION COMMENTS:
+{json.dumps(decision_comments, indent=2)}
 
 PINNED DEFAULT-BRANCH SHA:
 {base_sha}
@@ -184,13 +193,20 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
 
     def plan_issue(self, issue_number: int) -> tuple[dict[str, Any], str]:
         issue = self.github.issue(issue_number)
+        decision_comments = self.github.decision_comments(issue_number)
+        decision_context_hash = content_hash(
+            {
+                "body": str(issue.get("body") or ""),
+                "comments": decision_comments,
+            }
+        )
         base_sha = self.github.default_branch_sha()
         run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
         policy, policy_text = self.policy_at(base_sha)
         output = run(
             structured_planner_command(self.config.planner_command, issue_number, base_sha),
             cwd=self.config.repo_path,
-            input_text=self.prompt(issue, base_sha, policy_text),
+            input_text=self.prompt(issue, base_sha, policy_text, decision_comments),
             timeout=self.config.planner_timeout_seconds,
         )
         raw = extract_json(output)
@@ -199,6 +215,7 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
             issue_number=issue_number,
             base_sha=base_sha,
             issue_body_hash=content_hash(str(issue.get("body") or "")),
+            decision_context_hash=decision_context_hash,
         )
 
     def revalidate(self, plan: dict[str, Any], expected_hash: str) -> None:
@@ -213,6 +230,7 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
             issue_number=int(plan["issue"]),
             base_sha=str(plan["base_sha"]),
             issue_body_hash=str(plan.get("issue_body_hash") or ""),
+            decision_context_hash=plan.get("decision_context_hash"),
         )
         if actual_hash != expected_hash or normalized != plan:
             raise PlanValidationError(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,17 +86,33 @@ class Controller:
                 self.database.set_issue_state(number, "closed", {"reason": "GitHub issue closed"})
                 local = self.database.get_issue(number) or local
 
-            if project_ready:
-                self._sync_project(number)
-
             labels = {
                 str(label.get("name") or "")
                 for label in live[number].get("labels", [])
                 if isinstance(label, dict)
             }
             enrolled = local["github_state"] == "OPEN" and (
-                not intake_label or intake_label in labels
+                self.config.github.auto_intake
+                or not intake_label
+                or intake_label in labels
             )
+            if (
+                self.config.apply
+                and enrolled
+                and not current
+                and not jobs
+                and local["controller_state"] == "observed"
+            ):
+                self.database.set_issue_state(
+                    number,
+                    "planning",
+                    {"reason": "automatic GitHub issue intake"},
+                )
+                local = self.database.get_issue(number) or local
+
+            if project_ready:
+                self._sync_project(number)
+
             active = bool(current or jobs) or local["controller_state"] not in {
                 "observed",
                 "closed",
@@ -175,6 +192,24 @@ class Controller:
             current = None
 
         if current and not jobs and not self.database.is_approved(current["plan_hash"]):
+            if current["status"] == "rejected":
+                self._sync_project(issue_number)
+                return self._issue_summary(issue_number)
+            feedback = self.github.find_feedback(issue_number, after=current["created_at"])
+            if feedback:
+                self.database.invalidate_plan(
+                    issue_number,
+                    f"operator feedback in comment {feedback['comment_id']}",
+                )
+                self.notifier.send(
+                    f"issue:{issue_number}:feedback:{feedback['comment_id']}",
+                    f"Alfred #{issue_number} received specification feedback from @{feedback['actor']} and is replanning.",
+                    {"issue": issue_number, "comment": feedback.get("url")},
+                )
+                self._sync_project(issue_number)
+                current = None
+
+        if current and not jobs and not self.database.is_approved(current["plan_hash"]):
             live_sha = self.github.default_branch_sha()
             if live_sha != current["base_sha"]:
                 self.database.invalidate_plan(issue_number, "default branch advanced before approval")
@@ -191,6 +226,7 @@ class Controller:
                     f"Alfred #{issue_number} could not be specified: {exc}",
                     {"issue": issue_number},
                 )
+                self._sync_project(issue_number)
                 raise
             self.database.save_plan(issue_number, plan_hash, plan)
             plan_url = self.github.post_plan(issue_number, plan, plan_hash)
@@ -207,9 +243,25 @@ class Controller:
         plan_hash = current["plan_hash"]
         self.planner.revalidate(plan, plan_hash)
         self.github.post_plan(issue_number, plan, plan_hash)
-        approval = self.github.find_approval(issue_number, plan_hash)
+        decision = self.github.find_decision(issue_number, plan_hash)
         if not self.database.is_approved(plan_hash):
-            if approval is None:
+            if decision is None:
+                self._sync_project(issue_number)
+                return self._issue_summary(issue_number)
+            if decision["decision"] == "reject":
+                self.database.reject_plan(
+                    issue_number,
+                    plan_hash,
+                    decision["actor"],
+                    decision["comment_id"],
+                    decision.get("url"),
+                    decision["created_at"],
+                )
+                self.notifier.send(
+                    f"issue:{issue_number}:rejected:{plan_hash}",
+                    f"Alfred #{issue_number} plan {plan_hash[:12]} was rejected by @{decision['actor']}.",
+                    {"issue": issue_number, "plan_hash": plan_hash, "url": decision.get("url")},
+                )
                 self._sync_project(issue_number)
                 return self._issue_summary(issue_number)
             live_sha = self.github.default_branch_sha()
@@ -225,14 +277,14 @@ class Controller:
             self.database.record_approval(
                 issue_number,
                 plan_hash,
-                approval["actor"],
-                approval["comment_id"],
-                approval.get("url"),
-                approval["created_at"],
+                decision["actor"],
+                decision["comment_id"],
+                decision.get("url"),
+                decision["created_at"],
             )
             self.notifier.send(
                 f"issue:{issue_number}:approved:{plan_hash}",
-                f"Alfred #{issue_number} plan {plan_hash[:12]} was approved by @{approval['actor']} and is queued.",
+                f"Alfred #{issue_number} plan {plan_hash[:12]} was approved by @{decision['actor']} and is queued.",
                 {"issue": issue_number, "plan_hash": plan_hash},
             )
 
@@ -302,11 +354,29 @@ class Controller:
         if job["state"] in TERMINAL_JOB_STATES:
             return
         if job["workspace_id"]:
+            if (
+                job["state"] == "blocked"
+                and str(job.get("last_error") or "").startswith("worker made no repository progress")
+            ):
+                return
             details = self.superset.workspace_details(job["workspace_id"])
             self.database.observe("superset", f"workspace:{job['workspace_id']}", details)
             status_blob = json.dumps(details).lower()
             if any(token in status_blob for token in ('"failed"', '"crashed"', '"terminated"')):
                 self.database.update_job(job_id, state="blocked", last_error="Superset reports a failed agent session")
+            elif self._worker_progress_timed_out(job, plan, details):
+                timeout = self.config.superset.worker_progress_timeout_seconds
+                error = (
+                    f"worker made no repository progress within {timeout} seconds; "
+                    "inspect the Superset terminal for an interactive startup prompt or failed agent"
+                )
+                self.database.update_job(job_id, state="blocked", last_error=error)
+                self.database.release_lane(job_id)
+                self.notifier.send(
+                    f"job:{job_id}:no-progress:{plan['base_sha']}",
+                    f"Alfred #{issue['number']} lane {job['lane']} is blocked: {error}.",
+                    {"job": job_id, "workspace": job["workspace_id"]},
+                )
             else:
                 self.database.update_job(job_id, state="running")
             return
@@ -493,6 +563,43 @@ class Controller:
             raise AuthorityUnavailable(
                 f"existing branch {branch} is not descended from approved base {base_sha[:12]}"
             ) from exc
+
+    def _worker_progress_timed_out(
+        self,
+        job: dict[str, Any],
+        plan: dict[str, Any],
+        workspace: dict[str, Any],
+    ) -> bool:
+        path_value = workspace.get("worktreePath") or workspace.get("worktree_path")
+        if not path_value:
+            return False
+        worktree = Path(str(path_value)).expanduser()
+        if not worktree.is_dir():
+            return False
+        try:
+            head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+            status = run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=worktree,
+                timeout=30,
+            )
+        except (CommandError, OSError):
+            return False
+        meaningful = [
+            line
+            for line in status.splitlines()
+            if line.strip() and line[3:].strip() != ".lane"
+        ]
+        if head != str(plan["base_sha"]) or meaningful:
+            return False
+        try:
+            started = datetime.fromisoformat(str(job["created_at"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - started).total_seconds()
+        return age >= self.config.superset.worker_progress_timeout_seconds
 
     def _worker_workspace_name(self, issue_number: int, lane: str) -> str:
         return f"{self.config.superset.workspace_prefix}-{issue_number}-{lane.lower()}"

@@ -16,8 +16,10 @@ DEFAULT_CONFIG = Path("~/.config/alfred-code/controller.toml").expanduser()
 class GitHubConfig:
     repo: str = "ssdavidai/alfred"
     owner: str = "ssdavidai"
+    auto_intake: bool = False
     intake_label: str = "alfred-code"
     approval_command: str = "/approve-plan"
+    rejection_command: str = "/reject-plan"
     approvers: tuple[str, ...] = ("ssdavidai",)
     reviewers: tuple[str, ...] = ("ssdavidai",)
     project_number: int | None = None
@@ -33,6 +35,7 @@ class SupersetConfig:
     workspace_prefix: str = "alfred-code"
     api_key_env: str = "SUPERSET_API_KEY"
     cleanup_merged_workspaces: bool = False
+    worker_progress_timeout_seconds: int = 1200
 
 
 @dataclass(frozen=True)
@@ -130,8 +133,10 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         github=GitHubConfig(
             repo=str(github_raw.get("repo", "ssdavidai/alfred")),
             owner=str(github_raw.get("owner", "ssdavidai")),
+            auto_intake=bool(github_raw.get("auto_intake", False)),
             intake_label=str(github_raw.get("intake_label", "alfred-code")),
             approval_command=str(github_raw.get("approval_command", "/approve-plan")),
+            rejection_command=str(github_raw.get("rejection_command", "/reject-plan")),
             approvers=tuple(approvers),
             reviewers=tuple(reviewers),
             project_number=(int(github_raw["project_number"]) if github_raw.get("project_number") else None),
@@ -145,6 +150,9 @@ def load_config(path: Path | None = None) -> ControllerConfig:
             workspace_prefix=str(superset_raw.get("workspace_prefix", "alfred-code")),
             api_key_env=str(superset_raw.get("api_key_env", "SUPERSET_API_KEY")),
             cleanup_merged_workspaces=bool(superset_raw.get("cleanup_merged_workspaces", False)),
+            worker_progress_timeout_seconds=int(
+                superset_raw.get("worker_progress_timeout_seconds", 1200)
+            ),
         ),
         slack=SlackConfig(
             enabled=bool(slack_raw.get("enabled", False)),
@@ -154,6 +162,8 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     )
     if config.poll_seconds < 10:
         raise ConfigurationError("poll_seconds must be at least 10")
+    if config.superset.worker_progress_timeout_seconds < 60:
+        raise ConfigurationError("superset.worker_progress_timeout_seconds must be at least 60")
     if not config.github.repo.count("/") == 1:
         raise ConfigurationError("github.repo must be OWNER/REPO")
     return config

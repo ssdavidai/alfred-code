@@ -4,7 +4,7 @@ This is the executable specification for GitHub issues #5 through #11 in `ssdavi
 
 ## Outcome
 
-GitHub is the product-management and decision surface. A labeled issue is intake. The controller inspects the live repository and GitHub state, generates a lane-aware plan pinned to the current default-branch SHA, validates it deterministically, and comments it on the issue. The operator approves exactly that plan by commenting `/approve-plan <full-plan-sha256>`. Superset creates and owns the isolated workspaces and starts the configured worker/reviewer runtime. GitHub PRs and checks are the delivery authority. Slack is optional notification output only.
+GitHub is the product-management and decision surface. With `github.auto_intake = true`, every open issue is intake; label-gated intake remains available when it is false. The controller immediately projects an enrolled issue as `Specifying`, inspects the live repository and GitHub state, generates a lane-aware plan pinned to the current default-branch SHA, validates it deterministically, and comments it on the issue. The operator approves exactly that plan with `/approve-plan <full-plan-sha256>`, rejects it with `/reject-plan <full-plan-sha256>`, or leaves specification feedback as a normal comment. Superset creates and owns the isolated workspaces and starts the configured worker/reviewer runtime. GitHub PRs and checks are the delivery authority. Slack is optional notification output only.
 
 The controller never merges. It never closes an issue or PR. It never deletes a branch. It never force-pushes or resets a branch. Workspace deletion is separately configured, is off by default, and is eligible only after GitHub reports the associated PR as merged.
 
@@ -25,7 +25,7 @@ Local state is a cache and event ledger, never an excuse to skip refreshing an e
 
 ## Plan contract
 
-Every plan contains the GitHub issue number, exact default-branch SHA, hash of the issue body, summary, risk, and one job per affected lane. Each job declares a stable ID, canonical lane branch, bounded paths, real verification command, contracts read, contracts changed, dependencies, and observable acceptance evidence.
+Every plan contains the GitHub issue number, exact default-branch SHA, hash of the issue body, hash of the issue body plus accepted operator feedback, summary, risk, and one job per affected lane. Each job declares a stable ID, canonical lane branch, bounded paths, real verification command, contracts read, contracts changed, dependencies, and observable acceptance evidence.
 
 The normalizer computes SHA-256 over canonical JSON. Approval includes the full hash. Editing the issue or regenerating the plan changes the hash. Advancing the default branch before approval invalidates the plan. Once execution starts, an issue body edit blocks new execution rather than silently changing active scope.
 
@@ -59,9 +59,9 @@ Review passes only when GitHub CI is green and an allow-listed independent revie
 
 ## Issue lifecycle
 
-The issue state is derived from current job state. `awaiting_approval` means a current immutable plan exists with no valid approval. `building` means at least one approved job is active. `ready_merge` means every job is either ready or merged. `completed` means every planned job is merged. `blocked` means at least one job is blocked, quarantined, or closed without merge. `closed` mirrors a closed GitHub issue after its PRs have been refreshed and classified.
+The issue state is derived from current plan and job state. `planning` means an automatically enrolled issue is being specified. `awaiting_approval` means a current immutable plan exists with no valid decision. A normal allow-listed operator comment after that plan invalidates it and supplies context to a fresh plan. An exact rejection moves the issue to `blocked` without materializing jobs. `building` means at least one approved job is active. `ready_merge` means every job is either ready or merged. `completed` means every planned job is merged. `blocked` also covers jobs that are blocked, quarantined, closed without merge, or have made no repository progress before the configured worker timeout. `closed` mirrors a closed GitHub issue after its PRs have been refreshed and classified.
 
-GitHub Projects is a projection, not another state machine. The controller updates `Control stage`, `Risk`, `Plan hash`, `Lane set`, and `Runtime`. If project sync fails, execution can continue because the durable event records the visibility failure. Slack behaves the same way: notification failure never mutates delivery truth.
+GitHub Projects is a projection, not another state machine. The controller updates `Control stage`, `Risk`, `Plan hash`, `Lane set`, and `Runtime`. Project metadata and items are loaded once per daemon process and then updated from controller-owned transitions, avoiding an expensive full GraphQL refresh on every poll. If project sync fails, execution can continue because the durable event records the visibility failure. Slack behaves the same way: notification failure never mutates delivery truth.
 
 ## Persistence and restart behavior
 

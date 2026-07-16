@@ -71,6 +71,24 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.database.is_approved("a" * 64))
         self.assertEqual(self.database.current_plan(7)["plan_hash"], "b" * 64)
 
+    def test_rejection_is_durable_and_does_not_materialize_jobs(self):
+        digest = "r" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.assertTrue(
+            self.database.reject_plan(
+                7,
+                digest,
+                "ssdavidai",
+                "100",
+                "https://example/reject",
+                "2026-01-01T00:00:00Z",
+            )
+        )
+        self.assertEqual(self.database.current_plan(7)["status"], "rejected")
+        self.assertEqual(self.database.get_issue(7)["controller_state"], "blocked")
+        with self.assertRaisesRegex(RuntimeError, "not approved"):
+            self.database.materialize_jobs(7, digest, self.plan)
+
     def test_notification_delivery_is_deduplicated(self):
         self.assertTrue(self.database.claim_notification("key", "test", {"x": 1}))
         self.database.finish_notification("key")

@@ -69,11 +69,25 @@ class PlanTests(unittest.TestCase):
 
     def test_valid_plan_is_normalized_and_hashed(self):
         plan, digest = self.validator.validate(
-            self.valid(), issue_number=42, base_sha=self.base, issue_body_hash="body"
+            self.valid(),
+            issue_number=42,
+            base_sha=self.base,
+            issue_body_hash="body",
+            decision_context_hash="context",
         )
         self.assertEqual(plan["schema"], 1)
         self.assertEqual(plan["issue_body_hash"], "body")
+        self.assertEqual(plan["decision_context_hash"], "context")
         self.assertEqual(len(digest), 64)
+
+    def test_legacy_plan_hash_does_not_gain_context_field_during_revalidation(self):
+        plan, _ = self.validator.validate(
+            self.valid(),
+            issue_number=42,
+            base_sha=self.base,
+            issue_body_hash="body",
+        )
+        self.assertNotIn("decision_context_hash", plan)
 
     def test_job_id_is_globally_unique_by_issue_token(self):
         value = self.valid()

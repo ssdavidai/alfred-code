@@ -378,6 +378,40 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def reject_plan(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        actor: str,
+        comment_id: str,
+        comment_url: str | None,
+        rejected_at: str,
+    ) -> bool:
+        with self.transaction() as conn:
+            current = conn.execute(
+                "SELECT current_plan_hash FROM issues WHERE number = ?", (issue_number,)
+            ).fetchone()
+            if current is None or current["current_plan_hash"] != plan_hash:
+                return False
+            conn.execute("UPDATE plans SET status = 'rejected' WHERE plan_hash = ?", (plan_hash,))
+            conn.execute(
+                "UPDATE issues SET controller_state = 'blocked', updated_at = ? WHERE number = ?",
+                (utcnow(), issue_number),
+            )
+            self.event(
+                "plan.rejected",
+                {
+                    "plan_hash": plan_hash,
+                    "actor": actor,
+                    "comment_id": comment_id,
+                    "comment_url": comment_url,
+                    "rejected_at": rejected_at,
+                },
+                issue_number=issue_number,
+                connection=conn,
+            )
+        return True
+
     def materialize_jobs(self, issue_number: int, plan_hash: str, plan: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.is_approved(plan_hash):
             raise RuntimeError(f"plan {plan_hash[:12]} is not approved")

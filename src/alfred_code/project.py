@@ -122,11 +122,21 @@ class ProjectBoard:
         self._fields[number] = {str(field.get("name")): field for field in values}
         return self._fields[number]
 
-    def refresh(self, number: int) -> None:
+    def refresh(self, number: int, *, force: bool = False) -> None:
+        if (
+            not force
+            and number in self._projects
+            and number in self._fields
+            and number in self._items
+        ):
+            return
+        if force:
+            self._projects.pop(number, None)
+            self._fields.pop(number, None)
+            self._items.pop(number, None)
         self._projects[number] = self._json(
             ["project", "view", str(number), "--owner", self.config.owner, "--format", "json"]
         )
-        self._fields.pop(number, None)
         self.fields(number)
         values = self._values(
             self._json(

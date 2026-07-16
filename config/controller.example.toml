@@ -9,8 +9,10 @@ planner_timeout_seconds = 900
 [github]
 repo = "ssdavidai/alfred"
 owner = "ssdavidai"
+auto_intake = false
 intake_label = "alfred-code"
 approval_command = "/approve-plan"
+rejection_command = "/reject-plan"
 approvers = ["ssdavidai"]
 reviewers = ["ssdavidai"]
 project_title = "Alfred Product Control"
@@ -24,6 +26,7 @@ reviewer_agent = "Codex"
 workspace_prefix = "alfred-code"
 api_key_env = "SUPERSET_API_KEY"
 cleanup_merged_workspaces = false
+worker_progress_timeout_seconds = 1200
 
 [slack]
 enabled = false

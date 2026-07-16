@@ -16,11 +16,11 @@ Inspect every existing worktree with `alfred-code worktrees-audit`. This command
 
 Load the safe service with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ssdavidai.alfred-code-controller-v2.plist`. While `apply = false`, it only reconciles observations. Inspect `~/.alfred-code-state-v2/controller.jsonl`, `launchd.stdout.log`, and `launchd.stderr.log`.
 
-Only after diagnostics and a read-only cycle are clean should `apply = true` be set. The next cycle will specify newly labeled issues and post their plans. Nothing builds until the exact GitHub approval command is present.
+Only after diagnostics and a read-only cycle are clean should `apply = true` be set. Set `github.auto_intake = true` when every open issue should be enrolled automatically; otherwise the configured intake label remains the gate. The next cycle moves every enrolled issue through `Specifying` and posts its plan. Nothing builds until the exact GitHub approval command is present.
 
 ## Normal operation
 
-Create or label an issue with `alfred-code`. The controller comments a plan. Read the lane decomposition, affected contracts, verification, base SHA, and risk. Approve by copying the exact full-hash command from the comment. Do not abbreviate it.
+Create an issue. With automatic intake enabled, no label or board movement is required. The controller comments a plan. Read the lane decomposition, affected contracts, verification, base SHA, and risk. Approve or reject by copying the corresponding exact full-hash command from the comment; do not abbreviate it. Leave any other comment when the specification needs revision—the controller incorporates that operator feedback and publishes a fresh hash-bound plan.
 
 Watch the GitHub Project for the portfolio view. Open the linked Superset workspace when you want to see an agent's terminal. Use the PR for code, CI, smoke evidence, and the final merge decision. Use Slack as an inbox only.
 

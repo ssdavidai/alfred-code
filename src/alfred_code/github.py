@@ -143,7 +143,12 @@ class GitHubClient:
             raise
 
     @staticmethod
-    def plan_markdown(plan: dict[str, Any], plan_hash: str, approval_command: str) -> str:
+    def plan_markdown(
+        plan: dict[str, Any],
+        plan_hash: str,
+        approval_command: str,
+        rejection_command: str,
+    ) -> str:
         lines = [
             PLAN_MARKER.format(plan_hash=plan_hash),
             f"## Alfred Code execution plan `{plan_hash[:12]}`",
@@ -176,6 +181,12 @@ class GitHubClient:
                 "To approve exactly this plan, comment:",
                 "",
                 f"`{approval_command} {plan_hash}`",
+                "",
+                "To reject exactly this plan, comment:",
+                "",
+                f"`{rejection_command} {plan_hash}`",
+                "",
+                "Any other operator comment posted after this plan is treated as specification feedback and causes a fresh plan.",
             ]
         )
         return "\n".join(lines)
@@ -185,25 +196,93 @@ class GitHubClient:
         for comment in self.issue_comments(issue_number):
             if marker in str(comment.get("body") or ""):
                 return comment.get("html_url")
-        body = self.plan_markdown(plan, plan_hash, self.config.approval_command)
+        body = self.plan_markdown(
+            plan,
+            plan_hash,
+            self.config.approval_command,
+            self.config.rejection_command,
+        )
         return self.post_issue_comment(issue_number, body)
 
-    def find_approval(self, issue_number: int, plan_hash: str) -> dict[str, Any] | None:
-        expected = f"{self.config.approval_command} {plan_hash}"
+    def find_decision(self, issue_number: int, plan_hash: str) -> dict[str, Any] | None:
+        expected = {
+            f"{self.config.approval_command} {plan_hash}": "approve",
+            f"{self.config.rejection_command} {plan_hash}": "reject",
+        }
         approvers = {actor.lower() for actor in self.config.approvers}
         for comment in reversed(self.issue_comments(issue_number)):
             actor = str((comment.get("user") or {}).get("login") or "")
             if actor.lower() not in approvers:
                 continue
-            if str(comment.get("body") or "").strip() != expected:
+            decision = expected.get(str(comment.get("body") or "").strip())
+            if decision is None:
                 continue
             return {
+                "decision": decision,
                 "actor": actor,
                 "comment_id": str(comment.get("id")),
                 "url": comment.get("html_url"),
                 "created_at": comment.get("created_at") or utcnow(),
             }
         return None
+
+    def find_approval(self, issue_number: int, plan_hash: str) -> dict[str, Any] | None:
+        decision = self.find_decision(issue_number, plan_hash)
+        return decision if decision and decision["decision"] == "approve" else None
+
+    def find_rejection(self, issue_number: int, plan_hash: str) -> dict[str, Any] | None:
+        decision = self.find_decision(issue_number, plan_hash)
+        return decision if decision and decision["decision"] == "reject" else None
+
+    def decision_comments(self, issue_number: int) -> list[dict[str, str]]:
+        approvers = {actor.lower() for actor in self.config.approvers}
+        comments: list[dict[str, str]] = []
+        for comment in self.issue_comments(issue_number):
+            actor = str((comment.get("user") or {}).get("login") or "")
+            body = str(comment.get("body") or "").strip()
+            if actor.lower() not in approvers or not self._is_feedback(body):
+                continue
+            comments.append(
+                {
+                    "id": str(comment.get("id") or ""),
+                    "actor": actor,
+                    "created_at": str(comment.get("created_at") or ""),
+                    "body": body[:4000],
+                }
+            )
+        return comments[-20:]
+
+    def find_feedback(self, issue_number: int, *, after: str) -> dict[str, Any] | None:
+        approvers = {actor.lower() for actor in self.config.approvers}
+        for comment in reversed(self.issue_comments(issue_number)):
+            actor = str((comment.get("user") or {}).get("login") or "")
+            body = str(comment.get("body") or "").strip()
+            created_at = str(comment.get("created_at") or "")
+            if actor.lower() not in approvers or not created_at or created_at <= after:
+                continue
+            if not self._is_feedback(body):
+                continue
+            return {
+                "actor": actor,
+                "comment_id": str(comment.get("id") or ""),
+                "url": comment.get("html_url"),
+                "created_at": created_at,
+                "body": body,
+            }
+        return None
+
+    def _is_feedback(self, body: str) -> bool:
+        if not body:
+            return False
+        if PLAN_MARKER.split("{")[0] in body or "<!-- alfred-code:spec" in body:
+            return False
+        if body.startswith("## Alfred Code spec"):
+            return False
+        control_prefixes = (
+            f"{self.config.approval_command} ",
+            f"{self.config.rejection_command} ",
+        )
+        return not body.startswith(control_prefixes)
 
     def default_branch_sha(self) -> str:
         repo = self._json(

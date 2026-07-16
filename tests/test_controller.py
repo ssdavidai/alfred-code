@@ -31,6 +31,8 @@ class FakeGitHub:
         self.extra_issues = {}
         self.sha = sha
         self.approval = None
+        self.rejection = None
+        self.feedback = None
         self.prs = {}
         self.verdicts = {}
         self.plans = []
@@ -56,6 +58,16 @@ class FakeGitHub:
 
     def find_approval(self, issue_number, plan_hash):
         return copy.deepcopy(self.approval)
+
+    def find_decision(self, issue_number, plan_hash):
+        if self.rejection is not None:
+            return {"decision": "reject", **copy.deepcopy(self.rejection)}
+        if self.approval is not None:
+            return {"decision": "approve", **copy.deepcopy(self.approval)}
+        return None
+
+    def find_feedback(self, issue_number, after):
+        return copy.deepcopy(self.feedback)
 
     def pr_for_branch(self, branch):
         return self.prs.get(branch)
@@ -121,11 +133,13 @@ class FakeProject:
     def __init__(self):
         self.refreshes = []
         self.synced = {}
+        self.history = []
 
     def refresh(self, number):
         self.refreshes.append(number)
 
     def sync_issue(self, **values):
+        self.history.append(copy.deepcopy(values))
         self.synced[values["issue_url"]] = copy.deepcopy(values)
 
 
@@ -217,6 +231,42 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.list_jobs(), [])
         self.assertEqual(self.superset.worker_creates, 0)
 
+    def test_exact_rejection_blocks_without_materializing_jobs(self):
+        self.controller.run_once()
+        self.github.rejection = {
+            "actor": "owner",
+            "comment_id": "reject-1",
+            "url": "https://example/rejection",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "blocked")
+        self.assertEqual(self.db.current_plan(12)["status"], "rejected")
+        self.assertEqual(self.db.list_jobs(), [])
+        self.assertEqual(self.superset.worker_creates, 0)
+
+    def test_operator_feedback_replans_before_approval(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.github.feedback = {
+            "actor": "owner",
+            "comment_id": "feedback-1",
+            "url": "https://example/feedback",
+            "created_at": "2026-01-02T00:00:00Z",
+            "body": "Keep the API backwards compatible.",
+        }
+        self.plan = copy.deepcopy(self.plan)
+        self.plan["summary"] = "Revised API"
+        self.planner.plan = copy.deepcopy(self.plan)
+        self.planner.plan_hash = content_hash(self.plan)
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertNotEqual(result["issues"][0]["plan_hash"], first)
+        self.assertEqual(self.planner.calls, 2)
+
     def test_dry_run_only_observes(self):
         self.controller.config = replace(self.config, apply=False)
         self.controller.run_once()
@@ -261,6 +311,30 @@ class ControllerTests(unittest.TestCase):
             "closed",
         )
 
+    def test_auto_intake_plans_unlabeled_issue_and_projects_specifying_first(self):
+        self.issue["labels"] = [{"name": "bug"}]
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(
+                self.config.github,
+                auto_intake=True,
+                project_number=3,
+            ),
+        )
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertEqual(self.planner.calls, 1)
+        projected_states = [
+            item["controller_state"]
+            for item in project.history
+            if item["issue_url"] == self.issue["url"]
+        ]
+        self.assertEqual(projected_states, ["planning", "awaiting_approval"])
+
     def test_approval_launches_once_and_restart_adopts_workspace(self):
         self.controller.run_once()
         self.approve()
@@ -270,6 +344,41 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.superset.worker_creates, 1)
         self.controller.run_once()
         self.assertEqual(self.superset.worker_creates, 1)
+
+    def test_clean_worker_workspace_times_out_and_releases_lane(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        self.db.connection.execute(
+            "UPDATE jobs SET created_at = ? WHERE job_id = ?",
+            ("2020-01-01T00:00:00Z", "api-12"),
+        )
+
+        self.controller.run_once()
+
+        job = self.db.get_job("api-12")
+        self.assertEqual(job["state"], "blocked")
+        self.assertIn("no repository progress", job["last_error"])
+        self.assertIsNone(self.db.lease_owner("I"))
+
+    def test_worker_with_uncommitted_progress_does_not_time_out(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        self.db.connection.execute(
+            "UPDATE jobs SET created_at = ? WHERE job_id = ?",
+            ("2020-01-01T00:00:00Z", "api-12"),
+        )
+        (self.repo / "progress.txt").write_text("started\n")
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.get_job("api-12")["state"], "running")
+        self.assertEqual(self.db.lease_owner("I"), "api-12")
 
     def test_pr_ci_review_sha_and_merge_lifecycle(self):
         self.controller.run_once()
