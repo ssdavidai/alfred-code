@@ -8,8 +8,8 @@
 # State: records the run in ~/.alfred-code-state/dispatched.json so the
 # next poll sees "this issue is in-flight, skip it" instead of re-dispatching.
 #
-# Safety rails that make unattended builds acceptable (none of these are
-# permission prompts — they fire regardless of --dangerously-skip-permissions):
+# This legacy launcher is retained for evidence only. The v2 Superset controller
+# owns all new execution because it provides enforced scoped agent profiles.
 #   • PreToolUse hooks: block-env-dump, block-dead-ssh-aliases,
 #     enforce-worktree-isolation, require-smoke-evidence
 #   • Each lane runs in an isolated git worktree (no cross-lane stomping)
@@ -24,9 +24,10 @@ set -euo pipefail
 STATE_DIR="${HOME}/.alfred-code-state"
 RUNS_DIR="${STATE_DIR}/runs"
 DISPATCHED="${STATE_DIR}/dispatched.json"
-PERM_MODE="${ALFRED_CODE_DISPATCH_PERM:---dangerously-skip-permissions}"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+die "legacy autonomous dispatch is disabled: use the Alfred Code v2 Superset controller with scoped agents"
 
 ISSUE="${1:-}"
 [[ -z "$ISSUE" ]] && die "usage: alfred-code-dispatch <issue#> [--scope <hint>]"
@@ -41,11 +42,20 @@ REPO="${ALFRED_CODE_REPO:-ssdavidai/alfred}"
 [[ -d "$REPO_PATH/.git" ]] || die "ALFRED_CODE_REPO_PATH ($REPO_PATH) is not a git repo"
 
 mkdir -p "$RUNS_DIR"
-[[ -f "$DISPATCHED" ]] || echo '{}' > "$DISPATCHED"
+[[ -f "$DISPATCHED" ]] || echo '[]' > "$DISPATCHED"
+
+# dispatched.json is a JSON ARRAY of entry objects (poll-and-act reads .[].issue).
+# Heal a legacy object-shaped file ({} keyed by issue) into the array shape.
+if [[ "$(jq -r 'type' "$DISPATCHED")" == "object" ]]; then
+  tmp=$(mktemp)
+  jq '[.[]]' "$DISPATCHED" > "$tmp" && mv "$tmp" "$DISPATCHED"
+fi
 
 # --- guard: already in-flight? ----------------------------------------
-EXISTING_PID=$(jq -r --arg i "$ISSUE" '.[$i].pid // empty' "$DISPATCHED" 2>/dev/null || true)
-EXISTING_STATUS=$(jq -r --arg i "$ISSUE" '.[$i].status // empty' "$DISPATCHED" 2>/dev/null || true)
+# No error-masking here: if dispatched.json is corrupt we want a loud abort,
+# not a silent re-dispatch (the guard silently never firing was the old bug).
+EXISTING_PID=$(jq -r --arg i "$ISSUE" '[.[] | select((.issue|tostring) == $i)] | last | .pid // empty' "$DISPATCHED")
+EXISTING_STATUS=$(jq -r --arg i "$ISSUE" '[.[] | select((.issue|tostring) == $i)] | last | .status // empty' "$DISPATCHED")
 if [[ -n "$EXISTING_PID" && "$EXISTING_STATUS" == "building" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
   echo "already building #$ISSUE (pid $EXISTING_PID, status $EXISTING_STATUS) — not re-dispatching"
   exit 0
@@ -88,9 +98,11 @@ Process:
 5. DO NOT merge anything — merge is Sir's manual gate. Only open PRs.
 
 When all lanes have open PRs (or you hit a hard blocker):
-  - Update ~/.alfred-code-state/dispatched.json: set ."${ISSUE}".status to
-    "pr-open" (or "failed" + a one-line reason), and add a "prs" array of the
-    PR numbers you opened.
+  - Update ~/.alfred-code-state/dispatched.json — it is a JSON ARRAY of entry
+    objects: find the entry with .issue == ${ISSUE} and set its .status to
+    "pr-open" (or "failed" + a one-line .note reason), and add a "prs" array
+    of the PR numbers you opened. Keep it an array; never convert it to an
+    object keyed by issue number.
   - Send ONE Telegram summary to Sir:
       TG=\$(${HOME}/.claude/bin/secret get telegram-bot-token)
       CID=\$(${HOME}/.claude/bin/secret get telegram-chat-id)
@@ -110,10 +122,12 @@ PID=$!
 disown "$PID" 2>/dev/null || true
 
 # --- record state ----------------------------------------------------
+# Array shape: replace any prior entry for this issue, then append the fresh one.
 tmp=$(mktemp)
 jq --arg i "$ISSUE" --arg pid "$PID" --arg now "$NOW" --arg log "$LOG" --arg repo "$REPO" '
-  .[$i] = {issue: ($i|tonumber), status: "building", pid: ($pid|tonumber),
-           started_at: $now, log: $log, repo: $repo}
+  [.[] | select((.issue|tostring) != $i)]
+  + [{issue: ($i|tonumber), status: "building", pid: ($pid|tonumber),
+      dispatched_at: $now, log: $log, repo: $repo}]
 ' "$DISPATCHED" > "$tmp" && mv "$tmp" "$DISPATCHED"
 
 echo "dispatched #$ISSUE detached (pid $PID), log: $LOG"

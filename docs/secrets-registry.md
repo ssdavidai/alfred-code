@@ -24,11 +24,15 @@ otherwise drifts).
 | `groq-api-key` | OMI transcript pipeline | Groq Cloud → Keys | when leaked |
 | `composio-api-key` | Composio integrations (Gmail/Calendar OAuth in onboarding) | Composio dashboard → API Keys | when leaked |
 | `composio-webhook-secret` | Composio webhook HMAC verification | Composio dashboard | when leaked |
+| `agentmail-master-api-key` | AgentMail inbox provisioning + per-profile inbound/outbound email (fleet master key) | AgentMail dashboard → API Keys | when leaked |
 | `paperclip-api-key` | Paperclip board key (used by Hermes paperclip adapter) | Paperclip dashboard → MCP / Bootstrap | **30 days** |
 | `pypi-token` | `alfred-vault` PyPI publishes (trusted-publishing target) | PyPI → Account settings → Tokens | when used |
 | `acme-email` | Operator email used in `init-signup` + LE cert reg on every tenant | the operator-email convention (`david@sabo.tech`) | n/a |
 | `vaultwarden-master` | `home.alfred.black` Vaultwarden master password | Set during onboarding | when leaked |
 | `github-pat` | Fallback only — `gh auth login` is the primary path | GitHub → Settings → Developer settings → PATs | 90d |
+| `alfred-code-github-pat` | alfred-code-on-Paperclip foreman — GitHub API (issues/PRs/merge) on home, stored in home Vaultwarden | GitHub → fine-grained PAT, repo=ssdavidai/alfred, Contents+PRs+Issues RW, Checks+Metadata RO | 90d |
+| `superset-api-key` | Headless Alfred Code v2 access to the local Superset runtime | Superset → organization/API key settings | 90d |
+| `alfred-code-slack-webhook` | Optional outbound-only control-plane notifications | Slack app → Incoming Webhooks | when leaked |
 | `telegram-bot-token` | BotFather token for the Sir-facing alert bot (Tier 2 autonomous loop) | @BotFather → `/newbot` → reply contains the token | when leaked |
 | `telegram-chat-id` | Sir's chat_id with the bot (captured automatically from `getUpdates`) | First message Sir sends to the bot | n/a (immutable) |
 

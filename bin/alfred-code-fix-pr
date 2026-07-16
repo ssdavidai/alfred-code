@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# alfred-code-fix-pr <pr#> — launch a DETACHED headless build to make a red
+# PR's CI green again. Mirrors alfred-code-dispatch (nohup + disown so it
+# outlives the 5-min poll), but scoped to "diagnose + fix the failing checks
+# on PR #N", not a fresh issue decomposition.
+#
+# Auto-fix is capped: after ALFRED_CODE_CI_FIX_MAX (default 2) attempts on the
+# same PR, it refuses and escalates to Sir on Telegram instead of looping
+# forever. Documented CI flakes (compose-lint, test-voice-bridge) are NOT
+# treated as failures — the build is told to bypass them, not "fix" them.
+#
+# Every successful root-cause fix MUST append a one-line entry to
+# docs/ci-lessons.md (the compound-engineering ledger) so the next lane
+# pre-empts the same break.
+#
+# Usage:  alfred-code-fix-pr 176
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.alfred-code-state"
+RUNS_DIR="${STATE_DIR}/runs"
+CI_FIXES="${STATE_DIR}/ci-fixes.json"
+MAX_ATTEMPTS="${ALFRED_CODE_CI_FIX_MAX:-2}"
+LESSONS="${ALFRED_SECRETS_HOME:-$HOME/.claude/alfred-code}/docs/ci-lessons.md"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+die "legacy autonomous CI repair is disabled: use the Alfred Code v2 Superset controller with scoped agents"
+
+PR="${1:-}"
+[[ -z "$PR" ]] && die "usage: alfred-code-fix-pr <pr#>"
+
+[[ -f "$STATE_DIR/.env" ]] || die "missing $STATE_DIR/.env — run Tier 2 install first"
+# shellcheck disable=SC1090
+source "$STATE_DIR/.env"
+REPO_PATH="${ALFRED_CODE_REPO_PATH:-/Users/ssd/dev/alfred}"
+REPO="${ALFRED_CODE_REPO:-ssdavidai/alfred}"
+[[ -d "$REPO_PATH/.git" ]] || die "ALFRED_CODE_REPO_PATH ($REPO_PATH) is not a git repo"
+
+mkdir -p "$RUNS_DIR"
+[[ -f "$CI_FIXES" ]] || echo '{}' > "$CI_FIXES"
+
+ATTEMPTS=$(jq -r --arg p "$PR" '.[$p].attempts // 0' "$CI_FIXES" 2>/dev/null || echo 0)
+
+# Telegram helper (best-effort; never fatal).
+tg() {
+  local tok cid
+  tok=$("${HOME}/.claude/bin/secret" get telegram-bot-token 2>/dev/null || true)
+  cid=$("${HOME}/.claude/bin/secret" get telegram-chat-id 2>/dev/null || true)
+  [[ -z "$tok" || -z "$cid" ]] && return 0
+  curl -sS -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+    --data-urlencode "chat_id=${cid}" --data-urlencode "text=$1" >/dev/null 2>&1 || true
+}
+
+# --- cap guard --------------------------------------------------------
+if [[ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]]; then
+  echo "PR #$PR already had $ATTEMPTS auto-fix attempts (cap=$MAX_ATTEMPTS) — escalating to Sir, not re-dispatching."
+  tg "🛑 PR #$PR: CI still red after $ATTEMPTS auto-fix attempts. Stopping auto-fix — needs your eyes. \`gh pr checks $PR\`"
+  tmp=$(mktemp)
+  jq --arg p "$PR" '.[$p].status="capped"' "$CI_FIXES" > "$tmp" && mv "$tmp" "$CI_FIXES"
+  exit 0
+fi
+
+# --- guard: already fixing this PR? -----------------------------------
+EXISTING_PID=$(jq -r --arg p "$PR" '.[$p].pid // empty' "$CI_FIXES" 2>/dev/null || true)
+EXISTING_STATUS=$(jq -r --arg p "$PR" '.[$p].status // empty' "$CI_FIXES" 2>/dev/null || true)
+if [[ -n "$EXISTING_PID" && "$EXISTING_STATUS" == "fixing" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+  echo "already fixing PR #$PR (pid $EXISTING_PID) — not re-dispatching"
+  exit 0
+fi
+
+NEXT=$((ATTEMPTS + 1))
+LOG="${RUNS_DIR}/fix-pr-${PR}.log"
+NOW=$(date -u +%FT%TZ)
+
+read -r -d '' PROMPT <<PROMPT_EOF || true
+You are an autonomous CI-repair agent for PR #${PR} in ${REPO}.
+You were launched detached by alfred-code-fix-pr. This is attempt ${NEXT} of
+${MAX_ATTEMPTS} — if you cannot get the PR green this run, STOP and report
+honestly; do not thrash.
+
+Goal: make PR #${PR}'s required CI checks pass, WITHOUT merging.
+
+Process:
+1. \`gh pr checks ${PR}\` and \`gh pr view ${PR} --json headRefName,title,body\`.
+   Identify which checks are RED.
+2. DOCUMENTED FLAKES — do NOT try to "fix" these; they are known-good on main
+   from the same parent commit and are admin-bypassable, not real failures:
+     • compose-lint  • test-voice-bridge
+   If the ONLY red checks are documented flakes, leave the PR as-is, post a PR
+   comment noting the flakes, and exit (status green-modulo-flakes).
+3. For genuine failures: \`gh pr checkout ${PR}\`, read the failing run logs
+   (\`gh run view <run-id> --log-failed\`), find the ROOT CAUSE, fix it in the
+   worktree, run the relevant test/build LOCALLY to confirm, commit
+   (footer: Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>),
+   and push to the PR branch. Re-check \`gh pr checks ${PR}\` until green or you
+   hit a wall.
+4. COMPOUND (mandatory on any real fix): append ONE line to
+   ${LESSONS} in the form:
+     - YYYY-MM-DD · <check that failed> · <root cause> · <the rule that prevents it>
+   Commit that to the PR branch too. This is how the next lane pre-empts the
+   same break — skipping it defeats the purpose.
+5. DO NOT merge. DO NOT bypass a non-flake failure with --admin. If after your
+   fixes a non-flake check is still red, that's an honest partial.
+
+When done (green, or honest-partial, or blocked):
+  - Update ${CI_FIXES}: set ."${PR}".status to "green" / "partial" / "blocked".
+  - Post ONE Telegram note to Sir:
+      TG=\$(${HOME}/.claude/bin/secret get telegram-bot-token)
+      CID=\$(${HOME}/.claude/bin/secret get telegram-chat-id)
+      curl -sS -X POST "https://api.telegram.org/bot\${TG}/sendMessage" \\
+        --data-urlencode "chat_id=\${CID}" \\
+        --data-urlencode "text=<#${PR} CI auto-fix: green / still-red (reason) — what you changed>"
+  - Exit.
+PROMPT_EOF
+
+cd "$REPO_PATH"
+nohup claude -p "$PROMPT" "$PERM_MODE" > "$LOG" 2>&1 &
+PID=$!
+disown "$PID" 2>/dev/null || true
+
+tmp=$(mktemp)
+jq --arg p "$PR" --arg pid "$PID" --arg now "$NOW" --arg log "$LOG" --argjson n "$NEXT" '
+  .[$p] = {pr: ($p|tonumber), status: "fixing", attempts: $n, pid: ($pid|tonumber),
+           started_at: $now, log: $log}
+' "$CI_FIXES" > "$tmp" && mv "$tmp" "$CI_FIXES"
+
+echo "dispatched CI-fix for PR #$PR (attempt $NEXT/$MAX_ATTEMPTS, pid $PID), log: $LOG"

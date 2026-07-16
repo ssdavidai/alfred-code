@@ -1,0 +1,35 @@
+# Safe/read-only until all doctor checks pass and apply is deliberately enabled.
+repo_path = "~/dev/alfred"
+state_dir = "~/.alfred-code-state-v2"
+apply = false
+poll_seconds = 60
+planner_command = ["claude", "-p", "--safe-mode", "--permission-mode", "plan", "--tools", "", "--no-session-persistence", "--no-chrome", "--disable-slash-commands"]
+planner_timeout_seconds = 900
+
+[github]
+repo = "ssdavidai/alfred"
+owner = "ssdavidai"
+auto_intake = false
+intake_label = "alfred-code"
+approval_command = "/approve-plan"
+rejection_command = "/reject-plan"
+approvers = ["ssdavidai"]
+reviewers = ["ssdavidai"]
+project_title = "Alfred Product Control"
+# project_number = 1
+
+[superset]
+cli = "/Users/ssd/.superset/bin/superset"
+project_name = "alfred"
+# Dedicated IDs created by `alfred-code agents-provision`. Built-in presets are rejected.
+worker_agent = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
+reviewer_agent = "e75d43da-621f-449d-81ad-e3f92d553fd3"
+workspace_prefix = "alfred-code"
+api_key_env = "SUPERSET_API_KEY"
+cleanup_merged_workspaces = false
+worker_progress_timeout_seconds = 1200
+
+[slack]
+enabled = false
+webhook_env = "ALFRED_CODE_SLACK_WEBHOOK"
+channel = ""

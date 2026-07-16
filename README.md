@@ -1,6 +1,48 @@
-# alfred-code
+# Alfred Code
 
-**Autonomous-loop Claude Code rig. File a GitHub issue, tap Y in Telegram, the work ships.**
+Alfred Code v2 is a deterministic GitHub control plane with Superset execution for `ssdavidai/alfred`. File an issue, inspect a live-code-backed lane plan in GitHub, approve or reject that exact immutable plan, and let isolated Superset agents build and independently review each lane. When automatic intake is enabled, every open issue is specified without a label gate. You remain the product manager and final merge authority.
+
+GitHub owns work, approvals, PRs, CI, and merge state. The target repository's live `scripts/hooks/lanes.json` owns write boundaries. Superset owns isolated workspaces and agent sessions. SQLite owns durable scheduling, one-agent-per-lane leases, deduplication, observations, and immutable events. Slack is optional notification output, never a control protocol.
+
+```text
+GitHub issue -> SHA-pinned validated plan -> exact GitHub approval
+             -> SQLite lane scheduler -> Superset workers
+             -> GitHub PR + CI -> exact-HEAD independent review
+             -> GitHub Project "Ready to merge" -> human merge
+```
+
+No agent can start without a current validated plan and exact approval by an allow-listed GitHub user. The controller does not merge, close, reset, force-push, delete branches, expose secrets, or write outside the approved lane. Workspace cleanup is disabled by default.
+
+Workers and reviewers run only through the dedicated `Alfred Claude (Scoped)` and `Alfred Codex (Scoped)` Superset presets. The launcher rejects YOLO, bypass, alternate-sandbox, extra-directory, MCP, plugin, and configuration-override arguments. Codex receives a generated offline permission profile that makes the repository read-only except for the approved lane paths and one result marker. Claude runs with strict native sandboxing, home-directory reads denied, no network or unsandboxed escape, and a pre-tool lane guard. Both agents are forbidden from committing, pushing, or calling GitHub; after a result marker appears, the controller independently checks the immutable `.lane` manifest, exact base or review SHA, every changed path, and the absence of deletions before it performs any Git or GitHub delivery. Any drift is quarantined.
+
+## Install v2 safely
+
+```bash
+git clone https://github.com/ssdavidai/alfred-code ~/.claude/alfred-code
+cd ~/.claude/alfred-code
+./install-controller.sh
+~/.claude/bin/alfred-code agents-provision
+~/.claude/bin/alfred-code doctor
+```
+
+Installation creates `~/.config/alfred-code/controller.toml` with `apply = false`. It renders but does not load the launchd service. Follow [the v2 deployment runbook](docs/control-plane-runbook.md) to authenticate Superset, create the GitHub Project, import legacy evidence, audit worktrees, and deliberately enable execution.
+
+The principal read-only commands are `alfred-code doctor`, `alfred-code status`, `alfred-code run-once --dry-run`, and `alfred-code worktrees-audit`. External mutation is explicit through `project-setup`, `plan <issue> --publish`, or an apply-enabled reconciliation cycle.
+
+Plans include the issue-body hash, operator-feedback context hash, and pinned base SHA. Regeneration, issue edits, operator feedback, and pre-approval base changes invalidate approval. An exact `/reject-plan` decision is durable and starts no workers. The planner runs with zero tools against controller-collected git evidence, and any verification command it returns is discarded and replaced by the live lane policy's command. Every lifecycle transition refreshes GitHub or Superset first; an unavailable authority freezes advancement. The controller fetches the full PR file list and rejects scope escapes before review. Independent review is accepted only from an allow-listed actor, after review was requested, for the current PR HEAD, after green CI and smoke evidence. Deterministic workspace names plus intent-before-effect records adopt accepted work after a crash instead of launching duplicates.
+
+Read [the executable v2 architecture](docs/control-plane-v2.md) for the full authority and state model. Run the test suite with:
+
+```bash
+python3 -m compileall -q src tests
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
+
+## Legacy v1 Telegram package
+
+The material below describes the retained v1 Telegram/JSON loop. It is available for compatibility and migration evidence, but it is not the v2 lifecycle authority. `alfred-code migrate-legacy` fingerprints old JSON and logs without deleting them or trusting their status strings.
+
+**Legacy autonomous-loop Claude Code rig. File a GitHub issue, tap Y in Telegram, the work ships.**
 
 ```
                         ┌──────────────────────────────────────────┐

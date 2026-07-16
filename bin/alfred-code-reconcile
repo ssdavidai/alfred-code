@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# alfred-code-reconcile — GitHub is the source of truth.
+#
+# Run FIRST on every poll (after the lock). It pulls the authoritative state
+# from GitHub (open PRs + their CI + linked issue, PRs merged/closed since the
+# last poll, open issues), diffs it against the previous poll's snapshot, and:
+#   1. prints a human-readable "Δ since last poll" (for the poll to post to
+#      Telegram — empty if nothing changed),
+#   2. prints the current authoritative summary (what's actually open / waiting),
+#   3. conservatively self-heals local state: any pending-gate whose issue is
+#      CLOSED on GitHub is marked closed (GitHub wins — never the reverse).
+#
+# This is what stops the loop's Telegram view from drifting when work happens
+# outside the loop (a human merge, a direct push, Claude operating manually).
+# The loop must trust THIS, not its own dispatched.json memory.
+#
+# Usage:  alfred-code-reconcile            # reconcile + print delta + summary
+#         alfred-code-reconcile --quiet    # only print the delta (for Telegram)
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.alfred-code-state"
+SNAP="${STATE_DIR}/gh-truth.json"
+PREV="${STATE_DIR}/gh-truth.prev.json"
+GATES="${STATE_DIR}/pending-gates.json"
+mkdir -p "$STATE_DIR"
+
+QUIET=0
+[[ "${1:-}" == "--quiet" ]] && QUIET=1
+
+[[ -f "$STATE_DIR/.env" ]] && { set -o allexport; . "$STATE_DIR/.env"; set +o allexport; }
+REPO="${ALFRED_CODE_REPO:-ssdavidai/alfred}"
+
+command -v gh >/dev/null 2>&1 || { echo "gh not found" >&2; exit 1; }
+
+# ── 1. Gather authoritative state from GitHub ─────────────────────────
+# Open PRs: number, title, branch, mergeable, CI rollup (worst conclusion), linked issue (from body "#N" / "Closes #N").
+open_prs=$(gh pr list --repo "$REPO" --state open --limit 100 \
+  --json number,title,headRefName,mergeable,mergeStateStatus,statusCheckRollup,body 2>/dev/null \
+  | jq -c '[.[] | {
+      number, title, branch: .headRefName, mergeable, state: .mergeStateStatus,
+      ci: ((.statusCheckRollup // []) | map(.conclusion // .status // "PENDING")
+           | (if (index("FAILURE") or index("CANCELLED") or index("TIMED_OUT")) then "RED"
+              elif (index("PENDING") or index("IN_PROGRESS") or index("QUEUED")) then "PENDING"
+              else "GREEN" end)),
+      issue: ((.body // "") | (capture("(?:[Cc]loses |#)(?<n>[0-9]+)") .n // null))
+    }]' 2>/dev/null || echo '[]')
+
+# PRs merged/closed in the last 36h (so we report human/manual merges too).
+recent_done=$(gh pr list --repo "$REPO" --state all --limit 40 \
+  --json number,title,state,mergedAt,closedAt 2>/dev/null \
+  | jq -c --arg cutoff "$(date -u -v-36H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '36 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+      '[.[] | select(.state != "OPEN") | select((.mergedAt // .closedAt // "") > $cutoff)
+        | {number, title, state, at: (.mergedAt // .closedAt)}]' 2>/dev/null || echo '[]')
+
+open_issue_count=$(gh issue list --repo "$REPO" --state open --limit 200 --json number 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
+
+# Compose the snapshot.
+snapshot=$(jq -n --argjson prs "$open_prs" --argjson done "$recent_done" --arg oi "$open_issue_count" \
+  '{open_prs: $prs, recent_done: $done, open_issue_count: $oi}')
+
+[[ -f "$SNAP" ]] && cp "$SNAP" "$PREV" || echo '{"open_prs":[],"recent_done":[],"open_issue_count":"?"}' > "$PREV"
+printf '%s' "$snapshot" > "$SNAP"
+
+# ── 2. Delta vs previous poll ─────────────────────────────────────────
+prev_open=$(jq -r '[.open_prs[].number] | @csv' "$PREV" 2>/dev/null || echo "")
+delta=$(jq -rn --slurpfile cur "$SNAP" --slurpfile prv "$PREV" '
+  ($cur[0]) as $c | ($prv[0]) as $p |
+  ([$c.open_prs[].number] - [$p.open_prs[].number]) as $newprs |
+  ([$p.open_prs[].number] - [$c.open_prs[].number]) as $goneprs |
+  ([ $c.open_prs[] | select(.ci=="RED") | .number ]) as $redprs |
+  [ (if ($newprs|length)>0 then "new PRs: " + ($newprs|map("#\(.)")|join(" ")) else empty end),
+    (if ($goneprs|length)>0 then "PRs closed/merged: " + ($goneprs|map("#\(.)")|join(" ")) else empty end),
+    (if ($redprs|length)>0 then "RED CI: " + ($redprs|map("#\(.)")|join(" ")) else empty end)
+  ] | join("\n")
+' 2>/dev/null || echo "")
+
+# ── 3. Self-heal: close any gate whose issue is closed on GitHub ──────
+healed=""
+if [[ -f "$GATES" ]]; then
+  # collect non-terminal gate issues
+  issues=$(jq -r 'to_entries[] | select(.value.status != "closed" and .value.status != "skipped" and .value.status != "merged") | .value.issue' "$GATES" 2>/dev/null | sort -un)
+  for iss in $issues; do
+    st=$(gh issue view "$iss" --repo "$REPO" --json state --jq .state 2>/dev/null || echo "")
+    if [[ "$st" == "CLOSED" ]]; then
+      tmp=$(mktemp)
+      jq --argjson i "$iss" '(.[] | select(.issue==$i) | .status) |= "closed"' "$GATES" > "$tmp" 2>/dev/null && mv "$tmp" "$GATES"
+      healed="${healed} #${iss}"
+    fi
+  done
+fi
+
+# ── 4. Report ─────────────────────────────────────────────────────────
+if [[ -n "$delta" ]]; then
+  echo "Δ since last poll:"
+  echo "$delta" | sed 's/^/  /'
+else
+  echo "Δ since last poll: (no change)"
+fi
+[[ -n "$healed" ]] && echo "auto-closed gates (issue closed on GitHub):$healed"
+
+if [[ "$QUIET" -eq 0 ]]; then
+  echo ""
+  echo "── GitHub truth (authoritative) ──"
+  echo "  open issues: $open_issue_count"
+  echo "  open PRs:"
+  jq -r '.open_prs[] | "    #\(.number) [\(.mergeable)/\(.state) ci=\(.ci)] \(.title)"' "$SNAP" 2>/dev/null
+  if [[ "$(jq '.recent_done | length' "$SNAP")" -gt 0 ]]; then
+    echo "  merged/closed (last 36h):"
+    jq -r '.recent_done[] | "    #\(.number) \(.state) \(.title)"' "$SNAP" 2>/dev/null
+  fi
+fi

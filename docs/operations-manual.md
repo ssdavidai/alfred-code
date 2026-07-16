@@ -1,5 +1,7 @@
 # Operations manual
 
+> **Legacy v1 manual.** Do not use its reset or Telegram control procedures for the v2 controller. The current runbook is [control-plane-runbook.md](control-plane-runbook.md), and the executable architecture is [control-plane-v2.md](control-plane-v2.md).
+
 How the autonomous loop works, what each piece does, and what to do when it breaks.
 
 ## The loop, at a glance
@@ -27,7 +29,7 @@ issue filed ──→ notify-telegram.yml ──→ Telegram bot
 
 ## The state directory
 
-`~/.alfred-code-state/` is the single source of truth between poll-and-act runs.
+`~/.alfred-code-state/` was the v1 local cache between poll-and-act runs. GitHub was always more authoritative; v2 imports these files as evidence only.
 
 | File | Owner | Purpose |
 |---|---|---|
@@ -39,7 +41,7 @@ issue filed ──→ notify-telegram.yml ──→ Telegram bot
 | `stuck.json` | `kill-criteria.sh` | Issues that have hit the partial-iteration limit |
 | `paused` | Sir (via "pause" in Telegram) | If present, the poll exits early |
 
-**Safe to delete the whole directory** for a clean restart — `/setup-telegram` rebuilds everything.
+Do not delete this directory during v2 migration. `alfred-code migrate-legacy` preserves and fingerprints its evidence.
 
 ## The seven commands
 
@@ -130,7 +132,7 @@ Use cases:
 - You're on vacation and don't want gates piling up
 - You're debugging the loop itself
 
-## When to nuke and restart
+## Legacy reset procedure (do not use for v2)
 
 ```bash
 rm -rf ~/.alfred-code-state
@@ -138,4 +140,4 @@ rm -rf ~/.alfred-code-state
 # Then re-run /setup-telegram
 ```
 
-This is safe; nothing under `~/.alfred-code-state/` is irrecoverable. The actual work (issues, PRs, commits) lives in GitHub.
+This procedure is retained only for historical v1 recovery. It is intentionally not a v2 repair technique.

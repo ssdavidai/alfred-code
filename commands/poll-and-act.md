@@ -28,6 +28,47 @@ If `~/.alfred-code-state/.env` is missing, **stop and tell Sir to run `/setup-te
 
 ## Process (run in order, stop after each step's work is done)
 
+### 0. Acquire the single-flight lock (FIRST — prevents duplicate sends)
+
+A poll run that takes >5 min overlaps the next scheduled run; with no lock,
+overlapping runs each see the same new issue and all post → the "1 issue → 3
+Telegram sends" bug. So before anything else:
+
+```bash
+~/.claude/bin/alfred-code-poll-lock acquire
+```
+
+If it exits non-zero / prints `HELD`, **another poll is already running — STOP
+immediately and do nothing this cycle** (exit quietly, no Telegram). Only
+proceed past this point if it printed `ACQUIRED` / `ACQUIRED-STOLEN`. Release
+it in step 5 (and the 15-min TTL auto-frees it if this run crashes).
+
+### 0.5 Reconcile against GitHub — MANDATORY, every poll (GitHub is the source of truth)
+
+**Do this before anything else (after the lock). GitHub — never `dispatched.json`
+— is the authority for what's merged, open, or red.** The loop's local memory
+drifts the moment work happens outside it (a human merge, a direct push, an
+operator acting manually), so each poll must re-derive truth from GitHub:
+
+```bash
+~/.claude/bin/alfred-code-reconcile
+```
+
+It pulls live state (open PRs + their CI + linked issue, PRs merged/closed in
+the last 36h, open-issue count), self-heals local gates (any gate whose issue is
+CLOSED on GitHub is marked closed), writes the authoritative snapshot to
+`~/.alfred-code-state/gh-truth.json`, and prints:
+- a **`Δ since last poll`** block — if non-empty, **post it to Sir's Telegram**
+  (this is how he sees merges/closes/new-PRs/now-red-CI that happened since last
+  time, including ones the loop didn't do itself). If it says `(no change)`,
+  stay quiet.
+- the **current authoritative summary** — use THIS (not `dispatched.json`) as the
+  truth for steps 3–4: an issue GitHub says is closed is done; a PR GitHub says
+  is merged is merged; a PR GitHub shows RED is what `alfred-code-fix-pr` acts on.
+
+If `gh-truth.json` and `dispatched.json` disagree, **GitHub wins** — correct the
+local file, never the reverse.
+
 ### 1. Poll Telegram for Sir's recent replies
 
 ```bash
@@ -110,7 +151,12 @@ For each genuinely-new issue (no live gate, not dispatched):
   - `research` — needs investigation before code; dispatch a research agent (sandbox, no PR)
   - `skip` — already covered by an open PR, or a duplicate, or out of scope
 - **For non-skip**: draft a 3-bullet decomposition per the lane protocol (`docs/lane-protocol.md`)
-- **Post to Telegram** with the decomposition + a Y/N gate
+- **Register the gate in `pending-gates.json` FIRST, THEN post to Telegram.**
+  Write-before-send is mandatory: persisting the gate (status `awaiting`,
+  `tg_message_id: null`) before the send means any racing/retried run sees it
+  in the dedup check and skips — so a slow send or a second poll can't double-post.
+  After the send succeeds, backfill `tg_message_id`. (The step-0 lock already
+  serializes polls; this ordering is the belt-and-suspenders.)
 
 Telegram post shape:
 
@@ -215,9 +261,35 @@ For each entry, branch on `status`:
     to re-dispatch (`y #<issue>` re-runs it).
 
 - **`pr-open`** — the build finished and opened PRs (it already pinged Sir).
-  Verify the PRs still exist + smoke evidence is present. If a PR has been
-  open > 30 min untouched, optionally run `/ultrareview <n>` and post the
-  verdict. Otherwise stay quiet — the ball is in Sir's court to merge.
+  For EACH open PR of this issue:
+
+  1. **Auto-fix red CI** (capped, autonomous — Sir approved 2026-06-01):
+     ```bash
+     gh pr checks <pr> --json name,state,conclusion 2>/dev/null
+     ```
+     If any check is `failure`/`cancelled`/`timed_out` AND its name is NOT a
+     documented flake (`compose-lint`, `test-voice-bridge` — see
+     `docs/ci-lessons.md`), dispatch a detached, attempt-capped CI repair:
+     ```bash
+     ~/.claude/bin/alfred-code-fix-pr <pr>
+     ```
+     It self-caps at 2 attempts per PR (tracked in
+     `~/.alfred-code-state/ci-fixes.json`); after the cap it escalates to Sir
+     on Telegram instead of looping. The fix agent pushes to the PR branch,
+     **never merges**, and appends a one-line root-cause→rule entry to
+     `docs/ci-lessons.md` (the compound ledger). Do NOT also re-dispatch the
+     whole issue — the fix agent owns the PR-green lifecycle. If a PR already
+     has a live `fixing` entry in `ci-fixes.json`, leave it alone.
+
+  2. **Post a review** (every PR gets one, not just stale ones): if this PR
+     has not yet been reviewed this cycle (track reviewed PR numbers in the
+     `dispatched.json` entry's `reviewed_prs` array), run `/ultrareview <pr>`
+     once — it posts the verdict as a **PR comment** + a consolidated **issue
+     comment**, then a Telegram line. Record the PR number in `reviewed_prs`
+     so it isn't re-reviewed every poll (re-review only if the PR's head SHA
+     changed since last review).
+
+  3. Otherwise stay quiet — the ball is in Sir's court to merge.
 
 - **`merged`/`failed`** — terminal; skip (house-keeping trims these).
 
@@ -225,18 +297,41 @@ For each entry, branch on `status`:
 gh pr list --state open --search "in:body #<issue>" --json number,title,headRefName,mergeable
 ```
 
-If a PR has been open for >30 min with no body update:
-- Run `/ultrareview <n>` autonomously and post the result to Telegram
+Reviews are now posted on **first sighting** of every PR (see the `pr-open`
+step above), not gated on a 30-min wait. Re-review a PR only if its head SHA
+changed (a CI-fix push or a manual update) since the last review.
 
 If all of the issue's lanes have merged:
 - Verify the issue's acceptance criteria are met
 - Auto-close the issue with a summary comment
 - Mark the gate `status="closed"`
+- **Reap that issue's lane worktrees** — the build left an isolated worktree
+  per lane; now that the PRs are merged they're dead weight:
+  ```bash
+  ~/.claude/bin/alfred-code-reap-worktrees --issue <issue#> --reap-merged --apply
+  ```
+  `--reap-merged` is right here because the build is provably finished: it
+  force-removes the issue's lanes even when they're dirty (leftover
+  node_modules) or still hold a stale agent lock, as long as their PR is
+  MERGED/CLOSED. Worktrees with no merged PR or an OPEN PR are never touched.
 
 ### 5. House-keeping
 
 - Delete expired gates (older than 24h, not approved)
 - Trim `pending-gates.json` and `dispatched.json` to the last 30 days
+- **GC orphaned worktrees** — a periodic safety net for worktrees the
+  per-issue reap (step 4) missed: stale lanes from abandoned/closed PRs and the
+  harness's ephemeral `claude/<name-hash>` scratch checkouts. Run the full sweep:
+  ```bash
+  ~/.claude/bin/alfred-code-reap-worktrees --apply
+  ```
+  It removes ONLY worktrees that are clean AND (PR merged/closed OR empty
+  scratch with no open PR); dirty or un-landed worktrees are always kept. Safe
+  to run every poll — it's a no-op when there's nothing to reap.
+- **Release the single-flight lock** (last thing, always):
+  ```bash
+  ~/.claude/bin/alfred-code-poll-lock release
+  ```
 
 ## Honest reporting rules
 

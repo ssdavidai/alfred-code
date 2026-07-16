@@ -1,5 +1,7 @@
 # The autonomous loop — architecture
 
+> **Legacy v1 design.** This file describes the Telegram/JSON loop retained for migration evidence. It is not the current lifecycle authority. The v2 implementation and invariants are in [control-plane-v2.md](control-plane-v2.md); v2 uses GitHub approvals, SQLite reconciliation, GitHub Projects, and Superset.
+
 The whole alfred-code system is one loop. Here's the architecture in one diagram + the rationale for each piece.
 
 ```
@@ -98,9 +100,9 @@ Two Claude things run here:
 
 2. **Scheduled task `alfred-code-poll`** — fires every 5 min via macOS launchd (managed by Claude Code Desktop). Spawns a fresh, ephemeral session that runs `/poll-and-act`. Each run has its own git worktree, so the running interactive session is unaffected.
 
-### Layer 5: State (`~/.alfred-code-state/`)
+### Layer 5: Legacy state (`~/.alfred-code-state/`)
 
-The single source of truth between poll-and-act runs. Sqlite would be overkill; JSON files are enough. Atomic writes via `tempfile + mv`.
+This was the v1 cache between poll-and-act runs. It is not trustworthy enough to drive v2 execution. The v2 importer records it as evidence only, then refreshes GitHub and Superset.
 
 ### Layer 6: Lane workers
 

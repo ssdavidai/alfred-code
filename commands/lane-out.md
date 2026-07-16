@@ -28,14 +28,20 @@ Read the issue body above carefully. If `/tmp/orchestrator-$1-*.md` files exist 
 
 ### 2. Decompose
 
-Decompose the work per the lane protocol. The canonical lane shapes:
+Decompose the work per the lane protocol (`docs/lane-protocol.md` — the
+enforcement lanes in `scripts/hooks/lanes.json`; these are the ONLY valid IDs):
 
-- **Lane I** — backend / state.db / migrations / ctrl-api routes
-- **Lane II** — Temporal workflows / activities in `packages/learn`
-- **Lane III** — web UI / Wasp ops / dashboard pages
-- **Lane IV** — channel routing / per-profile awareness
-- **Lane V** — docker-compose / Hermes init / supervisor / per-channel config
-- **Lane VI** — tenant migration (only if needed; default opt-in)
+- **Lane I** — `packages/ctrl/**` (ctrl-api routes incl. channels, 4-store layer — NOT migrations/schema/server.ts: forbidden zone, orchestrator lands those)
+- **Lane II** — `packages/learn/**` (Temporal workflows / activities)
+- **Lane III** — `packages/web/**` (Wasp pages / ops / dashboard)
+- **Lane IV** — `packages/alfred-vault/**` (the Python vault daemon)
+- **Lane V** — `packages/{hermes,mcp-server,vault-init,setup}/**` + `scripts/**`, `caddy/**`, `docker-compose.yaml`, `.env.example`, `Makefile`, `docs/**`
+- **Lane VI** — `packages/voice-bridge/**`
+- **Lane VII** — `packages/paperclip/**`
+
+Branch = `lane-<arabic>/<issue>-<slug>` (lane-2 = Lane II). Work fitting no
+lane (CI, migrations, contracts) is orchestrator/phase0 work — do it yourself
+centrally, never assign it to a lane.
 
 For each lane: name it, name the files it owns exclusively, name the contracts it produces (table schema, env-var name, API shape).
 
@@ -65,8 +71,10 @@ On `Y`, dispatch each lane via the `Agent` tool with:
 - `isolation: "worktree"` — **mandatory** (the worktree hook enforces this)
 - `run_in_background: true` so they run in parallel
 - A prompt that includes:
-  - The lane's exclusive scope
+  - FIRST ACTION: write the `.lane` manifest (`echo '{"lane":"<ID>"}' > .lane`, roman ID I–VII)
+  - The lane's exclusive scope + branch name `lane-<arabic>/$1-<slug>`
   - The contracts file path verbatim
+  - The gate constraints: allowed globs only, forbidden zone off-limits, ~200 net LOC, never npm install, `git add` own paths only
   - The smoke template name (use `/lane-smoke <kind>` for boilerplate)
   - Standard constraints (the worker persona at `agents/lane-worker.md` covers most)
   - Explicit "Closes #$1" instructions for the lane that completes the user-visible flow; the others just reference `#$1`
