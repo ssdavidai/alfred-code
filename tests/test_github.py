@@ -76,6 +76,27 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(feedback["comment_id"], "2")
         self.assertEqual(client.decision_comments(5)[0]["body"], "Please preserve compatibility.")
 
+    def test_malformed_control_command_is_not_feedback(self):
+        client = FakeGitHub()
+        digest = "d" * 64
+        client.comments = [
+            {
+                "id": 1,
+                "body": f"/approve-plan {digest[:12]}",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:01:00Z",
+            },
+            {
+                "id": 2,
+                "body": f"/reject-plan {digest[:12]}",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:02:00Z",
+            },
+        ]
+
+        self.assertIsNone(client.find_feedback(5, after="2026-01-01T00:00:00Z"))
+        self.assertEqual(client.decision_comments(5), [])
+
     def test_plan_comment_is_deduplicated_by_immutable_marker(self):
         client = FakeGitHub()
         digest = "b" * 64
@@ -99,6 +120,8 @@ class GitHubTests(unittest.TestCase):
         client.post_plan(5, plan, digest)
         self.assertEqual(len(client.posts), 1)
         self.assertIn(f"/reject-plan {digest}", client.posts[0][1])
+        self.assertIn("non-command operator comment", client.posts[0][1])
+        self.assertIn("Malformed approval or rejection commands are ignored", client.posts[0][1])
         client.comments = [{"body": f"<!-- alfred-code-plan:{digest} -->", "html_url": "existing"}]
         self.assertEqual(client.post_plan(5, plan, digest), "existing")
         self.assertEqual(len(client.posts), 1)

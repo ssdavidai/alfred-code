@@ -186,7 +186,7 @@ class GitHubClient:
                 "",
                 f"`{rejection_command} {plan_hash}`",
                 "",
-                "Any other operator comment posted after this plan is treated as specification feedback and causes a fresh plan.",
+                "Any other non-command operator comment posted after this plan is treated as specification feedback and causes a fresh plan. Malformed approval or rejection commands are ignored.",
             ]
         )
         return "\n".join(lines)
