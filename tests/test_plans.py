@@ -107,7 +107,7 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "Phase-0-owned"):
             self.validator.validate(value, issue_number=42, base_sha=self.base)
 
-    def test_phase0_must_precede_every_lane(self):
+    def test_phase0_dependency_is_enforced_by_lane_authority(self):
         value = self.valid()
         value["jobs"].insert(
             0,
@@ -123,7 +123,28 @@ class PlanTests(unittest.TestCase):
                 "depends_on": [],
             },
         )
-        with self.assertRaisesRegex(PlanValidationError, "must depend directly"):
+        value["jobs"][2]["depends_on"] = ["api-42"]
+        plan, _ = self.validator.validate(value, issue_number=42, base_sha=self.base)
+        self.assertEqual(plan["jobs"][1]["depends_on"], ["contract-42"])
+        self.assertEqual(plan["jobs"][2]["depends_on"], ["api-42", "contract-42"])
+
+    def test_phase0_cannot_depend_on_a_downstream_lane(self):
+        value = self.valid()
+        value["jobs"].insert(
+            0,
+            {
+                "id": "contract-42",
+                "lane": "phase0",
+                "title": "Contract",
+                "branch": "phase0/42-contract",
+                "paths": ["db/schema.sql"],
+                "verify": "true",
+                "contracts_read": [],
+                "contracts_changed": ["db/schema.sql"],
+                "depends_on": ["api-42"],
+            },
+        )
+        with self.assertRaisesRegex(PlanValidationError, "dependency cycle"):
             self.validator.validate(value, issue_number=42, base_sha=self.base)
 
     def test_overlap_and_cycles_are_rejected(self):
