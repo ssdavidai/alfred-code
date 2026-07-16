@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+SECRET_BIN="${ALFRED_CODE_SECRET_BIN:-$ROOT/bin/secret}"
+
+if "$SECRET_BIN" has superset-api-key >/dev/null 2>&1; then
+  SUPERSET_API_KEY="$($SECRET_BIN get superset-api-key)"
+  export SUPERSET_API_KEY
+fi
+if "$SECRET_BIN" has alfred-code-slack-webhook >/dev/null 2>&1; then
+  ALFRED_CODE_SLACK_WEBHOOK="$($SECRET_BIN get alfred-code-slack-webhook)"
+  export ALFRED_CODE_SLACK_WEBHOOK
+fi
+
+exec "$ROOT/bin/alfred-code" "$@"
