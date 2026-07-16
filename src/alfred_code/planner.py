@@ -34,7 +34,68 @@ def extract_json(text: str) -> dict[str, Any]:
                 continue
             if isinstance(value, dict):
                 return value
-    raise PlanValidationError(["planner returned no JSON object"])
+    raise PlanValidationError([f"planner returned no JSON object (output length: {len(text)})"])
+
+
+def plan_json_schema(issue_number: int, base_sha: str) -> dict[str, Any]:
+    string_array = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "required": ["issue", "base_sha", "summary", "risk", "jobs"],
+        "additionalProperties": False,
+        "properties": {
+            "issue": {"type": "integer", "const": issue_number},
+            "base_sha": {"type": "string", "const": base_sha},
+            "summary": {"type": "string", "minLength": 1},
+            "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+            "jobs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "id",
+                        "lane",
+                        "title",
+                        "branch",
+                        "paths",
+                        "verify",
+                        "contracts_read",
+                        "contracts_changed",
+                        "depends_on",
+                        "acceptance",
+                    ],
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "lane": {"type": "string"},
+                        "title": {"type": "string", "minLength": 1},
+                        "branch": {"type": "string", "minLength": 1},
+                        "paths": {**string_array, "minItems": 1},
+                        "verify": {"type": "string", "minLength": 1},
+                        "contracts_read": string_array,
+                        "contracts_changed": string_array,
+                        "depends_on": string_array,
+                        "acceptance": {**string_array, "minItems": 1},
+                    },
+                },
+            },
+        },
+    }
+
+
+def structured_planner_command(
+    command: tuple[str, ...], issue_number: int, base_sha: str
+) -> list[str]:
+    argv = list(command)
+    if Path(argv[0]).name == "claude" and "--json-schema" not in argv:
+        argv.extend(
+            [
+                "--json-schema",
+                json.dumps(plan_json_schema(issue_number, base_sha), separators=(",", ":")),
+            ]
+        )
+    return argv
 
 
 class Planner:
@@ -127,7 +188,7 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
         run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
         policy, policy_text = self.policy_at(base_sha)
         output = run(
-            self.config.planner_command,
+            structured_planner_command(self.config.planner_command, issue_number, base_sha),
             cwd=self.config.repo_path,
             input_text=self.prompt(issue, base_sha, policy_text),
             timeout=self.config.planner_timeout_seconds,
