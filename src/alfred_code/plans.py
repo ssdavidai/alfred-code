@@ -155,14 +155,16 @@ class PlanValidator:
                         problems.append(f"{label} path {path!r} is outside lane {lane}")
                     if lane != "phase0" and any(path_matches(path, pattern) for pattern in self.policy.forbidden):
                         problems.append(f"{label} path {path!r} is Phase-0-owned")
-            if not verify:
-                problems.append(f"{label}.verify is required")
-            elif lane in self.policy.lanes:
+            if lane in self.policy.lanes:
                 expected_verify = str(self.policy.lanes[lane].get("verify") or "").strip()
-                if verify != expected_verify:
-                    problems.append(
-                        f"{label}.verify must exactly match lane {lane}'s enforced command {expected_verify!r}"
-                    )
+                if not expected_verify:
+                    problems.append(f"lane {lane} has no authoritative verification command")
+                else:
+                    # Planner output is untrusted. The live lane policy, not the model or issue text,
+                    # owns the only shell command the trusted controller may execute.
+                    verify = expected_verify
+            elif not verify:
+                problems.append(f"{label}.verify is required")
             if not isinstance(depends, list) or not all(isinstance(value, str) for value in depends):
                 problems.append(f"{label}.depends_on must be an array of job IDs")
                 depends = []
