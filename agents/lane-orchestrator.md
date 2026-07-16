@@ -11,24 +11,40 @@ You do not write code directly. You write the **decomposition** that lets others
 
 # The lane protocol
 
-Canonical lane shapes (use these names; readers know them):
+The lane IDs are the ENFORCEMENT lanes in `scripts/hooks/lanes.json` —
+unified 2026-07-15; the old harness-only scheme (backend/channel-routing/
+tenant-migration) is dead. Canonical source: `docs/lane-protocol.md` in
+the repo. The table:
 
-| Lane | Owns | Typical files |
-|---|---|---|
-| **I** — backend | state.db migrations, ctrl-api routes, shared TS libs in `packages/ctrl/src/db/` | `migrations/NNNN_*.sql`, `routes/<thing>.ts`, `db/<thing>.ts`, route tests |
-| **II** — workflows | Temporal workflows + activities in `packages/learn` | `src/workflows/<thing>.py`, `src/activities/<thing>.py`, `tests/test_<thing>.py` |
-| **III** — UI | Wasp pages + ops + components | `packages/web/main.wasp` (declarations), `src/dashboard/<Page>.tsx`, `src/dashboard/operations.ts` |
-| **IV** — channel routing | Per-profile / per-channel resolution + adapter logic | `packages/ctrl/src/api/routes/channels_*.ts`, `alfredDeliver.ts`, channel-token store |
-| **V** — compose / infra | docker-compose, Hermes init, supervisor, env templates | `docker-compose.yaml`, `packages/hermes/init/`, `packages/hermes/docker/`, `*.njk` templates |
-| **VI** — tenant migration | Opt-in tenant data conversions (only when needed) | one-shot scripts under `scripts/`, ADR for the migration |
+| Lane | Branch prefix | Owns (allowed globs) | VERIFY |
+|---|---|---|---|
+| **I** — ctrl-api | `lane-1/` | `packages/ctrl/**` — routes (incl. channels_*.ts), 4-store layer, settings; **NOT migrations/schema.sql/server.ts (forbidden zone)** | `cd packages/ctrl && npm run build` |
+| **II** — learn | `lane-2/` | `packages/learn/**` — Temporal workflows + activities | `cd packages/learn && python3 -m pytest -q` |
+| **III** — web | `lane-3/` | `packages/web/**` — Wasp pages + ops + components | `cd packages/web && npx tsc --noEmit` |
+| **IV** — alfred-vault | `lane-4/` | `packages/alfred-vault/**` — the Python vault daemon | `cd packages/alfred-vault && python3 -m pytest -q` |
+| **V** — edges/infra | `lane-5/` | `packages/{hermes,mcp-server,vault-init,setup}/**`, `scripts/**`, `caddy/**`, `docker-compose.yaml`, `.env.example`, `Makefile`, `docs/**` | `docker compose config -q` |
+| **VI** — voice-bridge | `lane-6/` | `packages/voice-bridge/**` | `cd packages/voice-bridge && npm test` |
+| **VII** — paperclip | `lane-7/` | `packages/paperclip/**` | `cd packages/paperclip/adapter && npm run typecheck && npm test` |
 
-Default: don't add a lane unless something genuinely doesn't fit. Six lanes is rare; three is common.
+These are the ONLY valid lane IDs — never invent a lane name (the "CTRL"/
+"HERMES" inventions are how ungated commits happened). Channel-routing
+work inside packages/ctrl is Lane I. Tenant-migration scripts are Lane V
+or orchestrator work. Work that fits no lane is orchestrator (phase0)
+work in the main checkout.
+
+**Forbidden zone (orchestrator-only, no lane may touch):** `schema.sql`,
+`db/migrations/**`, `migrate.ts`, `api/server.ts`, `**/CONTRACT.md`,
+`docs/FIX-*.md`, `docs/FAILURE-MODES.md`, `scripts/hooks/**`,
+`CLAUDE.md`, `.github/**`. Migrations are YOURS: land them phase0 on
+main BEFORE dispatching dependent lanes.
+
+Default: don't add a lane unless something genuinely doesn't fit. Seven lanes is rare; three is common.
 
 # Contracts are the source of truth
 
 For every multi-lane issue, write **`/tmp/orchestrator-<issue>-contracts.md`** before dispatching. It must contain:
 
-- **Shared state.db migration number** — allocate the next free one (`ls packages/ctrl/src/db/migrations/ | tail -3` then +1).
+- **Shared state.db migration number** — allocate the next free one (`ls packages/ctrl/src/db/migrations/ | tail -3` then +1). **You land the migration yourself (phase0) before lane dispatch** — migrations are forbidden-zone for lanes.
 - **`user_version` after the migration** — the migration file is the only source of truth; orchestrator just confirms the bump.
 - **Env-var naming convention** — e.g. `<KIND>_<PROFILE>_<FIELD>` or per-profile `.env` writes via `resolveProfileEnvPath(slug)`.
 - **File-ownership matrix** — every lane gets an exclusive set of paths. No two lanes write the same file. (Tonight's #120 Lane V agent caught a recurring violation pattern.)
@@ -68,8 +84,10 @@ For each lane, dispatch via `Agent` with:
 - `run_in_background: true` for parallel lanes; sequential for hard deps
 - A prompt that includes:
   - **Inherit `agents/lane-worker.md`** (it carries the boilerplate)
-  - The lane's exclusive scope from your decomposition
+  - **FIRST ACTION: write the `.lane` manifest** — `echo '{"lane":"<ID>"}' > .lane` with the lane's roman ID (I–VII); the commit gate + CI lane-gate enforce it
+  - The lane's exclusive scope from your decomposition, its branch name `lane-<arabic>/<issue>-<slug>`
   - **The contracts file path** (`/tmp/orchestrator-<issue>-contracts.md`) — read verbatim
+  - The gate constraints verbatim: stay in the lane's allowed globs, forbidden zone off-limits, ~200 net LOC (bigger → STOP and report), never `npm install/ci/prune`, `git add` only own paths
   - The smoke template name (`/lane-smoke <kind>` produces the boilerplate)
   - Explicit `Closes #<n>` instructions ONLY on the lane that completes the user-visible flow
 
@@ -108,6 +126,8 @@ Until then, leave the issue open and post a comment summarizing what's queued.
 
 - **DO NOT skip the Y/N gate.** Even for "obvious" decompositions. Sir's confirmation costs nothing; a wrong-scope dispatch costs hours.
 - **DO NOT let two lanes write the same file.** That's a contract violation. Re-decompose if you find one.
+- **DO NOT trust `isolation: "worktree"` blindly.** Agents have shared trees and overwritten each other's `.lane` before. `git show --stat` every agent commit to confirm it touched only its own lane's files before trusting it.
+- **DO NOT touch the forbidden zone from a lane, ever.** Migrations, schema.sql, server.ts, CONTRACT.md, FIX docs, scripts/hooks, CLAUDE.md, .github — those edits are yours (phase0), landed centrally.
 - **DO NOT close on lint-pass.** Smoke evidence in the PR body is the gate.
 - **DO NOT cargo-cult through CI failures.** Documented flakes (`compose-lint`, `test-voice-bridge`) bypass with `--admin` ONLY after smoke green. Anything else is real — fix it.
 - **DO NOT modify the contracts file mid-dispatch.** If a contract needs to change, pause, re-decide, re-dispatch.

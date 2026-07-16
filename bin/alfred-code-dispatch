@@ -41,11 +41,20 @@ REPO="${ALFRED_CODE_REPO:-ssdavidai/alfred}"
 [[ -d "$REPO_PATH/.git" ]] || die "ALFRED_CODE_REPO_PATH ($REPO_PATH) is not a git repo"
 
 mkdir -p "$RUNS_DIR"
-[[ -f "$DISPATCHED" ]] || echo '{}' > "$DISPATCHED"
+[[ -f "$DISPATCHED" ]] || echo '[]' > "$DISPATCHED"
+
+# dispatched.json is a JSON ARRAY of entry objects (poll-and-act reads .[].issue).
+# Heal a legacy object-shaped file ({} keyed by issue) into the array shape.
+if [[ "$(jq -r 'type' "$DISPATCHED")" == "object" ]]; then
+  tmp=$(mktemp)
+  jq '[.[]]' "$DISPATCHED" > "$tmp" && mv "$tmp" "$DISPATCHED"
+fi
 
 # --- guard: already in-flight? ----------------------------------------
-EXISTING_PID=$(jq -r --arg i "$ISSUE" '.[$i].pid // empty' "$DISPATCHED" 2>/dev/null || true)
-EXISTING_STATUS=$(jq -r --arg i "$ISSUE" '.[$i].status // empty' "$DISPATCHED" 2>/dev/null || true)
+# No error-masking here: if dispatched.json is corrupt we want a loud abort,
+# not a silent re-dispatch (the guard silently never firing was the old bug).
+EXISTING_PID=$(jq -r --arg i "$ISSUE" '[.[] | select((.issue|tostring) == $i)] | last | .pid // empty' "$DISPATCHED")
+EXISTING_STATUS=$(jq -r --arg i "$ISSUE" '[.[] | select((.issue|tostring) == $i)] | last | .status // empty' "$DISPATCHED")
 if [[ -n "$EXISTING_PID" && "$EXISTING_STATUS" == "building" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
   echo "already building #$ISSUE (pid $EXISTING_PID, status $EXISTING_STATUS) — not re-dispatching"
   exit 0
@@ -88,9 +97,11 @@ Process:
 5. DO NOT merge anything — merge is Sir's manual gate. Only open PRs.
 
 When all lanes have open PRs (or you hit a hard blocker):
-  - Update ~/.alfred-code-state/dispatched.json: set ."${ISSUE}".status to
-    "pr-open" (or "failed" + a one-line reason), and add a "prs" array of the
-    PR numbers you opened.
+  - Update ~/.alfred-code-state/dispatched.json — it is a JSON ARRAY of entry
+    objects: find the entry with .issue == ${ISSUE} and set its .status to
+    "pr-open" (or "failed" + a one-line .note reason), and add a "prs" array
+    of the PR numbers you opened. Keep it an array; never convert it to an
+    object keyed by issue number.
   - Send ONE Telegram summary to Sir:
       TG=\$(${HOME}/.claude/bin/secret get telegram-bot-token)
       CID=\$(${HOME}/.claude/bin/secret get telegram-chat-id)
@@ -110,10 +121,12 @@ PID=$!
 disown "$PID" 2>/dev/null || true
 
 # --- record state ----------------------------------------------------
+# Array shape: replace any prior entry for this issue, then append the fresh one.
 tmp=$(mktemp)
 jq --arg i "$ISSUE" --arg pid "$PID" --arg now "$NOW" --arg log "$LOG" --arg repo "$REPO" '
-  .[$i] = {issue: ($i|tonumber), status: "building", pid: ($pid|tonumber),
-           started_at: $now, log: $log, repo: $repo}
+  [.[] | select((.issue|tostring) != $i)]
+  + [{issue: ($i|tonumber), status: "building", pid: ($pid|tonumber),
+      dispatched_at: $now, log: $log, repo: $repo}]
 ' "$DISPATCHED" > "$tmp" && mv "$tmp" "$DISPATCHED"
 
 echo "dispatched #$ISSUE detached (pid $PID), log: $LOG"
