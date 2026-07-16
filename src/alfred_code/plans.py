@@ -157,6 +157,12 @@ class PlanValidator:
                         problems.append(f"{label} path {path!r} is Phase-0-owned")
             if not verify:
                 problems.append(f"{label}.verify is required")
+            elif lane in self.policy.lanes:
+                expected_verify = str(self.policy.lanes[lane].get("verify") or "").strip()
+                if verify != expected_verify:
+                    problems.append(
+                        f"{label}.verify must exactly match lane {lane}'s enforced command {expected_verify!r}"
+                    )
             if not isinstance(depends, list) or not all(isinstance(value, str) for value in depends):
                 problems.append(f"{label}.depends_on must be an array of job IDs")
                 depends = []

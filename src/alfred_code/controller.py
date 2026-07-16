@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .agent_security import REVIEW_RESULT, SECURITY_POLICY, WORKER_RESULT
 from .audit import AuditLog
 from .config import ControllerConfig
 from .db import Database
@@ -361,6 +362,12 @@ class Controller:
                 return
             details = self.superset.workspace_details(job["workspace_id"])
             self.database.observe("superset", f"workspace:{job['workspace_id']}", details)
+            scope_error = self._worker_workspace_error(issue, plan, job, details)
+            if scope_error:
+                self._quarantine_worker(issue, plan, job, scope_error)
+                return
+            if self._finalize_worker_result(issue, plan, job, details):
+                return
             status_blob = json.dumps(details).lower()
             if any(token in status_blob for token in ('"failed"', '"crashed"', '"terminated"')):
                 self.database.update_job(job_id, state="blocked", last_error="Superset reports a failed agent session")
@@ -498,6 +505,14 @@ class Controller:
                 else None
             ),
         ) if job.get("review_sha") == pr.head_sha else None
+        if verdict is None and job.get("review_sha") == pr.head_sha and job.get("review_workspace_id"):
+            if self._publish_review_result(issue, job, pr):
+                return
+            verdict = self.github.review_verdict(
+                pr.number,
+                pr.head_sha,
+                not_before=job.get("review_requested_at"),
+            )
         if verdict == "pass":
             if pr.is_draft:
                 self.database.update_job(job_id, state="pr_open", last_error="PR is still a draft")
@@ -547,6 +562,9 @@ class Controller:
             review_name,
             review_branch,
             self.reviewer_prompt(issue, plan, job, pr),
+            issue_number=int(issue["number"]),
+            controller_job=job["job_id"],
+            verify_command=job["verify_command"],
         )
         self.database.update_job(
             job_id,
@@ -620,6 +638,274 @@ class Controller:
         age = (datetime.now(timezone.utc) - started).total_seconds()
         return age >= self.config.superset.worker_progress_timeout_seconds
 
+    @staticmethod
+    def _workspace_path(workspace: dict[str, Any]) -> Path | None:
+        value = workspace.get("worktreePath") or workspace.get("worktree_path")
+        if not value:
+            return None
+        path = Path(str(value)).expanduser().resolve()
+        return path if path.is_dir() else None
+
+    @staticmethod
+    def _status_paths(output: str) -> list[str]:
+        paths: list[str] = []
+        for line in output.splitlines():
+            if len(line) < 4:
+                continue
+            value = line[3:]
+            if " -> " in value:
+                old, new = value.split(" -> ", 1)
+                paths.extend([old, new])
+            else:
+                paths.append(value)
+        return paths
+
+    def _changed_workspace_paths(self, worktree: Path, base_sha: str) -> list[str]:
+        status = run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree,
+            timeout=30,
+        )
+        committed = run(
+            ["git", "diff", "--name-only", f"{base_sha}...HEAD"],
+            cwd=worktree,
+            timeout=30,
+        )
+        return list(
+            dict.fromkeys(
+                [
+                    path
+                    for path in [*self._status_paths(status), *committed.splitlines()]
+                    if path and path not in {".lane", WORKER_RESULT, REVIEW_RESULT}
+                ]
+            )
+        )
+
+    def _worker_workspace_error(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        workspace: dict[str, Any],
+    ) -> str | None:
+        worktree = self._workspace_path(workspace)
+        if worktree is None:
+            return None
+        lane_path = worktree / ".lane"
+        try:
+            lane = json.loads(lane_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"enforced .lane manifest is missing or invalid: {exc}"
+        expected = {
+            "lane": job["lane"],
+            "issue": int(issue["number"]),
+            "allowed": job["paths"],
+            "verify": job["verify_command"],
+            "controller_job": job["job_id"],
+            "role": "worker",
+            "security_policy": SECURITY_POLICY,
+        }
+        if lane != expected:
+            return "enforced .lane manifest drifted from the approved controller job"
+        try:
+            head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+            if head != str(plan["base_sha"]):
+                return "agent modified Git metadata; only the trusted controller may commit"
+            changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+        except (CommandError, OSError) as exc:
+            return f"cannot prove workspace scope: {exc}"
+        outside = [
+            path for path in changed if not any(path_matches(path, allowed) for allowed in job["paths"])
+        ]
+        if outside:
+            return f"workspace contains changes outside its approved plan: {', '.join(outside)}"
+        try:
+            deleted = run(
+                ["git", "diff", "--name-only", "--diff-filter=D", str(plan["base_sha"])],
+                cwd=worktree,
+                timeout=30,
+            ).splitlines()
+        except (CommandError, OSError) as exc:
+            return f"cannot prove non-destructive workspace state: {exc}"
+        if deleted:
+            return f"destructive file deletion is prohibited: {', '.join(deleted)}"
+        return None
+
+    def _quarantine_worker(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        error: str,
+    ) -> None:
+        self.database.update_job(job["job_id"], state="quarantined", last_error=error)
+        self.database.release_lane(job["job_id"])
+        self.notifier.send(
+            f"job:{job['job_id']}:security:{plan['base_sha']}",
+            f"Alfred #{issue['number']} lane {job['lane']} was quarantined by the scoped-agent policy: {error}.",
+            {"job": job["job_id"], "workspace": job.get("workspace_id"), "error": error},
+        )
+
+    @staticmethod
+    def _load_result(path: Path) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"status": "invalid"}
+        return value if isinstance(value, dict) else {"status": "invalid"}
+
+    def _finalize_worker_result(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        workspace: dict[str, Any],
+    ) -> bool:
+        worktree = self._workspace_path(workspace)
+        if worktree is None:
+            return False
+        result = self._load_result(worktree / WORKER_RESULT)
+        if result is None:
+            return False
+        status = str(result.get("status") or "")
+        if status == "blocked":
+            reason = str(result.get("reason") or "worker reported an unspecified blocker")[:1000]
+            self.database.update_job(job["job_id"], state="blocked", last_error=reason)
+            self.database.release_lane(job["job_id"])
+            return True
+        if status != "ready":
+            self._quarantine_worker(issue, plan, job, "worker result marker is invalid")
+            return True
+        changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+        if not changed:
+            self._quarantine_worker(issue, plan, job, "worker claimed readiness without repository changes")
+            return True
+        try:
+            verification = run(
+                ["bash", "-lc", job["verify_command"]],
+                cwd=worktree,
+                timeout=1200,
+            )
+            scope_error = self._worker_workspace_error(issue, plan, job, workspace)
+            if scope_error:
+                self._quarantine_worker(issue, plan, job, scope_error)
+                return True
+            changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+            run(["git", "add", "--", *changed], cwd=worktree, timeout=60)
+            staged = run(["git", "diff", "--cached", "--name-only"], cwd=worktree, timeout=30).splitlines()
+            if not staged or set(staged) != set(changed):
+                raise AuthorityUnavailable("staged diff does not exactly match the approved changed-file set")
+            commit_message = f"feat: {job['title']} (#{issue['number']}, lane {job['lane']})"
+            run(["git", "commit", "-m", commit_message], cwd=worktree, timeout=1200)
+            run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
+            evidence = verification.strip() or "(command exited 0 with no output)"
+            body = (
+                f"Closes #{issue['number']}\n\n"
+                f"Controller job: `{job['job_id']}` · lane `{job['lane']}`\n\n"
+                "## Smoke evidence\n\n"
+                f"`{job['verify_command']}`\n\n```text\n{evidence[:12000]}\n```\n\n"
+                "The trusted controller independently reran this command after validating every changed path against the approved plan."
+            )
+            url = self.github.create_pr(
+                branch=job["branch"],
+                title=f"{issue['title']} (lane {job['lane']})",
+                body=body,
+            )
+        except (AuthorityUnavailable, CommandError, OSError) as exc:
+            self.database.update_job(job["job_id"], state="blocked", last_error=f"controller finalization failed: {exc}")
+            self.database.release_lane(job["job_id"])
+            self.notifier.send(
+                f"job:{job['job_id']}:finalize-failed:{plan['base_sha']}",
+                f"Alfred #{issue['number']} lane {job['lane']} passed agent handoff but trusted finalization failed: {exc}",
+                {"job": job["job_id"], "workspace": job.get("workspace_id")},
+            )
+            return True
+        self.database.update_job(job["job_id"], state="pr_open", pr_url=url, last_error=None)
+        self.notifier.send(
+            f"job:{job['job_id']}:pr-created:{job['branch']}",
+            f"Alfred #{issue['number']} lane {job['lane']} was validated, committed, pushed, and opened as {url}.",
+            {"job": job["job_id"], "pr": url},
+        )
+        return True
+
+    def _publish_review_result(
+        self,
+        issue: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+    ) -> bool:
+        workspace_id = str(job.get("review_workspace_id") or "")
+        if not workspace_id:
+            return False
+        details = self.superset.workspace_details(workspace_id)
+        worktree = self._workspace_path(details)
+        if worktree is None:
+            return False
+        expected_lane = {
+            "lane": "review",
+            "issue": int(issue["number"]),
+            "allowed": [],
+            "verify": job["verify_command"],
+            "controller_job": job["job_id"],
+            "role": "reviewer",
+            "security_policy": SECURITY_POLICY,
+        }
+        try:
+            lane = json.loads((worktree / ".lane").read_text())
+            head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+            status = run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=worktree,
+                timeout=30,
+            )
+            changed = self._status_paths(status)
+        except (OSError, json.JSONDecodeError, CommandError) as exc:
+            error = f"cannot prove reviewer workspace integrity: {exc}"
+        else:
+            unexpected = [path for path in changed if path not in {".lane", REVIEW_RESULT}]
+            if lane != expected_lane:
+                error = "reviewer .lane manifest drifted from the controller job"
+            elif head != pr.head_sha:
+                error = f"reviewer HEAD drifted from exact PR SHA {pr.head_sha}"
+            elif unexpected:
+                error = f"reviewer modified read-only workspace paths: {', '.join(unexpected)}"
+            else:
+                error = None
+        if error:
+            self.database.update_job(job["job_id"], state="quarantined", last_error=error)
+            self.notifier.send(
+                f"job:{job['job_id']}:review-security:{pr.head_sha}",
+                f"Alfred #{issue['number']} review workspace was quarantined: {error}.",
+                {"job": job["job_id"], "workspace": workspace_id, "error": error},
+            )
+            return True
+        result = self._load_result(worktree / REVIEW_RESULT)
+        if result is None:
+            return False
+        verdict = str(result.get("verdict") or "fail").lower()
+        if verdict not in {"pass", "fail"} or str(result.get("head_sha") or "") != pr.head_sha:
+            verdict = "fail"
+        findings = str(result.get("findings") or "Reviewer returned no findings summary.")[:8000]
+        try:
+            verification = run(
+                ["bash", "-lc", job["verify_command"]],
+                cwd=worktree,
+                timeout=1200,
+            )
+        except (CommandError, OSError) as exc:
+            verdict = "fail"
+            verification = str(exc)
+        marker = f"<!-- alfred-code-review:{pr.head_sha}:{verdict} -->"
+        body = (
+            f"## Alfred Code independent review\n\n{findings}\n\n"
+            f"Verification: `{job['verify_command']}`\n\n```text\n"
+            f"{(verification.strip() or '(command exited 0 with no output)')[:12000]}\n```\n\n{marker}"
+        )
+        self.github.post_pr_comment(pr.number, body)
+        return False
+
     def _worker_workspace_name(self, issue_number: int, lane: str) -> str:
         return f"{self.config.superset.workspace_prefix}-{issue_number}-{lane.lower()}"
 
@@ -641,9 +927,11 @@ Contracts changed by the approved phase0 job only: {json.dumps(contracts.get('ch
 Acceptance evidence:
 {acceptance or '- Satisfy the issue within the bounded lane scope and prove it with real tests.'}
 
-Build the complete production implementation. Add or update real tests. Run the required verification and any narrower relevant tests. Before pushing, inspect git diff and prove every changed file is in .lane. Commit intentionally, push {job['branch']}, and open one PR that references #{issue['number']} and includes exact commands plus their actual outputs under a `## Smoke evidence` heading.
+Build the complete production implementation. Add or update real tests. Run the required verification and any narrower relevant tests. Inspect git diff and prove every changed file is in .lane. Do not commit, push, or call GitHub: the trusted controller owns Git metadata and external delivery.
 
-Never merge, close, delete, reset, force-push, change another lane, read or print secrets, disable hooks, or claim a test you did not run. If the lane boundary or contract is wrong, stop and explain the blocker in the workspace instead of escaping the scope.
+When the implementation is complete, write `{WORKER_RESULT}` as one JSON object with `status` set to `ready` and a short `summary`. Write it only after your final test run, then stop. If blocked, write the same file with `status` set to `blocked` and a precise `reason`, then stop. The controller distrusts this marker: it independently validates scope, rejects deletions, reruns the lane verification, commits only the approved files, pushes the exact branch, and opens the PR.
+
+Never merge, close, delete, reset, force-push, change another lane, use browser/computer/MCP tools, read or print secrets, disable hooks, or claim a test you did not run. If the lane boundary or contract is wrong, stop and report the blocker instead of escaping the scope.
 """
 
     def reviewer_prompt(
@@ -657,15 +945,9 @@ Never merge, close, delete, reset, force-push, change another lane, read or prin
 
 Do not modify code. Verify the live diff, lane scope {json.dumps(job['paths'])}, contracts, acceptance criteria, and actual CI. Run the lane verification command `{job['verify_command']}` plus any focused tests needed to detect regressions. Documentation and PR prose are claims, not evidence.
 
-Post exactly one GitHub PR comment. Include findings and command evidence, then finish with exactly one marker:
+Do not modify code, Git metadata, or GitHub. When finished, write `{REVIEW_RESULT}` as one JSON object containing `head_sha` exactly `{pr.head_sha}`, `verdict` set to `pass` only if this exact SHA is production-ready (otherwise `fail`), and a concise `findings` string with evidence. Then stop. The trusted controller reruns the enforced verification and posts the review marker to GitHub itself.
 
-<!-- alfred-code-review:{pr.head_sha}:pass -->
-
-only if the exact SHA is production-ready, or:
-
-<!-- alfred-code-review:{pr.head_sha}:fail -->
-
-if any actionable defect, scope violation, missing test, or unverifiable behavior remains. Never merge, approve through GitHub's review API, close, delete, push, or expose secrets. If HEAD changes while reviewing, post fail for this SHA and stop.
+Never merge, approve through GitHub's review API, close, delete, push, use external-control tools, or expose secrets. If HEAD changes while reviewing, return `fail` for this SHA and stop.
 """
 
     @staticmethod

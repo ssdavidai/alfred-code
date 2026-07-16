@@ -1,4 +1,6 @@
 import copy
+import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -36,6 +38,8 @@ class FakeGitHub:
         self.prs = {}
         self.verdicts = {}
         self.plans = []
+        self.created_prs = []
+        self.review_comments = []
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -78,6 +82,17 @@ class FakeGitHub:
     def pr_files(self, number):
         return ["file.txt"]
 
+    def create_pr(self, **values):
+        self.created_prs.append(copy.deepcopy(values))
+        return "https://example/pr/new"
+
+    def post_pr_comment(self, number, body):
+        self.review_comments.append((number, body))
+        match = re.search(r"<!-- alfred-code-review:([0-9a-f]{40,64}):(pass|fail) -->", body)
+        if match:
+            self.verdicts[(number, match.group(1))] = match.group(2)
+        return "https://example/review-comment"
+
 
 class FakePlanner:
     def __init__(self, plan, plan_hash):
@@ -119,10 +134,22 @@ class FakeSuperset:
     def ensure_project(self, repo_path):
         return "project"
 
-    def create_review_workspace(self, project_id, pr_number, name, branch, prompt):
+    def create_review_workspace(
+        self,
+        project_id,
+        pr_number,
+        name,
+        branch,
+        prompt,
+        *,
+        issue_number,
+        controller_job,
+        verify_command,
+    ):
         self.review_creates += 1
         workspace = Workspace(f"r-{pr_number}-{self.review_creates}", name, branch, f"superset://{name}")
         self.workspaces_by_name[name] = workspace
+        self.details[workspace.id] = {"id": workspace.id, "agents": [{"status": "RUNNING"}]}
         return workspace, f"review-agent-{self.review_creates}"
 
     def delete_workspace(self, workspace_id):
@@ -225,6 +252,21 @@ class ControllerTests(unittest.TestCase):
             "url": "https://example/approval",
             "created_at": "2026-01-01T00:00:00Z",
         }
+
+    def write_worker_lane(self):
+        (self.repo / ".lane").write_text(
+            json.dumps(
+                {
+                    "lane": "I",
+                    "issue": 12,
+                    "allowed": ["file.txt"],
+                    "verify": "true",
+                    "controller_job": "api-12",
+                    "role": "worker",
+                    "security_policy": "alfred-scoped-v1",
+                }
+            )
+        )
 
     def test_no_approval_means_no_job_or_workspace(self):
         result = self.controller.run_once()
@@ -364,6 +406,8 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         job = self.db.get_job("api-12")
         self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        subprocess.run(["git", "checkout", job["branch"]], cwd=self.repo, check=True, capture_output=True)
+        self.write_worker_lane()
         self.db.connection.execute(
             "UPDATE jobs SET created_at = ? WHERE job_id = ?",
             ("2020-01-01T00:00:00Z", "api-12"),
@@ -382,16 +426,68 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         job = self.db.get_job("api-12")
         self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        self.write_worker_lane()
         self.db.connection.execute(
             "UPDATE jobs SET created_at = ? WHERE job_id = ?",
             ("2020-01-01T00:00:00Z", "api-12"),
         )
-        (self.repo / "progress.txt").write_text("started\n")
+        (self.repo / "file.txt").write_text("started\n")
 
         self.controller.run_once()
 
         self.assertEqual(self.db.get_job("api-12")["state"], "running")
         self.assertEqual(self.db.lease_owner("I"), "api-12")
+
+    def test_out_of_scope_uncommitted_progress_is_quarantined(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        self.write_worker_lane()
+        (self.repo / "outside.txt").write_text("escape\n")
+
+        self.controller.run_once()
+
+        job = self.db.get_job("api-12")
+        self.assertEqual(job["state"], "quarantined")
+        self.assertIn("outside its approved plan", job["last_error"])
+        self.assertIsNone(self.db.lease_owner("I"))
+
+    def test_controller_not_agent_commits_pushes_and_opens_pr_after_ready_marker(self):
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        subprocess.run(["git", "checkout", job["branch"]], cwd=self.repo, check=True, capture_output=True)
+        self.write_worker_lane()
+        (self.repo / "file.txt").write_text("implemented\n")
+        (self.repo / ".alfred-code-result.json").write_text(
+            json.dumps({"status": "ready", "summary": "implemented"})
+        )
+
+        self.controller.run_once()
+
+        job = self.db.get_job("api-12")
+        self.assertEqual(job["state"], "pr_open")
+        self.assertEqual(job["pr_url"], "https://example/pr/new")
+        self.assertEqual(self.github.created_prs[0]["branch"], "lane-1/12-api")
+        remote_sha = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/lane-1/12-api"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(
+            remote_sha,
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+            ).stdout.strip(),
+        )
 
     def test_pr_ci_review_sha_and_merge_lifecycle(self):
         self.controller.run_once()
@@ -526,6 +622,98 @@ class ControllerTests(unittest.TestCase):
         )
         self.controller.run_once()
         self.assertEqual(self.db.get_job("api-12")["last_error"], "PR body has no ## Smoke evidence section")
+
+    def test_controller_posts_scoped_reviewer_marker_and_accepts_exact_sha(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        sha = self.sha
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        review_workspace = job["review_workspace_id"]
+        self.superset.details[review_workspace]["worktreePath"] = str(self.repo)
+        (self.repo / ".lane").write_text(
+            json.dumps(
+                {
+                    "lane": "review",
+                    "issue": 12,
+                    "allowed": [],
+                    "verify": "true",
+                    "controller_job": "api-12",
+                    "role": "reviewer",
+                    "security_policy": "alfred-scoped-v1",
+                }
+            )
+        )
+        (self.repo / ".alfred-code-review.json").write_text(
+            json.dumps({"head_sha": sha, "verdict": "pass", "findings": "No defects found."})
+        )
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.get_job("api-12")["state"], "ready_merge")
+        self.assertEqual(len(self.github.review_comments), 1)
+        self.assertIn(f"<!-- alfred-code-review:{sha}:pass -->", self.github.review_comments[0][1])
+
+    def test_reviewer_workspace_modification_is_quarantined(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        sha = self.sha
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        review_workspace = job["review_workspace_id"]
+        self.superset.details[review_workspace]["worktreePath"] = str(self.repo)
+        (self.repo / ".lane").write_text(
+            json.dumps(
+                {
+                    "lane": "review",
+                    "issue": 12,
+                    "allowed": [],
+                    "verify": "true",
+                    "controller_job": "api-12",
+                    "role": "reviewer",
+                    "security_policy": "alfred-scoped-v1",
+                }
+            )
+        )
+        (self.repo / "file.txt").write_text("reviewer mutation\n")
+        (self.repo / ".alfred-code-review.json").write_text(
+            json.dumps({"head_sha": sha, "verdict": "pass", "findings": "No defects found."})
+        )
+
+        self.controller.run_once()
+
+        job = self.db.get_job("api-12")
+        self.assertEqual(job["state"], "quarantined")
+        self.assertIn("read-only workspace", job["last_error"])
+        self.assertEqual(self.github.review_comments, [])
 
 
 if __name__ == "__main__":

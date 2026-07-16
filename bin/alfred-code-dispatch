@@ -8,8 +8,8 @@
 # State: records the run in ~/.alfred-code-state/dispatched.json so the
 # next poll sees "this issue is in-flight, skip it" instead of re-dispatching.
 #
-# Safety rails that make unattended builds acceptable (none of these are
-# permission prompts — they fire regardless of --dangerously-skip-permissions):
+# This legacy launcher is retained for evidence only. The v2 Superset controller
+# owns all new execution because it provides enforced scoped agent profiles.
 #   • PreToolUse hooks: block-env-dump, block-dead-ssh-aliases,
 #     enforce-worktree-isolation, require-smoke-evidence
 #   • Each lane runs in an isolated git worktree (no cross-lane stomping)
@@ -24,9 +24,10 @@ set -euo pipefail
 STATE_DIR="${HOME}/.alfred-code-state"
 RUNS_DIR="${STATE_DIR}/runs"
 DISPATCHED="${STATE_DIR}/dispatched.json"
-PERM_MODE="${ALFRED_CODE_DISPATCH_PERM:---dangerously-skip-permissions}"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+die "legacy autonomous dispatch is disabled: use the Alfred Code v2 Superset controller with scoped agents"
 
 ISSUE="${1:-}"
 [[ -z "$ISSUE" ]] && die "usage: alfred-code-dispatch <issue#> [--scope <hint>]"

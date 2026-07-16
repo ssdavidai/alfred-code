@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .audit import AuditLog
+from .agent_security import SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID
 from .config import DEFAULT_CONFIG, ControllerConfig, load_config
 from .controller import Controller
 from .db import Database
@@ -24,11 +25,12 @@ from .planner import Planner
 from .plans import LanePolicy, PlanValidator
 from .project import ProjectBoard
 from .superset import SupersetClient
+from .superset_agents import inspect_agent_configs, provision_agent_configs
 from .util import atomic_write, run
 from .worktrees import audit_worktrees
 
 
-EXAMPLE_CONFIG = """# Alfred Code v2 control plane. Safe/read-only until apply = true.
+EXAMPLE_CONFIG = f"""# Alfred Code v2 control plane. Safe/read-only until apply = true.
 repo_path = "~/dev/alfred"
 state_dir = "~/.alfred-code-state-v2"
 apply = false
@@ -50,8 +52,8 @@ project_title = "Alfred Product Control"
 [superset]
 cli = "/Users/ssd/.superset/bin/superset"
 project_name = "alfred"
-worker_agent = "Claude"
-reviewer_agent = "Codex"
+worker_agent = "{SCOPED_CLAUDE_AGENT_ID}"
+reviewer_agent = "{SCOPED_CODEX_AGENT_ID}"
 workspace_prefix = "alfred-code"
 api_key_env = "SUPERSET_API_KEY"
 # Workspace deletion is intentionally disabled. Enable only after auditing cleanup.
@@ -137,6 +139,7 @@ def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
     )
     check("github", lambda: GitHubClient(config.github).doctor())
     check("superset", lambda: SupersetClient(config.superset).doctor())
+    check("superset_scoped_agents", inspect_agent_configs)
     if config.slack.enabled:
         check("slack", lambda: {"channel": SlackNotifier(config.slack).destination})
     if config.github.project_number:
@@ -193,6 +196,7 @@ def parser() -> argparse.ArgumentParser:
 
     sub.add_parser("project-setup", help="Create or adopt the GitHub PM project and fields")
     sub.add_parser("worktrees-audit", help="Read-only audit of every target-repository worktree")
+    sub.add_parser("agents-provision", help="Provision and verify Alfred-only scoped Superset agent presets")
     return root
 
 
@@ -253,6 +257,14 @@ def main(argv: list[str] | None = None) -> int:
         database.close()
         print(f"initialized durable state: {config.database_path}")
         return 0
+
+    if args.command == "agents-provision":
+        try:
+            emit(provision_agent_configs())
+            return 0
+        except (AlfredCodeError, OSError, ValueError, KeyError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     try:
         config = load_config(config_path)

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_security import SCOPED_AGENT_IDS, SECURITY_POLICY
 from .config import SupersetConfig
 from .errors import AuthorityUnavailable, CommandError
 from .util import canonical_json, run_json
@@ -37,6 +38,13 @@ class SupersetClient:
             return run_json(command, timeout=timeout)
         except CommandError as exc:
             raise AuthorityUnavailable(str(exc)) from exc
+
+    @staticmethod
+    def _assert_scoped_agent(agent: str) -> None:
+        if agent not in SCOPED_AGENT_IDS:
+            raise AuthorityUnavailable(
+                f"refusing unsafe Superset agent {agent!r}; Alfred Code accepts only provisioned scoped agent UUIDs"
+            )
 
     @staticmethod
     def _items(value: Any, key: str) -> list[dict[str, Any]]:
@@ -120,6 +128,7 @@ class SupersetClient:
         job: dict[str, Any],
         prompt: str,
     ) -> tuple[Workspace, str | None]:
+        self._assert_scoped_agent(self.config.worker_agent)
         name = f"{self.config.workspace_prefix}-{issue_number}-{job['lane'].lower()}"
         existing = self.workspace_for_branch(job["branch"])
         if existing:
@@ -135,6 +144,8 @@ class SupersetClient:
             "allowed": job["paths"],
             "verify": job["verify_command"],
             "controller_job": job["job_id"],
+            "role": "worker",
+            "security_policy": SECURITY_POLICY,
         }
         encoded = base64.b64encode((canonical_json(lane_document) + "\n").encode()).decode()
         command = f"printf '%s' {encoded} | base64 --decode > .lane"
@@ -154,7 +165,7 @@ class SupersetClient:
                 "--command",
                 command,
                 "--agent",
-                self.config.worker_agent.lower(),
+                self.config.worker_agent,
                 "--prompt",
                 prompt,
             ],
@@ -177,6 +188,7 @@ class SupersetClient:
         return self.start_agent(workspace_id, self.config.reviewer_agent, prompt)
 
     def start_agent(self, workspace_id: str, agent: str, prompt: str) -> str | None:
+        self._assert_scoped_agent(agent)
         result = self._json(
             [
                 "agents",
@@ -184,7 +196,7 @@ class SupersetClient:
                 "--workspace",
                 workspace_id,
                 "--agent",
-                agent.lower(),
+                agent,
                 "--prompt",
                 prompt,
             ],
@@ -202,7 +214,23 @@ class SupersetClient:
         name: str,
         branch: str,
         prompt: str,
+        *,
+        issue_number: int,
+        controller_job: str,
+        verify_command: str,
     ) -> tuple[Workspace, str | None]:
+        self._assert_scoped_agent(self.config.reviewer_agent)
+        lane_document = {
+            "lane": "review",
+            "issue": issue_number,
+            "allowed": [],
+            "verify": verify_command,
+            "controller_job": controller_job,
+            "role": "reviewer",
+            "security_policy": SECURITY_POLICY,
+        }
+        encoded = base64.b64encode((canonical_json(lane_document) + "\n").encode()).decode()
+        command = f"printf '%s' {encoded} | base64 --decode > .lane"
         result = self._json(
             [
                 "workspaces",
@@ -216,8 +244,10 @@ class SupersetClient:
                 branch,
                 "--base-branch",
                 "main",
+                "--command",
+                command,
                 "--agent",
-                self.config.reviewer_agent.lower(),
+                self.config.reviewer_agent,
                 "--prompt",
                 prompt,
             ],

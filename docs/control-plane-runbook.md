@@ -4,7 +4,7 @@
 
 Run `./install-controller.sh`. It symlinks the v2 CLI and daemon wrapper, creates a mode-0600 configuration with `apply = false`, initializes the SQLite database, and renders a launchd plist. It deliberately does not load launchd.
 
-Run `alfred-code doctor`. A healthy result proves the target repository, live lane policy, database, GitHub repository access, and Superset runtime are reachable. GitHub Projects requires the additional `project` token scope. Superset may use its persisted OAuth login or a `superset-api-key` in the Keychain broker.
+Run `alfred-code agents-provision`, then `alfred-code doctor`. Provisioning creates the two Alfred-only scoped Superset presets and replaces any YOLO arguments on the built-in Claude and Codex fallbacks with sandboxed settings. A healthy result proves the target repository, live lane policy, database, GitHub repository access, Superset runtime, scoped preset definitions, launcher, guard, and Codex permission-profile compatibility are all reachable. GitHub Projects requires the additional `project` token scope. Superset may use its persisted OAuth login or a `superset-api-key` in the Keychain broker.
 
 Run `alfred-code project-setup` after GitHub has project scope. Put the returned number into `github.project_number` in the controller TOML, then run `doctor` again.
 
@@ -35,5 +35,7 @@ If an issue changes during a build, the issue becomes blocked. Decide whether to
 If a PR closes without merge, the job becomes quarantined and releases its lane. The workspace and branch remain for inspection. Nothing is deleted automatically with the default configuration.
 
 If a reviewer fails, fix the same PR with a new commit. The old SHA-bound verdict cannot approve the new HEAD. Green CI causes a new independent review workspace.
+
+If `doctor` reports scoped-agent drift, do not launch work from a built-in Superset preset. Run `alfred-code agents-provision` and restart the controller. A scoped agent never owns Git delivery: it may edit only approved lane paths and write its result marker. A changed `.lane`, an agent-created commit, an out-of-scope path, any deletion, a reviewer edit, or a review SHA mismatch quarantines the job and preserves the workspace for inspection.
 
 If launchd misbehaves, `launchctl print gui/$(id -u)/com.ssdavidai.alfred-code-controller-v2` and the two launchd logs are the first evidence. The singleton lock prevents duplicate schedulers. Stopping this new service does not touch the legacy stopped schedule.

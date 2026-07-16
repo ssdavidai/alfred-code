@@ -21,8 +21,9 @@ project_title = "Alfred Product Control"
 [superset]
 cli = "/Users/ssd/.superset/bin/superset"
 project_name = "alfred"
-worker_agent = "Claude"
-reviewer_agent = "Codex"
+# Dedicated IDs created by `alfred-code agents-provision`. Built-in presets are rejected.
+worker_agent = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
+reviewer_agent = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 workspace_prefix = "alfred-code"
 api_key_env = "SUPERSET_API_KEY"
 cleanup_merged_workspaces = false

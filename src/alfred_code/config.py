@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .agent_security import (
+    SCOPED_AGENT_IDS,
+    SCOPED_CLAUDE_AGENT_ID,
+    SCOPED_CODEX_AGENT_ID,
+)
 from .errors import ConfigurationError
 
 
@@ -30,8 +35,8 @@ class GitHubConfig:
 class SupersetConfig:
     cli: str = "/Users/ssd/.superset/bin/superset"
     project_name: str = "alfred"
-    worker_agent: str = "Claude"
-    reviewer_agent: str = "Codex"
+    worker_agent: str = SCOPED_CLAUDE_AGENT_ID
+    reviewer_agent: str = SCOPED_CODEX_AGENT_ID
     workspace_prefix: str = "alfred-code"
     api_key_env: str = "SUPERSET_API_KEY"
     cleanup_merged_workspaces: bool = False
@@ -145,8 +150,8 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         superset=SupersetConfig(
             cli=str(superset_raw.get("cli", "/Users/ssd/.superset/bin/superset")),
             project_name=str(superset_raw.get("project_name", "alfred")),
-            worker_agent=str(superset_raw.get("worker_agent", "Claude")),
-            reviewer_agent=str(superset_raw.get("reviewer_agent", "Codex")),
+            worker_agent=str(superset_raw.get("worker_agent", SCOPED_CLAUDE_AGENT_ID)),
+            reviewer_agent=str(superset_raw.get("reviewer_agent", SCOPED_CODEX_AGENT_ID)),
             workspace_prefix=str(superset_raw.get("workspace_prefix", "alfred-code")),
             api_key_env=str(superset_raw.get("api_key_env", "SUPERSET_API_KEY")),
             cleanup_merged_workspaces=bool(superset_raw.get("cleanup_merged_workspaces", False)),
@@ -164,6 +169,16 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         raise ConfigurationError("poll_seconds must be at least 10")
     if config.superset.worker_progress_timeout_seconds < 60:
         raise ConfigurationError("superset.worker_progress_timeout_seconds must be at least 60")
+    if config.superset.worker_agent not in SCOPED_AGENT_IDS:
+        raise ConfigurationError(
+            "superset.worker_agent must be an Alfred scoped Superset agent UUID; "
+            "run `alfred-code agents-provision` instead of selecting a built-in preset"
+        )
+    if config.superset.reviewer_agent not in SCOPED_AGENT_IDS:
+        raise ConfigurationError(
+            "superset.reviewer_agent must be an Alfred scoped Superset agent UUID; "
+            "run `alfred-code agents-provision` instead of selecting a built-in preset"
+        )
     if not config.github.repo.count("/") == 1:
         raise ConfigurationError("github.repo must be OWNER/REPO")
     return config

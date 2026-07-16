@@ -21,10 +21,11 @@ STATE_DIR="${HOME}/.alfred-code-state"
 RUNS_DIR="${STATE_DIR}/runs"
 CI_FIXES="${STATE_DIR}/ci-fixes.json"
 MAX_ATTEMPTS="${ALFRED_CODE_CI_FIX_MAX:-2}"
-PERM_MODE="${ALFRED_CODE_DISPATCH_PERM:---dangerously-skip-permissions}"
 LESSONS="${ALFRED_SECRETS_HOME:-$HOME/.claude/alfred-code}/docs/ci-lessons.md"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+die "legacy autonomous CI repair is disabled: use the Alfred Code v2 Superset controller with scoped agents"
 
 PR="${1:-}"
 [[ -z "$PR" ]] && die "usage: alfred-code-fix-pr <pr#>"

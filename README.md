@@ -13,12 +13,15 @@ GitHub issue -> SHA-pinned validated plan -> exact GitHub approval
 
 No agent can start without a current validated plan and exact approval by an allow-listed GitHub user. The controller does not merge, close, reset, force-push, delete branches, expose secrets, or write outside the approved lane. Workspace cleanup is disabled by default.
 
+Workers and reviewers run only through the dedicated `Alfred Claude (Scoped)` and `Alfred Codex (Scoped)` Superset presets. The launcher rejects YOLO, bypass, alternate-sandbox, extra-directory, MCP, plugin, and configuration-override arguments. Codex receives a generated offline permission profile that makes the repository read-only except for the approved lane paths and one result marker. Claude runs with strict native sandboxing, home-directory reads denied, no network or unsandboxed escape, and a pre-tool lane guard. Both agents are forbidden from committing, pushing, or calling GitHub; after a result marker appears, the controller independently checks the immutable `.lane` manifest, exact base or review SHA, every changed path, and the absence of deletions before it performs any Git or GitHub delivery. Any drift is quarantined.
+
 ## Install v2 safely
 
 ```bash
 git clone https://github.com/ssdavidai/alfred-code ~/.claude/alfred-code
 cd ~/.claude/alfred-code
 ./install-controller.sh
+~/.claude/bin/alfred-code agents-provision
 ~/.claude/bin/alfred-code doctor
 ```
 

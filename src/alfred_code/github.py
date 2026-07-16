@@ -123,6 +123,29 @@ class GitHubClient:
             ["issue", "comment", str(number), "--repo", self.config.repo, "--body", body]
         ).strip()
 
+    def create_pr(self, *, branch: str, title: str, body: str, base: str = "main") -> str:
+        return self._run(
+            [
+                "pr",
+                "create",
+                "--repo",
+                self.config.repo,
+                "--head",
+                branch,
+                "--base",
+                base,
+                "--title",
+                title,
+                "--body",
+                body,
+            ]
+        ).strip()
+
+    def post_pr_comment(self, number: int, body: str) -> str:
+        return self._run(
+            ["pr", "comment", str(number), "--repo", self.config.repo, "--body", body]
+        ).strip()
+
     def ensure_label(self, name: str, color: str, description: str) -> None:
         try:
             self._run(
