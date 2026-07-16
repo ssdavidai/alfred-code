@@ -191,12 +191,14 @@ class PlanValidator:
                 }
             )
 
-        # Phase-0 sequencing is controller policy, not model judgment. When the
-        # planner correctly identifies one contract job, canonically add that
-        # direct dependency to every downstream lane. The dependency graph is
-        # still validated below, so a malicious or contradictory phase-0 edge
-        # cannot bypass cycle/unknown-job checks.
+        # Phase-0 sequencing is controller policy, not model judgment. A valid
+        # phase-0 job is always the root, so discard model-supplied dependencies
+        # on that job and canonically add it to every downstream lane. The rest
+        # of the graph is still validated below for cycles and unknown jobs.
         phase0_ids = {job["id"] for job in normalized_jobs if job["lane"] == "phase0"}
+        for job in normalized_jobs:
+            if job["lane"] == "phase0":
+                job["depends_on"] = []
         if len(phase0_ids) == 1:
             phase0_id = next(iter(phase0_ids))
             for job in normalized_jobs:

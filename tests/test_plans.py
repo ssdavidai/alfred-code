@@ -128,7 +128,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan["jobs"][1]["depends_on"], ["contract-42"])
         self.assertEqual(plan["jobs"][2]["depends_on"], ["api-42", "contract-42"])
 
-    def test_phase0_cannot_depend_on_a_downstream_lane(self):
+    def test_phase0_is_canonicalized_as_the_dependency_root(self):
         value = self.valid()
         value["jobs"].insert(
             0,
@@ -144,8 +144,10 @@ class PlanTests(unittest.TestCase):
                 "depends_on": ["api-42"],
             },
         )
-        with self.assertRaisesRegex(PlanValidationError, "dependency cycle"):
-            self.validator.validate(value, issue_number=42, base_sha=self.base)
+        plan, _ = self.validator.validate(value, issue_number=42, base_sha=self.base)
+        self.assertEqual(plan["jobs"][0]["depends_on"], [])
+        self.assertEqual(plan["jobs"][1]["depends_on"], ["contract-42"])
+        self.assertEqual(plan["jobs"][2]["depends_on"], ["contract-42"])
 
     def test_overlap_and_cycles_are_rejected(self):
         value = self.valid()
