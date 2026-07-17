@@ -238,16 +238,19 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(value["policy"], "alfred-scoped-v1")
 
     def test_provider_self_check_executes_the_resolved_binary(self):
+        provider = self.workspace / "fake-provider"
+        provider.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\n")
+        provider.chmod(0o700)
         output = StringIO()
         with (
-            patch("alfred_code.agent_security._provider_binary", return_value="/bin/echo"),
+            patch("alfred_code.agent_security._provider_binary", return_value=str(provider)),
             redirect_stdout(output),
         ):
             result = main(["--self-check", "codex"])
         value = json.loads(output.getvalue())
         self.assertEqual(result, 0)
         self.assertEqual(value["provider"], "codex")
-        self.assertEqual(value["provider_binary"], "/bin/echo")
+        self.assertEqual(value["provider_binary"], str(provider))
         self.assertEqual(value["provider_version"], "--version")
 
     def test_provider_exit_is_persisted_before_controller_reconciliation(self):
