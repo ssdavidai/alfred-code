@@ -438,16 +438,38 @@ class GitHubClient:
         *,
         not_before: str | None = None,
     ) -> str | None:
+        result = self.review_feedback(
+            pr_number,
+            head_sha,
+            not_before=not_before,
+        )
+        return str(result["verdict"]) if result else None
+
+    def review_feedback(
+        self,
+        pr_number: int,
+        head_sha: str,
+        *,
+        not_before: str | None = None,
+    ) -> dict[str, str] | None:
         reviewers = {actor.lower() for actor in self.config.reviewers}
         for comment in reversed(self.pr_comments(pr_number)):
             actor = str((comment.get("user") or {}).get("login") or "").lower()
             if actor not in reviewers:
                 continue
-            if not_before and str(comment.get("created_at") or "") < not_before:
+            created_at = str(comment.get("created_at") or "")
+            if not_before and created_at < not_before:
                 continue
-            for sha, verdict in REVIEW_RE.findall(str(comment.get("body") or "")):
+            body = str(comment.get("body") or "")
+            for sha, verdict in REVIEW_RE.findall(body):
                 if sha == head_sha:
-                    return verdict
+                    return {
+                        "verdict": verdict,
+                        "body": body[:12000],
+                        "url": str(comment.get("html_url") or ""),
+                        "created_at": created_at,
+                        "actor": actor,
+                    }
         return None
 
     def open_prs(self) -> list[dict[str, Any]]:

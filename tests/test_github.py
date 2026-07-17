@@ -25,6 +25,9 @@ class FakeGitHub(GitHubClient):
         self.posts.append((number, body))
         return "https://example/comment"
 
+    def pr_comments(self, number):
+        return self.comments
+
 
 class GitHubTests(unittest.TestCase):
     def test_cycle_cache_reuses_issue_and_comment_observations(self):
@@ -198,6 +201,39 @@ class GitHubTests(unittest.TestCase):
             "PENDING",
         )
         self.assertEqual(GitHubClient._ci_state([{"conclusion": "FAILURE"}]), "RED")
+
+    def test_review_feedback_is_exact_sha_allowlisted_and_timestamp_bound(self):
+        client = FakeGitHub()
+        sha = "a" * 40
+        client.comments = [
+            {
+                "body": f"old\n<!-- alfred-code-review:{sha}:fail -->",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "body": f"intruder\n<!-- alfred-code-review:{sha}:pass -->",
+                "user": {"login": "intruder"},
+                "created_at": "2026-01-01T00:02:00Z",
+            },
+            {
+                "body": f"schema mismatch\n<!-- alfred-code-review:{sha}:fail -->",
+                "user": {"login": "owner"},
+                "created_at": "2026-01-01T00:03:00Z",
+                "html_url": "https://example/review",
+            },
+        ]
+
+        feedback = client.review_feedback(
+            5,
+            sha,
+            not_before="2026-01-01T00:01:00Z",
+        )
+
+        self.assertEqual(feedback["verdict"], "fail")
+        self.assertIn("schema mismatch", feedback["body"])
+        self.assertEqual(feedback["url"], "https://example/review")
+        self.assertEqual(client.review_verdict(5, sha), "fail")
 
 
 if __name__ == "__main__":

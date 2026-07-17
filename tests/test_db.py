@@ -1,8 +1,9 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from alfred_code.db import Database, SCHEMA_VERSION
+from alfred_code.db import Database, SCHEMA, SCHEMA_VERSION
 
 
 class DatabaseTests(unittest.TestCase):
@@ -93,6 +94,43 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(self.database.claim_notification("key", "test", {"x": 1}))
         self.database.finish_notification("key")
         self.assertFalse(self.database.claim_notification("key", "test", {"x": 1}))
+
+    def test_schema_two_migrates_durable_repair_state(self):
+        path = Path(self.temp.name) / "schema-two.sqlite3"
+        legacy_schema = SCHEMA
+        for declaration in (
+            "    repair_attempts INTEGER NOT NULL DEFAULT 0,\n",
+            "    repair_sha TEXT,\n",
+            "    repair_agent_id TEXT,\n",
+            "    repair_requested_at TEXT,\n",
+            "    repair_token TEXT,\n",
+        ):
+            legacy_schema = legacy_schema.replace(declaration, "")
+        connection = sqlite3.connect(path)
+        connection.executescript(legacy_schema)
+        connection.execute("INSERT INTO schema_meta(version) VALUES (2)")
+        connection.commit()
+        connection.close()
+
+        migrated = Database(path)
+        self.addCleanup(migrated.close)
+        columns = {
+            row["name"] for row in migrated.connection.execute("PRAGMA table_info(jobs)")
+        }
+
+        self.assertEqual(
+            migrated.connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+        self.assertTrue(
+            {
+                "repair_attempts",
+                "repair_sha",
+                "repair_agent_id",
+                "repair_requested_at",
+                "repair_token",
+            }.issubset(columns)
+        )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from alfred_code.agent_security import (
     AgentSecurityError,
+    LAUNCH_REVISION,
     LAUNCH_STATUS,
     LaneManifest,
     REVIEW_RESULT,
@@ -53,6 +54,16 @@ class AgentSecurityTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def prepare_fake_codex_runtime(self):
+        (self.workspace / ".codex").mkdir(exist_ok=True)
+        guard = self.workspace / ".claude/bin/alfred-code-agent-guard"
+        guard.parent.mkdir(parents=True, exist_ok=True)
+        guard.write_text("#!/bin/sh\n")
+        guard.chmod(0o700)
+        npm_shell = self.workspace / ".claude/bin/alfred-code-npm-shell"
+        npm_shell.write_text("#!/bin/sh\n")
+        npm_shell.chmod(0o700)
 
     def test_yolo_and_policy_override_arguments_are_rejected(self):
         unsafe = [
@@ -280,6 +291,79 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(marker["status"], "exited")
         self.assertEqual(marker["exit_code"], 70)
         self.assertEqual(marker["controller_job"], "learn-299")
+
+    def test_repair_launch_overwrites_stale_result_and_requires_exact_binding(self):
+        lane = json.loads((self.workspace / ".lane").read_text())
+        lane.update(
+            {
+                "mode": "repair",
+                "head_sha": "a" * 40,
+                "handoff_token": "b" * 48,
+                "attempt": 1,
+            }
+        )
+        (self.workspace / ".lane").write_text(json.dumps(lane))
+        (self.workspace / WORKER_RESULT).write_text(
+            json.dumps({"status": "ready", "summary": "stale"})
+        )
+        self.prepare_fake_codex_runtime()
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", return_value=0),
+        ):
+            launch("codex", [])
+
+        result = json.loads((self.workspace / WORKER_RESULT).read_text())
+        marker = json.loads((self.workspace / LAUNCH_STATUS).read_text())
+        self.assertEqual(result["status"], "retrying")
+        self.assertEqual(result["handoff_token"], "b" * 48)
+        self.assertEqual(marker["status"], "exited")
+
+    def test_repair_launch_accepts_only_token_and_sha_bound_handoff(self):
+        lane = json.loads((self.workspace / ".lane").read_text())
+        lane.update(
+            {
+                "mode": "repair",
+                "head_sha": "c" * 40,
+                "handoff_token": "d" * 48,
+                "attempt": 2,
+            }
+        )
+        (self.workspace / ".lane").write_text(json.dumps(lane))
+        self.prepare_fake_codex_runtime()
+
+        def write_bound_result(command, cwd, env):
+            (self.workspace / WORKER_RESULT).write_text(
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "summary": "fixed",
+                        "head_sha": "c" * 40,
+                        "handoff_token": "d" * 48,
+                        "attempt": 2,
+                    }
+                )
+            )
+            return 0
+
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", side_effect=write_bound_result),
+        ):
+            launch("codex", [])
+
+        marker = json.loads((self.workspace / LAUNCH_STATUS).read_text())
+        self.assertEqual(marker["status"], "completed")
+        self.assertEqual(marker["attempt"], 2)
+        self.assertEqual(marker["revision"], LAUNCH_REVISION)
 
     def test_reviewer_verdict_is_a_valid_launch_handoff(self):
         lane = json.loads((self.workspace / ".lane").read_text())
