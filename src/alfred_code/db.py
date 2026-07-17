@@ -10,7 +10,7 @@ from .states import ISSUE_STATES, JOB_STATES
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 SCHEMA = """
@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_workspace_id TEXT,
     review_agent_id TEXT,
     review_requested_at TEXT,
+    repair_attempts INTEGER NOT NULL DEFAULT 0,
+    repair_sha TEXT,
+    repair_agent_id TEXT,
+    repair_requested_at TEXT,
+    repair_token TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -150,13 +155,25 @@ class Database:
             row = self.connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 self.connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif row["version"] == 1:
+            elif row["version"] in {1, 2}:
                 columns = {
                     item["name"] for item in self.connection.execute("PRAGMA table_info(jobs)")
                 }
                 for name in ("review_workspace_id", "review_agent_id", "review_requested_at"):
                     if name not in columns:
                         self.connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
+                repair_columns = {
+                    "repair_attempts": "INTEGER NOT NULL DEFAULT 0",
+                    "repair_sha": "TEXT",
+                    "repair_agent_id": "TEXT",
+                    "repair_requested_at": "TEXT",
+                    "repair_token": "TEXT",
+                }
+                for name, declaration in repair_columns.items():
+                    if name not in columns:
+                        self.connection.execute(
+                            f"ALTER TABLE jobs ADD COLUMN {name} {declaration}"
+                        )
                 self.connection.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
             elif row["version"] != SCHEMA_VERSION:
                 raise RuntimeError(
@@ -493,6 +510,11 @@ class Database:
             "review_workspace_id",
             "review_agent_id",
             "review_requested_at",
+            "repair_attempts",
+            "repair_sha",
+            "repair_agent_id",
+            "repair_requested_at",
+            "repair_token",
             "last_error",
         }
         unknown = set(fields) - allowed

@@ -18,20 +18,23 @@ from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 20
+LAUNCH_REVISION = 21
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
 WORKER_RESULT = ".alfred-code-result.json"
 REVIEW_RESULT = ".alfred-code-review.json"
+WORKER_RESULT_TEMP = ".alfred-code-result.json.tmp"
 LAUNCH_STATUS = ".alfred-code-launch.json"
 LAUNCH_STATUS_TEMP = ".alfred-code-launch.json.tmp"
 CONTROL_FILES = frozenset({WORKER_RESULT, REVIEW_RESULT})
 RUNTIME_CONTROL_FILES = frozenset(
     {
         ".lane",
+        ".lane.tmp",
         "node_modules",
         WORKER_RESULT,
+        WORKER_RESULT_TEMP,
         REVIEW_RESULT,
         LAUNCH_STATUS,
         LAUNCH_STATUS_TEMP,
@@ -52,6 +55,10 @@ class LaneManifest:
     allowed: tuple[str, ...]
     verify: str
     controller_job: str
+    mode: str = "build"
+    head_sha: str = ""
+    handoff_token: str = ""
+    attempt: int = 0
 
     @classmethod
     def load(cls, workspace: Path) -> "LaneManifest":
@@ -74,6 +81,21 @@ class LaneManifest:
             path = Path(pattern.removeprefix("./"))
             if path.is_absolute() or ".." in path.parts:
                 raise AgentSecurityError(f"unsafe lane path {pattern!r}")
+        mode = str(value.get("mode") or "build")
+        if mode not in {"build", "repair"}:
+            raise AgentSecurityError(f"invalid agent mode in .lane: {mode!r}")
+        head_sha = str(value.get("head_sha") or "")
+        handoff_token = str(value.get("handoff_token") or "")
+        attempt = int(value.get("attempt") or 0)
+        if mode == "repair":
+            if role != "worker":
+                raise AgentSecurityError("repair mode is valid only for worker lanes")
+            if not re.fullmatch(r"[0-9a-f]{40,64}", head_sha):
+                raise AgentSecurityError("repair mode requires an exact lowercase Git head SHA")
+            if not re.fullmatch(r"[0-9a-f]{32,64}", handoff_token):
+                raise AgentSecurityError("repair mode requires a controller handoff token")
+            if attempt < 1:
+                raise AgentSecurityError("repair mode requires a positive attempt number")
         return cls(
             workspace=workspace,
             role=role,
@@ -82,6 +104,10 @@ class LaneManifest:
             allowed=tuple(allowed),
             verify=str(value.get("verify") or ""),
             controller_job=str(value.get("controller_job") or ""),
+            mode=mode,
+            head_sha=head_sha,
+            handoff_token=handoff_token,
+            attempt=attempt,
         )
 
 
@@ -99,6 +125,13 @@ def write_launch_status(workspace: Path, status: str, **details: Any) -> dict[st
     temporary.chmod(0o600)
     os.replace(temporary, target)
     return value
+
+
+def _write_json_atomic(target: Path, value: dict[str, Any]) -> None:
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, target)
 
 
 def _record_startup_failure(reason: str, exit_code: int = 78) -> None:
@@ -844,6 +877,17 @@ def launch(provider: str, arguments: list[str]) -> int:
     workspace = workspace_from_environment()
     manifest = LaneManifest.load(workspace)
     started_at = _utcnow()
+    if manifest.mode == "repair":
+        _write_json_atomic(
+            workspace / WORKER_RESULT,
+            {
+                "status": "retrying",
+                "revision": LAUNCH_REVISION,
+                "head_sha": manifest.head_sha,
+                "handoff_token": manifest.handoff_token,
+                "attempt": manifest.attempt,
+            },
+        )
     write_launch_status(
         workspace,
         "running",
@@ -852,6 +896,9 @@ def launch(provider: str, arguments: list[str]) -> int:
         controller_job=manifest.controller_job,
         pid=os.getpid(),
         started_at=started_at,
+        mode=manifest.mode,
+        head_sha=manifest.head_sha or None,
+        attempt=manifest.attempt or None,
     )
     env = dict(os.environ)
     env["ALFRED_CODE_SECURITY_POLICY"] = SECURITY_POLICY
@@ -906,6 +953,9 @@ def launch(provider: str, arguments: list[str]) -> int:
             reason=f"{type(exc).__name__}: {exc}"[:500],
             started_at=started_at,
             finished_at=_utcnow(),
+            mode=manifest.mode,
+            head_sha=manifest.head_sha or None,
+            attempt=manifest.attempt or None,
         )
         raise
     result_path = workspace / (WORKER_RESULT if manifest.role == "worker" else REVIEW_RESULT)
@@ -922,10 +972,20 @@ def launch(provider: str, arguments: list[str]) -> int:
             and bool(str(result.get("head_sha") or ""))
         )
     else:
-        valid_handoff = isinstance(result, dict) and str(result.get("status") or "") in {
-            "ready",
-            "blocked",
-        }
+        valid_handoff = (
+            isinstance(result, dict)
+            and str(result.get("status") or "") in {"ready", "blocked"}
+            and (
+                manifest.mode != "repair"
+                or (
+                    str(result.get("head_sha") or "") == manifest.head_sha
+                    and str(result.get("handoff_token") or "")
+                    == manifest.handoff_token
+                    and type(result.get("attempt")) is int
+                    and result["attempt"] == manifest.attempt
+                )
+            )
+        )
     write_launch_status(
         workspace,
         "completed" if valid_handoff else "exited",
@@ -940,6 +1000,9 @@ def launch(provider: str, arguments: list[str]) -> int:
         ),
         started_at=started_at,
         finished_at=_utcnow(),
+        mode=manifest.mode,
+        head_sha=manifest.head_sha or None,
+        attempt=manifest.attempt or None,
     )
     return exit_code
 

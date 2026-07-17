@@ -42,6 +42,7 @@ class SupersetConfig:
     cleanup_merged_workspaces: bool = False
     worker_launch_timeout_seconds: int = 120
     worker_progress_timeout_seconds: int = 1200
+    review_repair_max_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,9 @@ def load_config(path: Path | None = None) -> ControllerConfig:
             worker_progress_timeout_seconds=int(
                 superset_raw.get("worker_progress_timeout_seconds", 1200)
             ),
+            review_repair_max_attempts=int(
+                superset_raw.get("review_repair_max_attempts", 2)
+            ),
         ),
         slack=SlackConfig(
             enabled=bool(slack_raw.get("enabled", False)),
@@ -175,6 +179,10 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         raise ConfigurationError("superset.worker_launch_timeout_seconds must be at least 30")
     if config.superset.worker_progress_timeout_seconds < 60:
         raise ConfigurationError("superset.worker_progress_timeout_seconds must be at least 60")
+    if not 0 <= config.superset.review_repair_max_attempts <= 10:
+        raise ConfigurationError(
+            "superset.review_repair_max_attempts must be between 0 and 10"
+        )
     if config.superset.worker_agent not in SCOPED_AGENT_IDS:
         raise ConfigurationError(
             "superset.worker_agent must be an Alfred scoped Superset agent UUID; "

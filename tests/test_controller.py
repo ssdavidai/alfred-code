@@ -43,6 +43,7 @@ class FakeGitHub:
         self.feedback = None
         self.prs = {}
         self.verdicts = {}
+        self.feedbacks = {}
         self.plans = []
         self.created_prs = []
         self.review_comments = []
@@ -86,6 +87,12 @@ class FakeGitHub:
 
     def review_verdict(self, number, sha, not_before=None):
         return self.verdicts.get((number, sha))
+
+    def review_feedback(self, number, sha, not_before=None):
+        if (number, sha) in self.feedbacks:
+            return copy.deepcopy(self.feedbacks[(number, sha)])
+        verdict = self.verdicts.get((number, sha))
+        return {"verdict": verdict, "body": f"review verdict: {verdict}"} if verdict else None
 
     def pr_files(self, number):
         return ["file.txt"]
@@ -327,6 +334,54 @@ class ControllerTests(unittest.TestCase):
             started_at=values.pop("started_at", "2026-01-01T00:00:00Z"),
             **values,
         )
+
+    def launch_failed_review_repair(self):
+        remote = self.root / "repair-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        subprocess.run(["git", "checkout", job["branch"]], cwd=self.repo, check=True, capture_output=True)
+        self.write_worker_lane()
+        (self.repo / "file.txt").write_text("initial implementation with a bug\n")
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps({"status": "ready", "summary": "initial implementation"})
+        )
+        self.write_launch_status("completed", exit_code=0)
+        self.controller.run_once()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        branch = job["branch"]
+        pr = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            head,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+        self.github.prs[branch] = pr
+        self.controller.run_once()
+        self.assertEqual(self.db.get_job("api-12")["state"], "reviewing")
+        self.github.verdicts[(5, head)] = "fail"
+        self.github.feedbacks[(5, head)] = {
+            "verdict": "fail",
+            "body": "FAIL: the current response breaks the existing consumer schema.",
+        }
+        self.controller.run_once()
+        return remote, pr, self.db.get_job("api-12")
 
     def test_no_approval_means_no_job_or_workspace(self):
         result = self.controller.run_once()
@@ -845,6 +900,126 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.get_job("api-12")["state"], "merged")
         self.assertIsNone(self.db.lease_owner("I"))
         self.assertEqual(self.superset.deleted, [])
+
+    def test_failed_review_launches_bound_repair_and_re_reviews_new_sha(self):
+        remote, pr, repairing = self.launch_failed_review_repair()
+
+        self.assertEqual(repairing["state"], "repairing")
+        self.assertEqual(repairing["repair_attempts"], 1)
+        self.assertEqual(repairing["repair_sha"], pr.head_sha)
+        lane = json.loads((self.repo / ".lane").read_text())
+        self.assertEqual(lane["mode"], "repair")
+        self.assertEqual(lane["head_sha"], pr.head_sha)
+        self.assertEqual(lane["handoff_token"], repairing["repair_token"])
+        self.assertEqual(self.superset.agent_starts, 1)
+
+        (self.repo / "file.txt").write_text("compatible repaired implementation\n")
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "summary": "preserved the consumer schema",
+                    "head_sha": pr.head_sha,
+                    "handoff_token": repairing["repair_token"],
+                    "attempt": 1,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=1,
+        )
+
+        self.controller.run_once()
+
+        repaired = self.db.get_job("api-12")
+        self.assertEqual(repaired["state"], "pr_open")
+        self.assertNotEqual(repaired["head_sha"], pr.head_sha)
+        remote_sha = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/lane-1/12-api"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(remote_sha, repaired["head_sha"])
+        repair_events = [event for event in self.db.events() if event["kind"] == "job.repair_pushed"]
+        self.assertEqual(repair_events[0]["detail"]["from_sha"], pr.head_sha)
+        self.assertEqual(repair_events[0]["detail"]["to_sha"], repaired["head_sha"])
+
+        new_pr = replace(pr, head_sha=repaired["head_sha"])
+        self.github.prs[pr.branch] = new_pr
+        self.controller.run_once()
+        self.assertEqual(self.db.get_job("api-12")["state"], "reviewing")
+        self.assertEqual(self.superset.review_creates, 2)
+        self.github.verdicts[(5, new_pr.head_sha)] = "pass"
+        self.controller.run_once()
+        self.assertEqual(self.db.get_job("api-12")["state"], "ready_merge")
+
+    def test_stale_repair_result_is_quarantined(self):
+        _, pr, repairing = self.launch_failed_review_repair()
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "summary": "stale marker without the controller token",
+                    "head_sha": pr.head_sha,
+                    "attempt": 1,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=1,
+        )
+
+        self.controller.run_once()
+
+        quarantined = self.db.get_job("api-12")
+        self.assertEqual(quarantined["state"], "quarantined")
+        self.assertIn("not bound", quarantined["last_error"])
+        self.assertIsNone(self.db.lease_owner("I"))
+        self.assertTrue(repairing["repair_token"])
+
+    def test_blocked_repair_stops_at_configured_attempt_cap(self):
+        self.controller.config = replace(
+            self.config,
+            superset=replace(self.config.superset, review_repair_max_attempts=1),
+        )
+        _, pr, repairing = self.launch_failed_review_repair()
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the contract requires a different lane",
+                    "head_sha": pr.head_sha,
+                    "handoff_token": repairing["repair_token"],
+                    "attempt": 1,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=1,
+        )
+        self.controller.run_once()
+        self.assertEqual(self.db.get_job("api-12")["state"], "blocked")
+
+        self.controller.run_once()
+
+        capped = self.db.get_job("api-12")
+        self.assertEqual(capped["state"], "blocked")
+        self.assertEqual(capped["repair_attempts"], 1)
+        self.assertIn("operator attention", capped["last_error"])
+        self.assertEqual(self.superset.agent_starts, 1)
 
     def test_issue_scope_drift_blocks_active_work(self):
         self.controller.run_once()

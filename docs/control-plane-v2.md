@@ -40,6 +40,7 @@ queued
   -> launching          -> running
   -> running            -> pr_open
   -> pr_open            -> reviewing
+  -> reviewing          -> repairing -> pr_open
   -> reviewing          -> ready_merge
   -> ready_merge        -> merged
 
@@ -61,11 +62,13 @@ On a launcher-policy revision, the controller may retry a completed old-policy b
 
 Before review, the controller fetches the complete PR file list from GitHub and compares every filename to the approved plan paths. An extra file blocks regardless of worker claims or hooks. Green CI is not enough unless the PR body also contains its smoke-evidence section.
 
-Review passes only when GitHub CI is green and an allow-listed independent reviewer posts `<!-- alfred-code-review:<exact-head-sha>:pass -->` after the controller requested review. A marker posted before the independent review intent, by another actor, or for another SHA is ignored. A new commit changes HEAD, invalidates the old marker automatically, and produces a distinct review workspace. A failing marker or red CI blocks. A passing review makes the job `ready_merge`; the operator still merges in GitHub.
+Review passes only when GitHub CI is green and an allow-listed independent reviewer posts `<!-- alfred-code-review:<exact-head-sha>:pass -->` after the controller requested review. A marker posted before the independent review intent, by another actor, or for another SHA is ignored. A new commit changes HEAD, invalidates the old marker automatically, and produces a distinct review workspace. A passing review makes the job `ready_merge`; the operator still merges in GitHub.
+
+A failing review marker starts a bounded repair cycle in the original worker workspace. The controller preserves the approved plan and lane, proves that the worktree is clean at the exact failed PR SHA, writes a one-attempt `.lane` handoff, and launches only the scoped worker preset. The repair agent remains offline, cannot write Git metadata, and can edit only the already-approved paths. Its result must echo the exact failed SHA, attempt number, and controller nonce; stale result files cannot complete the handoff. The trusted controller then rejects deletions and scope drift, reruns verification, commits and pushes the repair, and waits for CI plus a new independent review workspace at the new SHA. `review_repair_max_attempts` defaults to two; exhausting it leaves the PR blocked for operator attention instead of looping forever. Red CI still blocks separately.
 
 ## Issue lifecycle
 
-The issue state is derived from current plan and job state. `planning` means an automatically enrolled issue is being specified. `awaiting_approval` means a current immutable plan exists with no valid decision. A normal allow-listed operator comment after that plan invalidates it and supplies context to a fresh plan. An exact rejection moves the issue to `blocked` without materializing jobs. `building` means at least one approved job is active. `ready_merge` means every job is either ready or merged. `completed` means every planned job is merged. `blocked` also covers jobs that are blocked, quarantined, closed without merge, or have made no repository progress before the configured worker timeout. `closed` mirrors a closed GitHub issue after its PRs have been refreshed and classified.
+The issue state is derived from current plan and job state. `planning` means an automatically enrolled issue is being specified. `awaiting_approval` means a current immutable plan exists with no valid decision. A normal allow-listed operator comment after that plan invalidates it and supplies context to a fresh plan. An exact rejection moves the issue to `blocked` without materializing jobs. `building` means at least one approved job is active, including an exact-SHA repair. `ready_merge` means every job is either ready or merged. `completed` means every planned job is merged. `blocked` also covers jobs that are blocked, quarantined, closed without merge, or have made no repository progress before the configured worker timeout. `closed` mirrors a closed GitHub issue after its PRs have been refreshed and classified.
 
 GitHub Projects is a projection, not another state machine. The controller updates `Control stage`, `Risk`, `Plan hash`, `Lane set`, and `Runtime`. Project metadata and items are loaded once per daemon process and then updated from controller-owned transitions, avoiding an expensive full GraphQL refresh on every poll. If project sync fails, execution can continue because the durable event records the visibility failure. Slack behaves the same way: notification failure never mutates delivery truth.
 

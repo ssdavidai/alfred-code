@@ -18,6 +18,7 @@ JOB_STATES = {
     "running",
     "pr_open",
     "reviewing",
+    "repairing",
     "ready_merge",
     "merged",
     "closed",
@@ -26,7 +27,15 @@ JOB_STATES = {
 }
 
 TERMINAL_JOB_STATES = {"merged", "closed", "quarantined"}
-ACTIVE_LEASE_STATES = {"launching", "running", "pr_open", "reviewing", "ready_merge", "blocked"}
+ACTIVE_LEASE_STATES = {
+    "launching",
+    "running",
+    "pr_open",
+    "reviewing",
+    "repairing",
+    "ready_merge",
+    "blocked",
+}
 
 PROJECT_STATUS = {
     "observed": "Inbox",
