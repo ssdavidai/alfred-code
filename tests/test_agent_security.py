@@ -281,6 +281,36 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(marker["exit_code"], 70)
         self.assertEqual(marker["controller_job"], "learn-299")
 
+    def test_reviewer_verdict_is_a_valid_launch_handoff(self):
+        lane = json.loads((self.workspace / ".lane").read_text())
+        lane.update({"allowed": [], "role": "reviewer"})
+        (self.workspace / ".lane").write_text(json.dumps(lane))
+        (self.workspace / REVIEW_RESULT).write_text(
+            json.dumps({"head_sha": "a" * 40, "verdict": "fail", "findings": "bug"})
+        )
+        (self.workspace / ".codex").mkdir()
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", return_value=0),
+        ):
+            guard = self.workspace / ".claude/bin/alfred-code-agent-guard"
+            guard.parent.mkdir(parents=True)
+            guard.write_text("#!/bin/sh\n")
+            guard.chmod(0o700)
+            npm_shell = self.workspace / ".claude/bin/alfred-code-npm-shell"
+            npm_shell.write_text("#!/bin/sh\n")
+            npm_shell.chmod(0o700)
+            result = launch("codex", [])
+
+        marker = json.loads((self.workspace / LAUNCH_STATUS).read_text())
+        self.assertEqual(result, 0)
+        self.assertEqual(marker["status"], "completed")
+        self.assertIn("valid result marker", marker["reason"])
+
     def test_hook_blocks_out_of_lane_edits_and_destructive_shell(self):
         with patch.dict(os.environ, {"SUPERSET_WORKSPACE_PATH": str(self.workspace)}):
             outside = guard_reason(

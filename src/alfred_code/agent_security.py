@@ -18,7 +18,7 @@ from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 19
+LAUNCH_REVISION = 20
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
@@ -915,10 +915,17 @@ def launch(provider: str, arguments: list[str]) -> int:
             result = json.loads(result_path.read_text())
         except (OSError, json.JSONDecodeError):
             result = None
-    valid_handoff = isinstance(result, dict) and str(result.get("status") or "") in {
-        "ready",
-        "blocked",
-    }
+    if manifest.role == "reviewer":
+        valid_handoff = (
+            isinstance(result, dict)
+            and str(result.get("verdict") or "").lower() in {"pass", "fail"}
+            and bool(str(result.get("head_sha") or ""))
+        )
+    else:
+        valid_handoff = isinstance(result, dict) and str(result.get("status") or "") in {
+            "ready",
+            "blocked",
+        }
     write_launch_status(
         workspace,
         "completed" if valid_handoff else "exited",
