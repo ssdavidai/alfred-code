@@ -12,10 +12,12 @@ chmod +x "$ROOT/bin/alfred-code"
 chmod +x "$ROOT/bin/alfred-code-daemon"
 chmod +x "$ROOT/bin/alfred-code-agent"
 chmod +x "$ROOT/bin/alfred-code-agent-guard"
+chmod +x "$ROOT/bin/alfred-code-npm-shell"
 ln -sf "$ROOT/bin/alfred-code" "$TARGET_BIN/alfred-code"
 ln -sf "$ROOT/bin/alfred-code-daemon" "$TARGET_BIN/alfred-code-daemon"
 ln -sf "$ROOT/bin/alfred-code-agent" "$TARGET_BIN/alfred-code-agent"
 ln -sf "$ROOT/bin/alfred-code-agent-guard" "$TARGET_BIN/alfred-code-agent-guard"
+ln -sf "$ROOT/bin/alfred-code-npm-shell" "$TARGET_BIN/alfred-code-npm-shell"
 "$TARGET_BIN/alfred-code" --config "$CONFIG" init
 if find "$HOME/.superset/host" -mindepth 2 -maxdepth 2 -name host.db -print -quit 2>/dev/null | grep -q .; then
   "$TARGET_BIN/alfred-code" --config "$CONFIG" agents-provision

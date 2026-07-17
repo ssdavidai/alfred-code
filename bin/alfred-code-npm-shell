@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# npm prepends every ancestor node_modules/.bin directory before invoking a
+# package script. A tracked self-referential node_modules link makes command
+# lookup fail before the script can start. Drop only .bin entries that are not
+# usable directories; keep the launcher-created root overlay and every normal
+# toolchain entry.
+IFS=: read -r -a path_entries <<< "${PATH:-}"
+clean_path=""
+for entry in "${path_entries[@]}"; do
+  if [[ "$entry" == */node_modules/.bin && ! -d "$entry" ]]; then
+    continue
+  fi
+  if [[ -n "$clean_path" ]]; then
+    clean_path+=":"
+  fi
+  clean_path+="$entry"
+done
+
+# Login shells used by provider harnesses may restore Homebrew default Node
+# ahead of the controller-pinned runtime. Reassert the repository CI major at
+# the final npm lifecycle boundary, after npm has added its package .bin paths.
+node22_bin="/opt/homebrew/opt/node@22/bin"
+if [[ -d "$node22_bin" && ":$clean_path:" != *":$node22_bin:"* ]]; then
+  clean_path="$node22_bin${clean_path:+:$clean_path}"
+fi
+export PATH="$clean_path"
+
+exec /bin/bash "$@"

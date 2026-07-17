@@ -3,4 +3,21 @@ set -euo pipefail
 
 ROOT="${ALFRED_CODE_HOME:-$HOME/.claude/alfred-code}"
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/bin/python3 -c 'from alfred_code.agent_security import guard_main; raise SystemExit(guard_main())'
+
+for PYTHON in \
+  "$ROOT/.venv/bin/python3" \
+  /opt/homebrew/opt/python@3.14/bin/python3.14 \
+  /opt/homebrew/bin/python3 \
+  /usr/local/bin/python3 \
+  /usr/bin/python3
+do
+  if [[ -x "$PYTHON" ]] && "$PYTHON" -c \
+    'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+    >/dev/null 2>&1
+  then
+    exec "$PYTHON" -c 'from alfred_code.agent_security import guard_main; raise SystemExit(guard_main())'
+  fi
+done
+
+printf '%s\n' 'Alfred scoped-agent guard refused: no trusted Python 3.11+ runtime is available' >&2
+exit 70
