@@ -5,22 +5,38 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
 import tomllib
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
+LAUNCH_REVISION = 18
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
 WORKER_RESULT = ".alfred-code-result.json"
 REVIEW_RESULT = ".alfred-code-review.json"
+LAUNCH_STATUS = ".alfred-code-launch.json"
+LAUNCH_STATUS_TEMP = ".alfred-code-launch.json.tmp"
 CONTROL_FILES = frozenset({WORKER_RESULT, REVIEW_RESULT})
+RUNTIME_CONTROL_FILES = frozenset(
+    {
+        ".lane",
+        "node_modules",
+        WORKER_RESULT,
+        REVIEW_RESULT,
+        LAUNCH_STATUS,
+        LAUNCH_STATUS_TEMP,
+    }
+)
 
 
 class AgentSecurityError(RuntimeError):
@@ -69,6 +85,38 @@ class LaneManifest:
         )
 
 
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def write_launch_status(workspace: Path, status: str, **details: Any) -> dict[str, Any]:
+    if status not in {"retrying", "running", "completed", "exited", "failed"}:
+        raise ValueError(f"unknown scoped-agent launch status: {status}")
+    value = {"schema": 1, "revision": LAUNCH_REVISION, "status": status, **details}
+    temporary = workspace / LAUNCH_STATUS_TEMP
+    target = workspace / LAUNCH_STATUS
+    temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, target)
+    return value
+
+
+def _record_startup_failure(reason: str, exit_code: int = 78) -> None:
+    workspace = Path.cwd().resolve()
+    if not (workspace / ".lane").is_file():
+        return
+    try:
+        write_launch_status(
+            workspace,
+            "failed",
+            exit_code=exit_code,
+            reason=reason[:500],
+            finished_at=_utcnow(),
+        )
+    except OSError:
+        pass
+
+
 def workspace_from_environment() -> Path:
     current = Path.cwd().resolve()
     configured = os.environ.get("SUPERSET_WORKSPACE_PATH", "").strip()
@@ -89,6 +137,9 @@ def path_matches(path: str, pattern: str) -> bool:
         return True
     if pattern.endswith("/**"):
         prefix = pattern[:-3].rstrip("/")
+        return path == prefix or path.startswith(prefix + "/")
+    if pattern.endswith("/"):
+        prefix = pattern.rstrip("/")
         return path == prefix or path.startswith(prefix + "/")
     if pattern.startswith("**/"):
         suffix = pattern[3:]
@@ -164,9 +215,211 @@ def _profile_path(pattern: str) -> str:
     return value
 
 
-def codex_profile(manifest: LaneManifest) -> str:
+def _git_metadata_paths(workspace: Path) -> tuple[Path, ...]:
+    marker = workspace / ".git"
+    if marker.is_dir():
+        return (marker.resolve(),)
+    try:
+        first_line = marker.read_text().splitlines()[0]
+    except (OSError, IndexError):
+        return ()
+    if not first_line.startswith("gitdir:"):
+        return ()
+    git_dir = Path(first_line.split(":", 1)[1].strip()).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = marker.parent / git_dir
+    git_dir = git_dir.resolve()
+    paths = [git_dir]
+    try:
+        common_value = (git_dir / "commondir").read_text().strip()
+    except OSError:
+        common_value = ""
+    if common_value:
+        common_dir = Path(common_value).expanduser()
+        if not common_dir.is_absolute():
+            common_dir = git_dir / common_dir
+        paths.append(common_dir.resolve())
+    return tuple(dict.fromkeys(paths))
+
+
+def _trusted_toolchain_paths() -> tuple[Path, ...]:
+    candidates = (
+        Path("/opt/homebrew/opt/node@22/bin"),
+        Path("/opt/homebrew/bin"),
+        Path("/opt/homebrew/lib"),
+        Path("/opt/homebrew/opt"),
+        Path("/opt/homebrew/Cellar"),
+        Path("/opt/homebrew/share"),
+        Path("/opt/homebrew/Frameworks"),
+        Path("/opt/homebrew/etc/openssl@3"),
+        Path("/Applications/ChatGPT.app/Contents/Resources/rg"),
+        Path("/Applications/Codex.app/Contents/Resources/rg"),
+        Path.home() / ".claude/bin/alfred-code-npm-shell",
+        Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback",
+        Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/git",
+    )
+    return tuple(path.resolve() for path in candidates if path.exists())
+
+
+def _toolchain_path_value(paths: tuple[Path, ...]) -> str:
+    executable_dirs = [
+        path if path.is_dir() else path.parent
+        for path in paths
+        if path.name in {"bin", "fallback"} or path.name == "rg"
+    ]
+    executable_dirs.extend(Path(value) for value in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
+    return os.pathsep.join(str(path) for path in dict.fromkeys(executable_dirs))
+
+
+def _verification_roots(manifest: LaneManifest) -> tuple[str, ...]:
+    roots = {"."}
+    for match in re.finditer(r"(?:^|&&)\s*cd\s+([^\s;&|]+)", manifest.verify):
+        value = match.group(1).strip("'\"")
+        path = Path(value)
+        if value and not path.is_absolute() and ".." not in path.parts:
+            roots.add(path.as_posix())
+    return tuple(sorted(roots))
+
+
+def _verification_write_paths(manifest: LaneManifest) -> tuple[str, ...]:
+    roots = _verification_roots(manifest)
+    outputs = (".pytest_cache", ".cache", "coverage", "dist", "build", ".next", "node_modules/.cache")
+    return tuple(
+        (Path(root) / output).as_posix()
+        for root in sorted(roots)
+        for output in outputs
+    )
+
+
+def _verification_dependency_paths(manifest: LaneManifest) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for root in _verification_roots(manifest):
+        base = manifest.workspace if root == "." else manifest.workspace / root
+        for name in ("node_modules", ".venv", "venv"):
+            candidate = base / name
+            if candidate.is_symlink():
+                paths.append(candidate.resolve())
+    return tuple(dict.fromkeys(paths))
+
+
+def _git_origin_url(checkout: Path) -> str:
+    for git_dir in reversed(_git_metadata_paths(checkout)):
+        config = git_dir / "config"
+        try:
+            lines = config.read_text().splitlines()
+        except OSError:
+            continue
+        in_origin = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                in_origin = line[1:-1].strip().lower() == 'remote "origin"'
+                continue
+            if not in_origin or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip().lower() == "url":
+                return value.strip()
+    return ""
+
+
+def _normalized_git_origin(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if normalized.startswith("git@github.com:"):
+        normalized = "https://github.com/" + normalized.split(":", 1)[1]
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized.lower()
+
+
+def _node_modules_supports(package_root: Path, node_modules: Path) -> bool:
+    try:
+        package = json.loads((package_root / "package.json").read_text())
+        target = node_modules.resolve(strict=True)
+    except (OSError, RuntimeError, json.JSONDecodeError):
+        return False
+    if not target.is_dir() or not isinstance(package, dict):
+        return False
+    required: set[str] = set()
+    for section in ("dependencies", "devDependencies"):
+        values = package.get(section, {})
+        if isinstance(values, dict):
+            required.update(str(name) for name in values)
+    return all((target / Path(*name.split("/"))).exists() for name in required)
+
+
+def _dependency_candidates(manifest: LaneManifest, package_root: Path) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    explicit = os.environ.get("ALFRED_CODE_NODE_MODULES", "").strip()
+    if explicit:
+        candidates.extend(Path(value).expanduser() for value in explicit.split(os.pathsep) if value)
+
+    git_paths = _git_metadata_paths(manifest.workspace)
+    common_dir = git_paths[-1] if git_paths else None
+    source_checkout = common_dir.parent if common_dir and common_dir.name == ".git" else None
+    source_origin = _normalized_git_origin(_git_origin_url(source_checkout)) if source_checkout else ""
+    relative_root = package_root.relative_to(manifest.workspace)
+    if source_checkout and source_origin:
+        try:
+            siblings = source_checkout.parent.iterdir()
+        except OSError:
+            siblings = ()
+        for sibling in siblings:
+            if sibling == source_checkout or not (sibling / ".git").exists():
+                continue
+            if _normalized_git_origin(_git_origin_url(sibling)) != source_origin:
+                continue
+            candidates.append(sibling / relative_root / "node_modules")
+
+    usable: list[tuple[float, Path]] = []
+    for candidate in dict.fromkeys(candidates):
+        if not _node_modules_supports(package_root, candidate):
+            continue
+        try:
+            target = candidate.resolve(strict=True)
+            usable.append((target.stat().st_mtime, target))
+        except (OSError, RuntimeError):
+            continue
+    usable.sort(key=lambda item: item[0], reverse=True)
+    return tuple(dict.fromkeys(target for _, target in usable))
+
+
+def prepare_dependency_overlay(manifest: LaneManifest) -> Path | None:
+    """Create a root Node resolution fallback without replacing repository files."""
+    overlay = manifest.workspace / "node_modules"
+    if os.path.lexists(overlay):
+        return None
+    for root in _verification_roots(manifest):
+        if root == ".":
+            continue
+        package_root = manifest.workspace / root
+        local_modules = package_root / "node_modules"
+        if not local_modules.is_symlink() or local_modules.exists():
+            continue
+        candidates = _dependency_candidates(manifest, package_root)
+        if not candidates:
+            continue
+        overlay.symlink_to(candidates[0], target_is_directory=True)
+        return overlay
+    return None
+
+
+def codex_profile(
+    manifest: LaneManifest,
+    *,
+    profile_path: Path | None = None,
+    hook_trust_hash: str | None = None,
+    toolchain_paths: tuple[Path, ...] | None = None,
+    git_metadata_paths: tuple[Path, ...] | None = None,
+) -> str:
     writes = [_profile_path(pattern) for pattern in manifest.allowed] if manifest.role == "worker" else []
     writes.append(WORKER_RESULT if manifest.role == "worker" else REVIEW_RESULT)
+    verification_writes = _verification_write_paths(manifest)
+    base_toolchains = _trusted_toolchain_paths() if toolchain_paths is None else toolchain_paths
+    npm_shell = Path.home() / ".claude/bin/alfred-code-npm-shell"
+    toolchains = tuple(dict.fromkeys((*base_toolchains, npm_shell)))
+    git_paths = _git_metadata_paths(manifest.workspace) if git_metadata_paths is None else git_metadata_paths
+    dependency_paths = _verification_dependency_paths(manifest)
     lines = [
         'default_permissions = "alfred_scoped"',
         'approval_policy = "never"',
@@ -176,13 +429,17 @@ def codex_profile(manifest: LaneManifest) -> str:
         "",
         "[permissions.alfred_scoped.filesystem]",
         '":minimal" = "read"',
-        "",
-        '[permissions.alfred_scoped.filesystem.":workspace_roots"]',
-        '"." = "read"',
+        '":tmpdir" = "write"',
+        '":slash_tmp" = "write"',
     ]
+    for path in dict.fromkeys((*toolchains, *git_paths, *dependency_paths)):
+        lines.append(f"{_toml_key(str(path))} = \"read\"")
+    lines.extend(["", '[permissions.alfred_scoped.filesystem.":workspace_roots"]', '"." = "read"'])
     for path in dict.fromkeys(writes):
         if path:
             lines.append(f"{_toml_key(path)} = \"write\"")
+    for path in verification_writes:
+        lines.append(f"{_toml_key(path)} = \"write\"")
     lines.extend(
         [
             '".git" = "read"',
@@ -190,9 +447,19 @@ def codex_profile(manifest: LaneManifest) -> str:
             '".codex" = "read"',
             '".agents" = "read"',
             '"**/.env" = "deny"',
-            '"**/.env.*" = "deny"',
-            '"**/*credential*" = "deny"',
-            '"**/*secret*" = "deny"',
+            '"**/.env.local" = "deny"',
+            '"**/.env.*.local" = "deny"',
+            '"**/.env.development" = "deny"',
+            '"**/.env.production" = "deny"',
+            '"**/.env.staging" = "deny"',
+            '"**/.env.test" = "deny"',
+            '"**/credentials.json" = "deny"',
+            '"**/secrets.json" = "deny"',
+            '"**/*.pem" = "deny"',
+            '"**/*.key" = "deny"',
+            '"**/id_rsa*" = "deny"',
+            '"**/.npmrc" = "deny"',
+            '"**/.pypirc" = "deny"',
             "",
             "[permissions.alfred_scoped.network]",
             "enabled = false",
@@ -201,6 +468,17 @@ def codex_profile(manifest: LaneManifest) -> str:
             'inherit = "core"',
             "ignore_default_excludes = false",
             'exclude = ["AWS_*", "AZURE_*", "GH_*", "GITHUB_*", "SUPERSET_*", "*_KEY", "*_TOKEN", "*_SECRET"]',
+            "",
+            "[shell_environment_policy.set]",
+            f"PATH = {_toml_key(_toolchain_path_value(toolchains))}",
+            'PYTHONDONTWRITEBYTECODE = "1"',
+            'GIT_CONFIG_GLOBAL = "/dev/null"',
+            'GIT_CONFIG_NOSYSTEM = "1"',
+            'GIT_CONFIG_COUNT = "1"',
+            'GIT_CONFIG_KEY_0 = "core.excludesFile"',
+            'GIT_CONFIG_VALUE_0 = "/dev/null"',
+            'npm_config_scripts_prepend_node_path = "false"',
+            f"npm_config_script_shell = {_toml_key(str(Path.home() / '.claude/bin/alfred-code-npm-shell'))}",
             "",
             "[[hooks.PreToolUse]]",
             'matcher = ".*"',
@@ -213,7 +491,129 @@ def codex_profile(manifest: LaneManifest) -> str:
             "",
         ]
     )
+    if bool(profile_path) != bool(hook_trust_hash):
+        raise AgentSecurityError("Codex hook profile path and trust hash must be supplied together")
+    if profile_path and hook_trust_hash:
+        key = f"{profile_path.resolve()}:pre_tool_use:0:0"
+        lines.extend(
+            [
+                f"[hooks.state.{_toml_key(key)}]",
+                f"trusted_hash = {_toml_key(hook_trust_hash)}",
+                "",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _codex_hook_override(guard: Path) -> str:
+    return (
+        "hooks.PreToolUse=[{matcher=\".*\",hooks=[{type=\"command\",command="
+        f"{_toml_key(str(guard))},timeout=5,statusMessage=\"Enforcing Alfred lane scope\""
+        "}]}]"
+    )
+
+
+def _read_app_server_response(process: subprocess.Popen[str], request_id: int, timeout: float) -> dict[str, Any]:
+    if process.stdout is None:
+        raise AgentSecurityError("Codex hook trust probe has no stdout")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([process.stdout], [], [], remaining)
+        if not readable:
+            break
+        line = process.stdout.readline()
+        if not line:
+            break
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("id") == request_id:
+            return payload
+    raise AgentSecurityError(f"Codex hook trust probe timed out waiting for response {request_id}")
+
+
+def codex_hook_trust_hash(binary: str, guard: Path, workspace: Path) -> str:
+    command = [
+        binary,
+        "--strict-config",
+        "--enable",
+        "hooks",
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        "plugins={}",
+        "-c",
+        "features={hooks=true}",
+        "-c",
+        _codex_hook_override(guard),
+        "app-server",
+        "--listen",
+        "stdio://",
+    ]
+    env = dict(os.environ)
+    env.pop("ALFRED_CODE_SECURITY_POLICY", None)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=workspace,
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise AgentSecurityError(f"cannot start Codex hook trust probe: {exc}") from exc
+    try:
+        if process.stdin is None:
+            raise AgentSecurityError("Codex hook trust probe has no stdin")
+        process.stdin.write(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {"name": "alfred-code-controller", "version": "1"},
+                        "capabilities": {},
+                    },
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        initialized = _read_app_server_response(process, 1, 15)
+        if "error" in initialized:
+            raise AgentSecurityError(f"Codex hook trust probe initialization failed: {initialized['error']}")
+        process.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
+        process.stdin.write(
+            json.dumps(
+                {"id": 2, "method": "hooks/list", "params": {"cwds": [str(workspace)]}}
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        response = _read_app_server_response(process, 2, 15)
+        for entry in response.get("result", {}).get("data", []):
+            for hook in entry.get("hooks", []):
+                if (
+                    hook.get("source") == "sessionFlags"
+                    and hook.get("eventName") == "preToolUse"
+                    and hook.get("command") == str(guard)
+                ):
+                    current_hash = str(hook.get("currentHash") or "")
+                    if current_hash.startswith("sha256:"):
+                        return current_hash
+        raise AgentSecurityError("Codex did not report the scoped PreToolUse hook during trust probe")
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=2)
 
 
 def claude_settings(manifest: LaneManifest, guard: Path) -> dict[str, Any]:
@@ -236,7 +636,16 @@ def claude_settings(manifest: LaneManifest, guard: Path) -> dict[str, Any]:
             "excludedCommands": [],
             "filesystem": {
                 "denyRead": ["~/"],
-                "allowRead": [str(manifest.workspace)],
+                "allowRead": [
+                    str(path)
+                    for path in dict.fromkeys(
+                        (
+                            manifest.workspace,
+                            *_verification_dependency_paths(manifest),
+                            Path.home() / ".claude/bin/alfred-code-npm-shell",
+                        )
+                    )
+                ],
             },
             "network": {
                 "allowedDomains": [],
@@ -278,22 +687,20 @@ def claude_settings(manifest: LaneManifest, guard: Path) -> dict[str, Any]:
     return settings
 
 
-def _quoted_config_segment(value: str) -> str:
-    return json.dumps(value)
-
-
-def _codex_disable_integrations(config_path: Path) -> list[str]:
-    try:
-        with config_path.open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        return []
-    arguments: list[str] = []
-    for name in (config.get("mcp_servers") or {}):
-        arguments.extend(["-c", f"mcp_servers.{_quoted_config_segment(str(name))}.enabled=false"])
-    for name in (config.get("plugins") or {}):
-        arguments.extend(["-c", f"plugins.{_quoted_config_segment(str(name))}.enabled=false"])
-    return arguments
+def _codex_isolation_arguments() -> list[str]:
+    # Replace the complete integration tables. Per-entry dotted overrides can
+    # be interpreted as quoted literal table names by some Codex builds and
+    # fail configuration loading before the scoped profile is active.
+    return [
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        "plugins={}",
+        "-c",
+        "features={hooks=true}",
+        "-c",
+        "memories={generate_memories=false,use_memories=false}",
+    ]
 
 
 def _codex_legacy_sandbox_conflict(config_path: Path) -> str | None:
@@ -315,16 +722,58 @@ def _codex_legacy_sandbox_conflict(config_path: Path) -> str | None:
 def _provider_binary(provider: str) -> str:
     override = os.environ.get(f"ALFRED_CODE_REAL_{provider.upper()}", "").strip()
     if override:
-        return override
-    superset_wrapper = Path.home() / ".superset/bin" / provider
-    if superset_wrapper.is_file() and os.access(superset_wrapper, os.X_OK):
-        return str(superset_wrapper)
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise AgentSecurityError(f"configured {provider} executable is unavailable: {candidate}")
+    trusted_candidates: dict[str, tuple[Path, ...]] = {
+        "codex": (
+            Path("/Applications/Codex.app/Contents/Resources/codex"),
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            Path.home() / ".local/bin/codex",
+            Path("/opt/homebrew/bin/codex"),
+            Path("/usr/local/bin/codex"),
+        ),
+        "claude": (
+            Path.home() / ".local/bin/claude",
+            Path("/opt/homebrew/bin/claude"),
+            Path("/usr/local/bin/claude"),
+        ),
+    }
+    for candidate in trusted_candidates.get(provider, ()):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     path = os.environ.get("PATH", "")
     for directory in path.split(os.pathsep):
+        if not directory or Path(directory).expanduser().resolve() == Path.home() / ".superset/bin":
+            continue
         candidate = Path(directory) / provider
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     raise AgentSecurityError(f"cannot find {provider} executable")
+
+
+def provider_self_check(provider: str) -> dict[str, Any]:
+    if provider not in {"claude", "codex"}:
+        raise AgentSecurityError(f"unsupported scoped agent provider {provider!r}")
+    binary = _provider_binary(provider)
+    try:
+        checked = subprocess.run(
+            [binary, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentSecurityError(f"cannot execute {provider} provider at {binary}: {exc}") from exc
+    if checked.returncode != 0:
+        detail = (checked.stderr or checked.stdout or f"exit code {checked.returncode}").strip()[:300]
+        raise AgentSecurityError(f"{provider} provider self-check failed at {binary}: {detail}")
+    return {
+        "provider": provider,
+        "provider_binary": binary,
+        "provider_version": (checked.stdout or checked.stderr).strip()[:300],
+    }
 
 
 def build_provider_command(
@@ -340,8 +789,7 @@ def build_provider_command(
     if provider == "codex":
         if not profile_name:
             raise AgentSecurityError("Codex scoped profile name is required")
-        config_path = Path.home() / ".codex/config.toml"
-        conflict = _codex_legacy_sandbox_conflict(config_path)
+        conflict = _codex_legacy_sandbox_conflict(Path.home() / ".codex/config.toml")
         if conflict:
             raise AgentSecurityError(conflict)
         command = [
@@ -352,7 +800,14 @@ def build_provider_command(
             "--enable",
             "hooks",
         ]
-        command.extend(_codex_disable_integrations(config_path))
+        command.extend(_codex_isolation_arguments())
+        command.extend(
+            [
+                "-c",
+                f"projects={{{_toml_key(str(manifest.workspace))}={{trust_level=\"trusted\"}}}}",
+                "exec",
+            ]
+        )
         return [*command, *arguments]
     if provider == "claude":
         if guard is None:
@@ -382,25 +837,98 @@ def build_provider_command(
 def launch(provider: str, arguments: list[str]) -> int:
     workspace = workspace_from_environment()
     manifest = LaneManifest.load(workspace)
+    started_at = _utcnow()
+    write_launch_status(
+        workspace,
+        "running",
+        provider=provider,
+        role=manifest.role,
+        controller_job=manifest.controller_job,
+        pid=os.getpid(),
+        started_at=started_at,
+    )
     env = dict(os.environ)
     env["ALFRED_CODE_SECURITY_POLICY"] = SECURITY_POLICY
     env["ALFRED_CODE_AGENT_ROLE"] = manifest.role
-    if provider == "codex":
-        digest = hashlib.sha256(f"{workspace}:{os.getpid()}".encode()).hexdigest()[:16]
-        profile_name = f"alfred-scoped-{digest}"
-        profile_path = Path.home() / ".codex" / f"{profile_name}.config.toml"
-        profile_path.write_text(codex_profile(manifest))
-        profile_path.chmod(0o600)
+    env["PATH"] = _toolchain_path_value(_trusted_toolchain_paths())
+    env["npm_config_scripts_prepend_node_path"] = "false"
+    env["npm_config_script_shell"] = str(Path.home() / ".claude/bin/alfred-code-npm-shell")
+    try:
+        npm_shell = Path.home() / ".claude/bin/alfred-code-npm-shell"
+        if not npm_shell.is_file() or not os.access(npm_shell, os.X_OK):
+            raise AgentSecurityError(f"required npm verification shell is unavailable: {npm_shell}")
+        prepare_dependency_overlay(manifest)
+        if provider == "codex":
+            digest = hashlib.sha256(f"{workspace}:{os.getpid()}".encode()).hexdigest()[:16]
+            profile_name = f"alfred-scoped-{digest}"
+            profile_path = Path.home() / ".codex" / f"{profile_name}.config.toml"
+            guard = Path.home() / ".claude/bin/alfred-code-agent-guard"
+            if not guard.is_file() or not os.access(guard, os.X_OK):
+                raise AgentSecurityError(f"required Codex security guard is unavailable: {guard}")
+            hook_trust_hash = codex_hook_trust_hash(
+                _provider_binary("codex"), guard, workspace
+            )
+            profile_path.write_text(
+                codex_profile(
+                    manifest,
+                    profile_path=profile_path,
+                    hook_trust_hash=hook_trust_hash,
+                )
+            )
+            profile_path.chmod(0o600)
+            try:
+                command = build_provider_command(
+                    provider, arguments, manifest, profile_name=profile_name
+                )
+                exit_code = subprocess.call(command, cwd=workspace, env=env)
+            finally:
+                profile_path.unlink(missing_ok=True)
+        else:
+            guard = Path.home() / ".claude/bin/alfred-code-agent-guard"
+            if not guard.is_file() or not os.access(guard, os.X_OK):
+                raise AgentSecurityError(f"required Claude security guard is unavailable: {guard}")
+            command = build_provider_command(provider, arguments, manifest, guard=guard)
+            exit_code = subprocess.call(command, cwd=workspace, env=env)
+    except Exception as exc:
+        write_launch_status(
+            workspace,
+            "failed",
+            provider=provider,
+            role=manifest.role,
+            controller_job=manifest.controller_job,
+            exit_code=78,
+            reason=f"{type(exc).__name__}: {exc}"[:500],
+            started_at=started_at,
+            finished_at=_utcnow(),
+        )
+        raise
+    result_path = workspace / (WORKER_RESULT if manifest.role == "worker" else REVIEW_RESULT)
+    result = None
+    if result_path.is_file():
         try:
-            command = build_provider_command(provider, arguments, manifest, profile_name=profile_name)
-            return subprocess.call(command, cwd=workspace, env=env)
-        finally:
-            profile_path.unlink(missing_ok=True)
-    guard = Path.home() / ".claude/bin/alfred-code-agent-guard"
-    if not guard.is_file() or not os.access(guard, os.X_OK):
-        raise AgentSecurityError(f"required Claude security guard is unavailable: {guard}")
-    command = build_provider_command(provider, arguments, manifest, guard=guard)
-    return subprocess.call(command, cwd=workspace, env=env)
+            result = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            result = None
+    valid_handoff = isinstance(result, dict) and str(result.get("status") or "") in {
+        "ready",
+        "blocked",
+    }
+    write_launch_status(
+        workspace,
+        "completed" if valid_handoff else "exited",
+        provider=provider,
+        role=manifest.role,
+        controller_job=manifest.controller_job,
+        exit_code=exit_code,
+        reason=(
+            "agent returned after writing a valid result marker"
+            if valid_handoff
+            else "agent exited before writing its required result marker"
+        ),
+        started_at=started_at,
+        finished_at=_utcnow(),
+    )
+    return exit_code
 
 
 DESTRUCTIVE_SHELL_PATTERNS = (
@@ -424,6 +952,11 @@ DESTRUCTIVE_SHELL_PATTERNS = (
     r"\b(?:pip|pip3|python(?:3)?\s+-m\s+pip)\s+(?:install|uninstall)\b",
     r"\b(?:brew|apt|apt-get|dnf|yum)\s+(?:install|remove|uninstall|upgrade)\b",
     r"(^|[;&|]\s*)(?:mv|sed\s+-i|perl\s+-i)\b",
+    r"(^|[;&|]\s*)(?:cp|tee|truncate)\b",
+    r"\b(?:make|gmake|ninja)\s+(?:clean|distclean|clobber|mrproper)\b",
+    r"\b(?:python(?:3)?|node|ruby|perl)\b[^\n]*(?:\.unlink\s*\(|\.rmdir\s*\(|\.write_(?:text|bytes)\s*\(|open\s*\([^)]*,\s*['\"](?:w|x|a))",
+    r"(^|[;&|]\s]*)(?:eval|source)\b",
+    r"(^|[^>])>(?!>)(?![ \t]*(?:&[012]\b|/dev/(?:null|stdout|stderr)\b))",
 )
 
 READ_ONLY_SHELL_COMMANDS = frozenset(
@@ -490,7 +1023,20 @@ def _tool_paths(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
         if isinstance(value, str) and value:
             paths.append(value)
     if tool_name.lower() in {"apply_patch", "applypatch"}:
-        patch = str(tool_input.get("patch") or tool_input.get("input") or "")
+        patch = str(
+            tool_input.get("patch")
+            or tool_input.get("input")
+            or tool_input.get("patch_text")
+            or tool_input.get("patchText")
+            or next(
+                (
+                    value
+                    for value in tool_input.values()
+                    if isinstance(value, str) and "*** Begin Patch" in value
+                ),
+                "",
+            )
+        )
         paths.extend(re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", patch, re.MULTILINE))
         paths.extend(re.findall(r"^\*\*\* Move to: (.+)$", patch, re.MULTILINE))
     return paths
@@ -536,8 +1082,6 @@ def guard_reason(payload: dict[str, Any]) -> str | None:
         destructive = destructive_shell_reason(command)
         if destructive:
             return destructive
-        if command.strip() != manifest.verify.strip() and not read_only_shell_command(command):
-            return "shell commands are limited to read-only inspection or the exact controller-enforced verification command"
     return None
 
 
@@ -564,14 +1108,39 @@ def guard_main() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] == "--self-check":
+        try:
+            provider = provider_self_check(values[1]) if len(values) == 2 else {}
+            if len(values) > 2:
+                raise AgentSecurityError("self-check accepts at most one provider")
+        except AgentSecurityError as exc:
+            print(f"Alfred scoped-agent self-check failed: {exc}", file=sys.stderr)
+            return 70
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "policy": SECURITY_POLICY,
+                    "python": list(sys.version_info[:3]),
+                    **provider,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if not values or values[0] not in {"claude", "codex"}:
         print("usage: alfred-code-agent claude|codex [provider arguments]", file=sys.stderr)
         return 64
     try:
         return launch(values[0], values[1:])
     except AgentSecurityError as exc:
+        _record_startup_failure(f"AgentSecurityError: {exc}")
         print(f"Alfred scoped-agent launch refused: {exc}", file=sys.stderr)
         return 78
+    except Exception as exc:
+        _record_startup_failure(f"{type(exc).__name__}: {exc}")
+        print(f"Alfred scoped-agent launch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 70
 
 
 if __name__ == "__main__":

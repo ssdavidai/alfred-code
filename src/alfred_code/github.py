@@ -40,6 +40,19 @@ class GitHubClient:
     def __init__(self, config: GitHubConfig, binary: str = "gh"):
         self.config = config
         self.binary = binary
+        self._issues: dict[int, dict[str, Any]] = {}
+        self._issue_comments: dict[int, list[dict[str, Any]]] = {}
+        self._pull_requests: dict[str, PullRequestObservation | None] = {}
+        self._pr_comments: dict[int, list[dict[str, Any]]] = {}
+        self._default_branch_sha: str | None = None
+
+    def begin_cycle(self) -> None:
+        """Drop observation caches at the start of one reconciliation cycle."""
+        self._issues.clear()
+        self._issue_comments.clear()
+        self._pull_requests.clear()
+        self._pr_comments.clear()
+        self._default_branch_sha = None
 
     def _run(self, arguments: list[str], *, timeout: int = 120) -> str:
         try:
@@ -59,7 +72,10 @@ class GitHubClient:
         return {"auth": auth, "repo": repo, "observed_at": utcnow()}
 
     def issue(self, number: int) -> dict[str, Any]:
-        return self._json(
+        cached = self._issues.get(number)
+        if cached is not None:
+            return cached
+        issue = self._json(
             [
                 "issue",
                 "view",
@@ -70,6 +86,10 @@ class GitHubClient:
                 "id,number,title,body,state,url,labels,updatedAt",
             ]
         )
+        if not isinstance(issue, dict):
+            raise AuthorityUnavailable(f"GitHub issue #{number} returned a non-object response")
+        self._issues[number] = issue
+        return issue
 
     def open_issues(self, *, limit: int = 500) -> list[dict[str, Any]]:
         result = self._json(
@@ -88,6 +108,9 @@ class GitHubClient:
         )
         if not isinstance(result, list):
             raise AuthorityUnavailable("GitHub issue list returned a non-array response")
+        for issue in result:
+            if isinstance(issue, dict) and issue.get("number") is not None:
+                self._issues[int(issue["number"])] = issue
         return result
 
     def intake_issues(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -111,17 +134,23 @@ class GitHubClient:
         return result
 
     def issue_comments(self, number: int) -> list[dict[str, Any]]:
+        cached = self._issue_comments.get(number)
+        if cached is not None:
+            return cached
         result = self._json(
             ["api", f"repos/{self.config.repo}/issues/{number}/comments", "--paginate"]
         )
         if not isinstance(result, list):
             raise AuthorityUnavailable("GitHub comments endpoint returned a non-array response")
+        self._issue_comments[number] = result
         return result
 
     def post_issue_comment(self, number: int, body: str) -> str:
-        return self._run(
+        result = self._run(
             ["issue", "comment", str(number), "--repo", self.config.repo, "--body", body]
         ).strip()
+        self._issue_comments.pop(number, None)
+        return result
 
     def create_pr(self, *, branch: str, title: str, body: str, base: str = "main") -> str:
         return self._run(
@@ -314,11 +343,16 @@ class GitHubClient:
         return True
 
     def default_branch_sha(self) -> str:
+        if self._default_branch_sha is not None:
+            return self._default_branch_sha
         repo = self._json(
             ["repo", "view", self.config.repo, "--json", "defaultBranchRef"]
         )
         branch = ((repo.get("defaultBranchRef") or {}).get("name") if isinstance(repo, dict) else None) or "main"
-        return self._run(["api", f"repos/{self.config.repo}/commits/{branch}", "--jq", ".sha"]).strip()
+        self._default_branch_sha = self._run(
+            ["api", f"repos/{self.config.repo}/commits/{branch}", "--jq", ".sha"]
+        ).strip()
+        return self._default_branch_sha
 
     @staticmethod
     def _ci_state(checks: list[dict[str, Any]]) -> str:
@@ -337,6 +371,8 @@ class GitHubClient:
         return "PENDING"
 
     def pr_for_branch(self, branch: str) -> PullRequestObservation | None:
+        if branch in self._pull_requests:
+            return self._pull_requests[branch]
         result = self._json(
             [
                 "pr",
@@ -354,9 +390,10 @@ class GitHubClient:
             ]
         )
         if not result:
+            self._pull_requests[branch] = None
             return None
         pr = result[0]
-        return PullRequestObservation(
+        observation = PullRequestObservation(
             number=int(pr["number"]),
             url=str(pr["url"]),
             state=str(pr["state"]).upper(),
@@ -368,6 +405,8 @@ class GitHubClient:
             branch=str(pr.get("headRefName") or branch),
             body=str(pr.get("body") or ""),
         )
+        self._pull_requests[branch] = observation
+        return observation
 
     def pr_files(self, number: int) -> list[str]:
         result = self._json(
@@ -381,8 +420,13 @@ class GitHubClient:
         return paths
 
     def pr_comments(self, number: int) -> list[dict[str, Any]]:
+        cached = self._pr_comments.get(number)
+        if cached is not None:
+            return cached
         result = self._json(["api", f"repos/{self.config.repo}/issues/{number}/comments", "--paginate"])
-        return result if isinstance(result, list) else []
+        comments = result if isinstance(result, list) else []
+        self._pr_comments[number] = comments
+        return comments
 
     def review_verdict(
         self,

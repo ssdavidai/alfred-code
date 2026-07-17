@@ -3,4 +3,54 @@ set -euo pipefail
 
 ROOT="${ALFRED_CODE_HOME:-$HOME/.claude/alfred-code}"
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/bin/python3 -m alfred_code.agent_security "$@"
+
+select_python() {
+  local candidate
+  for candidate in \
+    "$ROOT/.venv/bin/python3" \
+    /opt/homebrew/opt/python@3.14/bin/python3.14 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3
+  do
+    if [[ -x "$candidate" ]] && "$candidate" -c \
+      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+      >/dev/null 2>&1
+    then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_bootstrap_failure() {
+  local code="$1"
+  local revision
+  revision="$(/usr/bin/awk '/^LAUNCH_REVISION = [0-9]+$/ { print $3; exit }' \
+    "$ROOT/src/alfred_code/agent_security.py" 2>/dev/null || true)"
+  if [[ ! "$revision" =~ ^[0-9]+$ ]]; then
+    revision=1
+  fi
+  if [[ -f .lane ]]; then
+    printf '{"schema":1,"revision":%d,"status":"failed","exit_code":%d,"reason":"scoped launcher could not start a Python 3.11+ security runtime","finished_at":"%s"}\n' \
+      "$revision" "$code" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .alfred-code-launch.json.tmp
+    chmod 600 .alfred-code-launch.json.tmp
+    mv .alfred-code-launch.json.tmp .alfred-code-launch.json
+  fi
+}
+
+if ! PYTHON="$(select_python)"; then
+  write_bootstrap_failure 70
+  printf '%s\n' 'Alfred scoped-agent launch refused: no trusted Python 3.11+ runtime is available' >&2
+  exit 70
+fi
+
+set +e
+"$PYTHON" -m alfred_code.agent_security "$@"
+status=$?
+set -e
+if (( status != 0 )); then
+  write_bootstrap_failure "$status"
+fi
+exit "$status"

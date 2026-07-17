@@ -3,19 +3,28 @@ import os
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from alfred_code.agent_security import (
     AgentSecurityError,
+    LAUNCH_STATUS,
     LaneManifest,
     REVIEW_RESULT,
     WORKER_RESULT,
+    _codex_isolation_arguments,
     _codex_legacy_sandbox_conflict,
+    _normalized_git_origin,
+    build_provider_command,
     claude_settings,
     codex_profile,
     guard_reason,
+    launch,
+    main,
     path_allowed,
+    prepare_dependency_overlay,
     validate_provider_arguments,
 )
 from alfred_code.config import load_config
@@ -65,7 +74,20 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertIn("override named permission profiles", _codex_legacy_sandbox_conflict(config))
 
     def test_codex_profile_is_lane_scoped_read_only_elsewhere_and_offline(self):
-        profile = codex_profile(self.manifest)
+        profile_path = self.workspace / "alfred-scoped-test.config.toml"
+        dependency_target = self.workspace.parent / f"{self.workspace.name}-node-modules"
+        dependency_target.mkdir(exist_ok=True)
+        self.addCleanup(dependency_target.rmdir)
+        dependency_link = self.workspace / "packages/learn/node_modules"
+        dependency_link.parent.mkdir(parents=True)
+        dependency_link.symlink_to(dependency_target, target_is_directory=True)
+        profile = codex_profile(
+            self.manifest,
+            profile_path=profile_path,
+            hook_trust_hash="sha256:test",
+            toolchain_paths=(Path("/trusted/bin"),),
+            git_metadata_paths=(Path("/trusted/git"),),
+        )
         parsed = tomllib.loads(profile)
         filesystem = parsed["permissions"]["alfred_scoped"]["filesystem"][":workspace_roots"]
         self.assertEqual(parsed["approval_policy"], "never")
@@ -73,22 +95,120 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(filesystem["packages/learn"], "write")
         self.assertEqual(filesystem["docs/result.md"], "write")
         self.assertEqual(filesystem[WORKER_RESULT], "write")
+        self.assertNotIn("**/.env.*", filesystem)
+        self.assertEqual(filesystem["**/.env.production"], "deny")
         self.assertEqual(parsed["permissions"]["alfred_scoped"]["network"]["enabled"], False)
+        self.assertEqual(parsed["permissions"]["alfred_scoped"]["filesystem"][":tmpdir"], "write")
+        self.assertEqual(parsed["permissions"]["alfred_scoped"]["filesystem"]["/trusted/bin"], "read")
+        self.assertEqual(parsed["permissions"]["alfred_scoped"]["filesystem"]["/trusted/git"], "read")
+        self.assertEqual(
+            parsed["permissions"]["alfred_scoped"]["filesystem"][str(dependency_target.resolve())],
+            "read",
+        )
+        self.assertEqual(filesystem["packages/learn/dist"], "write")
         self.assertEqual(parsed["shell_environment_policy"]["inherit"], "core")
         self.assertFalse(parsed["shell_environment_policy"]["ignore_default_excludes"])
+        self.assertTrue(parsed["shell_environment_policy"]["set"]["PYTHONDONTWRITEBYTECODE"])
+        self.assertEqual(parsed["shell_environment_policy"]["set"]["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(parsed["shell_environment_policy"]["set"]["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["npm_config_scripts_prepend_node_path"],
+            "false",
+        )
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["npm_config_script_shell"],
+            str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
+        )
         self.assertEqual(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             str(Path.home() / ".claude/bin/alfred-code-agent-guard"),
         )
+        trust_key = f"{profile_path.resolve()}:pre_tool_use:0:0"
+        self.assertEqual(parsed["hooks"]["state"][trust_key]["trusted_hash"], "sha256:test")
         self.assertNotIn("danger-full-access", profile)
+
+    def test_codex_integrations_are_replaced_as_whole_tables(self):
+        arguments = _codex_isolation_arguments()
+        self.assertIn("mcp_servers={}", arguments)
+        self.assertIn("plugins={}", arguments)
+        self.assertIn("features={hooks=true}", arguments)
+        self.assertIn("memories={generate_memories=false,use_memories=false}", arguments)
+        self.assertFalse(any('mcp_servers."' in value for value in arguments))
+
+    def test_equivalent_github_origin_forms_match_for_dependency_reuse(self):
+        self.assertEqual(
+            _normalized_git_origin("https://github.com/ssdavidai/alfred.git"),
+            _normalized_git_origin("git@github.com:ssdavidai/alfred"),
+        )
+
+    def test_broken_package_dependency_link_gets_non_overwriting_root_overlay(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"dependencies": {"tsx": "1.0.0"}, "devDependencies": {"esbuild": "1.0.0"}})
+        )
+        broken = package_root / "node_modules"
+        broken.symlink_to(broken, target_is_directory=True)
+        dependency_target = self.workspace / ".dependency-cache"
+        (dependency_target / "tsx").mkdir(parents=True)
+        (dependency_target / "esbuild").mkdir()
+
+        with patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": str(dependency_target)}):
+            overlay = prepare_dependency_overlay(self.manifest)
+
+        self.assertEqual(overlay, self.workspace / "node_modules")
+        self.assertTrue(overlay.is_symlink())
+        self.assertEqual(overlay.resolve(), dependency_target.resolve())
+
+    def test_dependency_overlay_never_replaces_an_existing_path(self):
+        overlay = self.workspace / "node_modules"
+        overlay.write_text("keep")
+        with patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": "/tmp/dependencies"}):
+            self.assertIsNone(prepare_dependency_overlay(self.manifest))
+        self.assertEqual(overlay.read_text(), "keep")
+
+    def test_codex_uses_unattended_exec_for_the_exact_worktree(self):
+        with (
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security._codex_legacy_sandbox_conflict", return_value=None),
+        ):
+            command = build_provider_command(
+                "codex",
+                ["--", "build it"],
+                self.manifest,
+                profile_name="alfred-scoped-test",
+            )
+        self.assertIn("exec", command)
+        self.assertLess(command.index("exec"), command.index("--"))
+        project_override = command[command.index("exec") - 1]
+        self.assertIn(str(self.workspace), project_override)
+        self.assertIn('trust_level="trusted"', project_override)
 
     def test_claude_policy_denies_home_reads_and_requires_native_sandbox(self):
         settings = claude_settings(self.manifest, Path("/guard"))
         self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
         self.assertEqual(settings["sandbox"]["filesystem"]["denyRead"], ["~/"])
-        self.assertEqual(settings["sandbox"]["filesystem"]["allowRead"], [str(self.workspace)])
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["allowRead"],
+            [str(self.workspace), str(Path.home() / ".claude/bin/alfred-code-npm-shell")],
+        )
         self.assertTrue(settings["sandbox"]["failIfUnavailable"])
         self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+
+    def test_claude_can_read_only_a_validated_dependency_overlay_target(self):
+        target = self.workspace / ".dependency-cache"
+        target.mkdir()
+        overlay = self.workspace / "node_modules"
+        overlay.symlink_to(target, target_is_directory=True)
+        settings = claude_settings(self.manifest, Path("/guard"))
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["allowRead"],
+            [
+                str(self.workspace),
+                str(target.resolve()),
+                str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
+            ],
+        )
 
     def test_lane_paths_and_control_marker_are_enforced(self):
         self.assertTrue(path_allowed("packages/learn/src/model.py", self.manifest))
@@ -96,7 +216,64 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertTrue(path_allowed(WORKER_RESULT, self.manifest))
         self.assertFalse(path_allowed("packages/ctrl/src/server.ts", self.manifest))
         self.assertFalse(path_allowed(REVIEW_RESULT, self.manifest))
+        self.assertFalse(path_allowed(LAUNCH_STATUS, self.manifest))
         self.assertFalse(path_allowed(".git/config", self.manifest))
+
+    def test_directory_allow_rule_covers_descendants(self):
+        value = json.loads((self.workspace / ".lane").read_text())
+        value["allowed"] = ["packages/learn/tests/"]
+        (self.workspace / ".lane").write_text(json.dumps(value))
+        manifest = LaneManifest.load(self.workspace)
+        self.assertTrue(path_allowed("packages/learn/tests/test_worker.py", manifest))
+        self.assertFalse(path_allowed("packages/learn/src/worker.py", manifest))
+
+    def test_self_check_reports_supported_runtime_and_policy(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(["--self-check"])
+        value = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertTrue(value["ok"])
+        self.assertGreaterEqual(tuple(value["python"][:2]), (3, 11))
+        self.assertEqual(value["policy"], "alfred-scoped-v1")
+
+    def test_provider_self_check_executes_the_resolved_binary(self):
+        output = StringIO()
+        with (
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/echo"),
+            redirect_stdout(output),
+        ):
+            result = main(["--self-check", "codex"])
+        value = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(value["provider"], "codex")
+        self.assertEqual(value["provider_binary"], "/bin/echo")
+        self.assertEqual(value["provider_version"], "--version")
+
+    def test_provider_exit_is_persisted_before_controller_reconciliation(self):
+        (self.workspace / ".codex").mkdir()
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", return_value=70),
+        ):
+            guard = self.workspace / ".claude/bin/alfred-code-agent-guard"
+            guard.parent.mkdir(parents=True)
+            guard.write_text("#!/bin/sh\n")
+            guard.chmod(0o700)
+            npm_shell = self.workspace / ".claude/bin/alfred-code-npm-shell"
+            npm_shell.write_text("#!/bin/sh\n")
+            npm_shell.chmod(0o700)
+            result = launch("codex", [])
+
+        marker = json.loads((self.workspace / LAUNCH_STATUS).read_text())
+        self.assertEqual(result, 70)
+        self.assertEqual(marker["status"], "exited")
+        self.assertEqual(marker["exit_code"], 70)
+        self.assertEqual(marker["controller_job"], "learn-299")
 
     def test_hook_blocks_out_of_lane_edits_and_destructive_shell(self):
         with patch.dict(os.environ, {"SUPERSET_WORKSPACE_PATH": str(self.workspace)}):
@@ -121,16 +298,51 @@ class AgentSecurityTests(unittest.TestCase):
             inspection = guard_reason(
                 {"tool_name": "Bash", "tool_input": {"command": "git diff --check"}}
             )
+            safe_redirection = guard_reason(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status 2>&1; node --version 2>/dev/stderr"},
+                }
+            )
             outside_read = guard_reason(
                 {"tool_name": "Read", "tool_input": {"file_path": "/Users/ssd/.ssh/config"}}
             )
+            current_codex_patch_payload = guard_reason(
+                {
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "patch_text": (
+                            "*** Begin Patch\n"
+                            "*** Update File: packages/learn/src/model.py\n"
+                            "@@\n-old\n+new\n"
+                            "*** End Patch"
+                        )
+                    },
+                }
+            )
+            outside_codex_patch_payload = guard_reason(
+                {
+                    "tool_name": "apply_patch",
+                    "tool_input": {
+                        "patch_text": (
+                            "*** Begin Patch\n"
+                            "*** Update File: packages/ctrl/src/server.ts\n"
+                            "@@\n-old\n+new\n"
+                            "*** End Patch"
+                        )
+                    },
+                }
+            )
         self.assertIn("outside approved", outside)
         self.assertIn("destructive", destructive)
-        self.assertIn("limited to read-only", hidden_write)
+        self.assertIn("destructive", hidden_write)
         self.assertIn("outside the assigned", outside_read)
         self.assertIsNone(allowed)
         self.assertIsNone(verification)
         self.assertIsNone(inspection)
+        self.assertIsNone(safe_redirection)
+        self.assertIsNone(current_codex_patch_payload)
+        self.assertIn("outside approved", outside_codex_patch_payload)
 
     def test_config_rejects_builtin_superset_presets(self):
         path = self.workspace / "controller.toml"

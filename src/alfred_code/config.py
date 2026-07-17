@@ -40,6 +40,7 @@ class SupersetConfig:
     workspace_prefix: str = "alfred-code"
     api_key_env: str = "SUPERSET_API_KEY"
     cleanup_merged_workspaces: bool = False
+    worker_launch_timeout_seconds: int = 120
     worker_progress_timeout_seconds: int = 1200
 
 
@@ -155,6 +156,9 @@ def load_config(path: Path | None = None) -> ControllerConfig:
             workspace_prefix=str(superset_raw.get("workspace_prefix", "alfred-code")),
             api_key_env=str(superset_raw.get("api_key_env", "SUPERSET_API_KEY")),
             cleanup_merged_workspaces=bool(superset_raw.get("cleanup_merged_workspaces", False)),
+            worker_launch_timeout_seconds=int(
+                superset_raw.get("worker_launch_timeout_seconds", 120)
+            ),
             worker_progress_timeout_seconds=int(
                 superset_raw.get("worker_progress_timeout_seconds", 1200)
             ),
@@ -167,6 +171,8 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     )
     if config.poll_seconds < 10:
         raise ConfigurationError("poll_seconds must be at least 10")
+    if config.superset.worker_launch_timeout_seconds < 30:
+        raise ConfigurationError("superset.worker_launch_timeout_seconds must be at least 30")
     if config.superset.worker_progress_timeout_seconds < 60:
         raise ConfigurationError("superset.worker_progress_timeout_seconds must be at least 60")
     if config.superset.worker_agent not in SCOPED_AGENT_IDS:

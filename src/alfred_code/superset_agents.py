@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -186,6 +187,47 @@ def inspect_agent_configs(database: Path | None = None) -> dict[str, Any]:
         problems.append(f"scoped agent launcher is not executable: {wrapper}")
     if not guard.is_file() or not os.access(guard, os.X_OK):
         problems.append(f"scoped agent guard is not executable: {guard}")
+    if wrapper.is_file() and os.access(wrapper, os.X_OK):
+        providers = sorted({str(value["preset_id"]) for value in expected.values()})
+        for provider in providers:
+            try:
+                checked = subprocess.run(
+                    [str(wrapper), "--self-check", provider],
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+                self_check = json.loads(checked.stdout) if checked.returncode == 0 else {}
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+                problems.append(f"scoped {provider} launcher self-check failed: {exc}")
+                continue
+            python_version = self_check.get("python") if isinstance(self_check, dict) else None
+            if (
+                checked.returncode != 0
+                or not isinstance(self_check, dict)
+                or self_check.get("policy") != SECURITY_POLICY
+                or self_check.get("provider") != provider
+                or not self_check.get("provider_version")
+                or not isinstance(python_version, list)
+                or tuple(python_version[:2]) < (3, 11)
+            ):
+                detail = (checked.stderr or checked.stdout or "invalid self-check output").strip()[:300]
+                problems.append(f"scoped {provider} launcher self-check failed: {detail}")
+    if guard.is_file() and os.access(guard, os.X_OK):
+        try:
+            guarded = subprocess.run(
+                [str(guard)],
+                input="{}",
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"scoped agent guard self-check failed: {exc}")
+        else:
+            if guarded.returncode != 0:
+                detail = (guarded.stderr or guarded.stdout or "guard exited non-zero").strip()[:300]
+                problems.append(f"scoped agent guard self-check failed: {detail}")
     codex_conflict = _codex_legacy_sandbox_conflict(Path.home() / ".codex/config.toml")
     if codex_conflict:
         problems.append(codex_conflict)

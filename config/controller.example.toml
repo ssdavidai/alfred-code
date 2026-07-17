@@ -27,6 +27,7 @@ reviewer_agent = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 workspace_prefix = "alfred-code"
 api_key_env = "SUPERSET_API_KEY"
 cleanup_merged_workspaces = false
+worker_launch_timeout_seconds = 120
 worker_progress_timeout_seconds = 1200
 
 [slack]

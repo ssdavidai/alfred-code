@@ -27,6 +27,38 @@ class FakeGitHub(GitHubClient):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_cycle_cache_reuses_issue_and_comment_observations(self):
+        client = GitHubClient(
+            GitHubConfig(
+                repo="owner/repo",
+                owner="owner",
+                approval_command="/approve-plan",
+                approvers=("owner",),
+                reviewers=("owner",),
+            )
+        )
+        calls = []
+
+        def fake_json(arguments, timeout=120):
+            calls.append(tuple(arguments))
+            if arguments[:2] == ["issue", "list"]:
+                return [{"number": 7, "state": "OPEN", "title": "cached"}]
+            if arguments[:2] == ["issue", "view"]:
+                return {"number": 7, "state": "OPEN", "title": "fresh"}
+            if arguments[0] == "api":
+                return [{"id": 1, "body": "hello"}]
+            raise AssertionError(arguments)
+
+        client._json = fake_json
+        self.assertEqual(client.open_issues()[0]["title"], "cached")
+        self.assertEqual(client.issue(7)["title"], "cached")
+        self.assertEqual(client.issue_comments(7), client.issue_comments(7))
+        self.assertEqual(len(calls), 2)
+
+        client.begin_cycle()
+        self.assertEqual(client.issue(7)["title"], "fresh")
+        self.assertEqual(len(calls), 3)
+
     def test_approval_must_be_full_exact_and_from_allowlist(self):
         client = FakeGitHub()
         digest = "a" * 64
