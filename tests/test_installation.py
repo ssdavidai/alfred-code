@@ -26,6 +26,7 @@ class InstallationTests(unittest.TestCase):
             self.assertNotIn("exec /usr/bin/python3", script)
         self.assertIn("/^LAUNCH_REVISION = [0-9]+$/", launcher)
         self.assertNotIn('"revision":3', launcher)
+        self.assertNotIn('write_bootstrap_failure "$status"', launcher)
         self.assertIn("node_modules/.bin", npm_shell)
         self.assertIn("! -d", npm_shell)
         self.assertIn('/opt/homebrew/opt/node@22/bin', npm_shell)

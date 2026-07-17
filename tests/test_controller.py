@@ -986,6 +986,104 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(self.db.lease_owner("I"))
         self.assertTrue(repairing["repair_token"])
 
+    def test_failed_provider_resumes_partial_repair_with_a_new_bound_attempt(self):
+        remote, pr, repairing = self.launch_failed_review_repair()
+        first_token = repairing["repair_token"]
+        (self.repo / "file.txt").write_text("partial compatible repair\n")
+        self.write_launch_status(
+            "exited",
+            exit_code=1,
+            reason="provider was at capacity",
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=1,
+        )
+
+        self.controller.run_once()
+
+        resumed = self.db.get_job("api-12")
+        self.assertEqual(resumed["state"], "repairing")
+        self.assertEqual(resumed["repair_attempts"], 2)
+        self.assertNotEqual(resumed["repair_token"], first_token)
+        self.assertEqual((self.repo / "file.txt").read_text(), "partial compatible repair\n")
+        lane = json.loads((self.repo / ".lane").read_text())
+        result = json.loads((self.repo / WORKER_RESULT).read_text())
+        launch = json.loads((self.repo / LAUNCH_STATUS).read_text())
+        for marker in (lane, result, launch):
+            self.assertEqual(marker["head_sha"], pr.head_sha)
+            self.assertEqual(marker["attempt"], 2)
+        self.assertEqual(lane["handoff_token"], resumed["repair_token"])
+        self.assertEqual(result["handoff_token"], resumed["repair_token"])
+        self.assertEqual(launch["status"], "retrying")
+        self.assertEqual(self.superset.agent_starts, 2)
+
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "summary": "finished the resumed repair",
+                    "head_sha": pr.head_sha,
+                    "handoff_token": resumed["repair_token"],
+                    "attempt": 2,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=2,
+        )
+
+        self.controller.run_once()
+
+        finalized = self.db.get_job("api-12")
+        self.assertEqual(finalized["state"], "pr_open")
+        self.assertNotEqual(finalized["head_sha"], pr.head_sha)
+        remote_sha = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/lane-1/12-api"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(remote_sha, finalized["head_sha"])
+
+    def test_revision_21_unbound_failure_recovers_only_bound_partial_repair(self):
+        _, pr, repairing = self.launch_failed_review_repair()
+        first_token = repairing["repair_token"]
+        (self.repo / "file.txt").write_text("partial repair from interrupted provider\n")
+        (self.repo / LAUNCH_STATUS).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "revision": LAUNCH_REVISION - 1,
+                    "status": "failed",
+                    "exit_code": 1,
+                    "reason": "scoped launcher could not start a Python 3.11+ security runtime",
+                }
+            )
+        )
+        self.db.update_job(
+            "api-12",
+            state="quarantined",
+            last_error="review repair launch marker is not bound to the current exact SHA and attempt",
+        )
+        self.db.release_lane("api-12")
+
+        self.controller.run_once()
+
+        resumed = self.db.get_job("api-12")
+        self.assertEqual(resumed["state"], "repairing")
+        self.assertEqual(resumed["repair_attempts"], 2)
+        self.assertNotEqual(resumed["repair_token"], first_token)
+        self.assertEqual(
+            (self.repo / "file.txt").read_text(),
+            "partial repair from interrupted provider\n",
+        )
+        self.assertEqual(self.db.lease_owner("I"), "api-12")
+        self.assertEqual(self.superset.agent_starts, 2)
+
     def test_blocked_repair_stops_at_configured_attempt_cap(self):
         self.controller.config = replace(
             self.config,
