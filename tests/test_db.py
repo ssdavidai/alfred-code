@@ -99,6 +99,7 @@ class DatabaseTests(unittest.TestCase):
         path = Path(self.temp.name) / "schema-two.sqlite3"
         legacy_schema = SCHEMA
         for declaration in (
+            "    base_sha TEXT,\n",
             "    repair_attempts INTEGER NOT NULL DEFAULT 0,\n",
             "    repair_sha TEXT,\n",
             "    repair_agent_id TEXT,\n",
@@ -129,8 +130,23 @@ class DatabaseTests(unittest.TestCase):
                 "repair_agent_id",
                 "repair_requested_at",
                 "repair_token",
+                "base_sha",
             }.issubset(columns)
         )
+
+    def test_job_launch_base_is_immutable_once_recorded(self):
+        digest = "p" * 64
+        dependent = dict(self.plan)
+        dependent["jobs"] = [dict(self.plan["jobs"][0], depends_on=["parent-7"])]
+        self.database.save_plan(7, digest, dependent)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        job = self.database.materialize_jobs(7, digest, dependent)[0]
+        self.assertIsNone(job["base_sha"])
+
+        self.database.update_job("job-7", base_sha="b" * 40)
+        self.database.update_job("job-7", base_sha="b" * 40)
+        with self.assertRaisesRegex(ValueError, "base_sha is immutable"):
+            self.database.update_job("job-7", base_sha="c" * 40)
 
 
 if __name__ == "__main__":

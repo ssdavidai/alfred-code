@@ -82,6 +82,28 @@ class GitHubTests(unittest.TestCase):
         self.assertNotIn(5, client._pr_comments)
         self.assertNotIn(5, client._issue_comments)
 
+    def test_close_and_reopen_issue_use_explicit_state_commands_and_invalidate_cache(self):
+        client = GitHubClient(
+            GitHubConfig(repo="owner/repo", owner="owner", approvers=("owner",))
+        )
+        calls = []
+        client._run = lambda arguments, timeout=120: calls.append(arguments) or ""
+        client._issues[7] = {"number": 7, "state": "OPEN"}
+        client._issue_comments[7] = [{"id": 1}]
+
+        client.close_issue(7)
+        self.assertEqual(
+            calls[-1],
+            ["issue", "close", "7", "--repo", "owner/repo", "--reason", "completed"],
+        )
+        self.assertNotIn(7, client._issues)
+        self.assertNotIn(7, client._issue_comments)
+
+        client._issues[7] = {"number": 7, "state": "CLOSED"}
+        client.reopen_issue(7)
+        self.assertEqual(calls[-1], ["issue", "reopen", "7", "--repo", "owner/repo"])
+        self.assertNotIn(7, client._issues)
+
     def test_approval_must_be_full_exact_and_from_allowlist(self):
         client = FakeGitHub()
         digest = "a" * 64

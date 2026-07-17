@@ -10,7 +10,7 @@ from .states import ISSUE_STATES, JOB_STATES
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 SCHEMA = """
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     title TEXT NOT NULL,
     state TEXT NOT NULL,
     branch TEXT NOT NULL,
+    base_sha TEXT,
     paths_json TEXT NOT NULL,
     verify_command TEXT NOT NULL,
     contracts_json TEXT NOT NULL,
@@ -155,7 +156,7 @@ class Database:
             row = self.connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 self.connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif row["version"] in {1, 2}:
+            elif row["version"] in {1, 2, 3}:
                 columns = {
                     item["name"] for item in self.connection.execute("PRAGMA table_info(jobs)")
                 }
@@ -174,6 +175,8 @@ class Database:
                         self.connection.execute(
                             f"ALTER TABLE jobs ADD COLUMN {name} {declaration}"
                         )
+                if "base_sha" not in columns:
+                    self.connection.execute("ALTER TABLE jobs ADD COLUMN base_sha TEXT")
                 self.connection.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
             elif row["version"] != SCHEMA_VERSION:
                 raise RuntimeError(
@@ -437,10 +440,10 @@ class Database:
             for job in plan["jobs"]:
                 conn.execute(
                     """
-                    INSERT INTO jobs(job_id, issue_number, plan_hash, lane, title, state, branch,
+                    INSERT INTO jobs(job_id, issue_number, plan_hash, lane, title, state, branch, base_sha,
                                      paths_json, verify_command, contracts_json, depends_on_json,
                                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id) DO NOTHING
                     """,
                     (
@@ -450,6 +453,7 @@ class Database:
                         job["lane"],
                         job["title"],
                         job["branch"],
+                        None if job.get("depends_on") else plan["base_sha"],
                         canonical_json(job["paths"]),
                         job["verify"],
                         canonical_json(
@@ -503,6 +507,7 @@ class Database:
             "workspace_id",
             "workspace_url",
             "agent_id",
+            "base_sha",
             "pr_number",
             "pr_url",
             "head_sha",
@@ -524,6 +529,15 @@ class Database:
             previous = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             if previous is None:
                 raise KeyError(f"job {job_id} not found")
+            if "base_sha" in fields:
+                candidate = fields["base_sha"]
+                existing = previous["base_sha"]
+                if not isinstance(candidate, str) or not candidate:
+                    raise ValueError("job base_sha must be a non-empty string")
+                if existing and existing != candidate:
+                    raise ValueError(
+                        f"job {job_id} base_sha is immutable ({existing[:12]} != {candidate[:12]})"
+                    )
             updates = dict(fields)
             if state is not None:
                 updates["state"] = state

@@ -76,6 +76,12 @@ class Controller:
         for number, issue in tracked.items():
             if issue["github_state"] == "OPEN" and number not in live:
                 live[number] = self.github.issue(number)
+            elif (
+                issue["github_state"] == "CLOSED"
+                and number not in live
+                and self._closed_issue_needs_recovery_audit(number)
+            ):
+                live[number] = self.github.issue(number)
 
         project_ready = bool(
             self.config.apply and self.project and self.config.github.project_number
@@ -191,15 +197,22 @@ class Controller:
     def process_issue(self, issue_number: int) -> dict[str, Any]:
         live = self.github.issue(issue_number)
         issue = self.database.upsert_issue(live)
+        current = self.database.current_plan(issue_number)
+        jobs = self.database.list_jobs(issue_number)
         if issue["github_state"] == "CLOSED":
-            self._close_issue(issue_number)
+            if (
+                self.config.apply
+                and current
+                and self._recover_premature_multi_job_close(live, current["plan"], jobs)
+            ):
+                self._sync_project(issue_number)
+                return self._issue_summary(issue_number)
+            self._close_issue(issue_number, recovery_checked=True)
             self._sync_project(issue_number)
             return self._issue_summary(issue_number)
         if not self.config.apply:
             return self._issue_summary(issue_number)
 
-        current = self.database.current_plan(issue_number)
-        jobs = self.database.list_jobs(issue_number)
         if current and current["plan"].get("issue_body_hash") != issue["body_hash"]:
             active = [job for job in jobs if job["state"] not in TERMINAL_JOB_STATES]
             if active:
@@ -320,11 +333,125 @@ class Controller:
             jobs = self.database.materialize_jobs(issue_number, plan_hash, plan)
         for job in jobs:
             self.reconcile_job(issue, plan, job)
-        self._derive_issue_state(issue_number)
+        state = self._derive_issue_state(issue_number)
+        if state == "completed" and issue["github_state"] == "OPEN":
+            self.github.close_issue(issue_number)
+            issue = self.database.upsert_issue(self.github.issue(issue_number))
+            self.database.set_issue_state(issue_number, "completed")
         self._sync_project(issue_number)
         return self._issue_summary(issue_number)
 
-    def _close_issue(self, issue_number: int) -> None:
+    def _closed_issue_needs_recovery_audit(self, issue_number: int) -> bool:
+        current = self.database.current_plan(issue_number)
+        jobs = self.database.list_jobs(issue_number)
+        if not current or len(current["plan"].get("jobs", [])) <= 1 or len(jobs) <= 1:
+            return False
+        if any(job["state"] not in TERMINAL_JOB_STATES for job in jobs):
+            return True
+        return any(
+            str(job.get("last_error") or "") == "GitHub issue or PR closed without merge"
+            for job in jobs
+        )
+
+    @staticmethod
+    def _timestamps_are_near(left: str, right: str, *, seconds: int = 10) -> bool:
+        try:
+            first = datetime.fromisoformat(left.replace("Z", "+00:00"))
+            second = datetime.fromisoformat(right.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=timezone.utc)
+        if second.tzinfo is None:
+            second = second.replace(tzinfo=timezone.utc)
+        return abs((first - second).total_seconds()) <= seconds
+
+    def _recover_premature_multi_job_close(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        jobs: list[dict[str, Any]],
+    ) -> bool:
+        if len(plan.get("jobs", [])) <= 1 or len(jobs) <= 1:
+            return False
+        observations: list[tuple[dict[str, Any], PullRequestObservation | None]] = []
+        for job in jobs:
+            pr = self.github.pr_for_branch(job["branch"])
+            if pr:
+                self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+            observations.append((job, pr))
+        if observations and all(pr and pr.merged for _, pr in observations):
+            return False
+
+        issue_updated_at = str(issue.get("updatedAt") or "")
+        generated_auto_close = any(
+            pr
+            and pr.merged
+            and f"Closes #{issue['number']}" in {line.strip() for line in pr.body.splitlines()}
+            and f"Controller job: `{job['job_id']}` · lane `{job['lane']}`" in pr.body
+            and self._timestamps_are_near(issue_updated_at, pr.merged_at)
+            for job, pr in observations
+        )
+        if not generated_auto_close:
+            return False
+
+        self.github.reopen_issue(int(issue["number"]))
+        for job, pr in observations:
+            if pr and pr.merged:
+                self.database.update_job(
+                    job["job_id"],
+                    state="merged",
+                    pr_number=pr.number,
+                    pr_url=pr.url,
+                    head_sha=pr.head_sha,
+                    review_sha=pr.head_sha,
+                    last_error=None,
+                )
+                self.database.release_lane(job["job_id"])
+                continue
+            if pr and not pr.closed_unmerged:
+                self.database.update_job(
+                    job["job_id"],
+                    state="pr_open",
+                    pr_number=pr.number,
+                    pr_url=pr.url,
+                    head_sha=pr.head_sha,
+                    last_error=None,
+                )
+                self.database.acquire_lane(job["lane"], job["job_id"])
+                continue
+            error = str(job.get("last_error") or "")
+            closed_by_controller = error.startswith("GitHub issue or PR closed without merge")
+            if pr is None and job["state"] == "closed" and closed_by_controller:
+                restored = (
+                    "running"
+                    if job.get("workspace_id")
+                    else "waiting_dependency"
+                    if job.get("depends_on")
+                    else "queued"
+                )
+                self.database.update_job(job["job_id"], state=restored, last_error=None)
+                if restored == "running":
+                    self.database.acquire_lane(job["lane"], job["job_id"])
+        refreshed = self.database.upsert_issue(self.github.issue(int(issue["number"])))
+        state = self._derive_issue_state(int(issue["number"]))
+        self.database.event(
+            "issue.premature_close_recovered",
+            {
+                "updated_at": issue_updated_at,
+                "restored_state": state,
+                "github_state": refreshed["github_state"],
+            },
+            issue_number=int(issue["number"]),
+        )
+        self.notifier.send(
+            f"issue:{issue['number']}:premature-close-recovered:{issue_updated_at}",
+            f"Alfred #{issue['number']} was automatically reopened because one lane PR closed a multi-lane issue before every lane merged.",
+            {"issue": int(issue["number"]), "url": issue.get("url")},
+        )
+        return True
+
+    def _close_issue(self, issue_number: int, *, recovery_checked: bool = False) -> None:
         for job in self.database.list_jobs(issue_number):
             pr = self.github.pr_for_branch(job["branch"])
             if pr:
@@ -347,13 +474,18 @@ class Controller:
                     last_error="issue closed while PR remains open",
                 )
             else:
+                error = "GitHub issue or PR closed without merge"
+                if recovery_checked:
+                    error += " (automatic multi-job close recovery not applicable)"
                 self.database.update_job(
                     job["job_id"],
                     state="closed",
-                    last_error="GitHub issue or PR closed without merge",
+                    last_error=error,
                 )
             self.database.release_lane(job["job_id"])
-        self.database.set_issue_state(issue_number, "closed")
+        jobs = self.database.list_jobs(issue_number)
+        state = "completed" if jobs and all(job["state"] == "merged" for job in jobs) else "closed"
+        self.database.set_issue_state(issue_number, state)
 
     def reconcile_job(self, issue: dict[str, Any], plan: dict[str, Any], job: dict[str, Any]) -> None:
         job_id = job["job_id"]
@@ -420,7 +552,7 @@ class Controller:
                 return
             workspace_progress = bool(
                 worktree
-                and self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+                and self._changed_workspace_paths(worktree, self._job_base_sha(plan, job))
             )
             if self._retry_legacy_launch_failure(issue, plan, job, worktree, launch_status):
                 return
@@ -451,7 +583,7 @@ class Controller:
                 self.database.update_job(job_id, state="blocked", last_error=error)
                 self.database.release_lane(job_id)
                 self.notifier.send(
-                    f"job:{job_id}:no-progress:{plan['base_sha']}",
+                    f"job:{job_id}:no-progress:{self._job_base_sha(plan, job)}",
                     f"Alfred #{issue['number']} lane {job['lane']} is blocked: {error}.",
                     {"job": job_id, "workspace": job["workspace_id"]},
                 )
@@ -467,7 +599,9 @@ class Controller:
             return
         self.database.update_job(job_id, state="launching", last_error=None)
         try:
-            self._prepare_branch(job["branch"], plan["base_sha"])
+            job = self._ensure_job_base_sha(plan, job)
+            base_sha = self._job_base_sha(plan, job)
+            self._prepare_branch(job["branch"], base_sha)
             workspace_name = self._worker_workspace_name(int(issue["number"]), job["lane"])
             existing = self.superset.workspace_by_name(workspace_name)
             if existing:
@@ -491,7 +625,7 @@ class Controller:
                 agent_id=agent_id,
             )
             self.notifier.send(
-                f"job:{job_id}:launched:{plan['base_sha']}",
+                f"job:{job_id}:launched:{base_sha}",
                 f"Alfred #{issue['number']} lane {job['lane']} launched in Superset: {workspace.url or workspace.name}",
                 {"job": job_id, "workspace": workspace.id},
             )
@@ -1286,6 +1420,30 @@ class Controller:
             {"job": job["job_id"], "pr": pr.url, "sha": new_sha},
         )
 
+    @staticmethod
+    def _job_base_sha(plan: dict[str, Any], job: dict[str, Any]) -> str:
+        return str(job.get("base_sha") or plan["base_sha"])
+
+    def _ensure_job_base_sha(
+        self, plan: dict[str, Any], job: dict[str, Any]
+    ) -> dict[str, Any]:
+        if job.get("base_sha"):
+            return job
+        if not job.get("depends_on"):
+            return self.database.update_job(job["job_id"], base_sha=str(plan["base_sha"]))
+
+        refresh = getattr(self.github, "refresh_default_branch_sha", None)
+        base_sha = str(refresh() if callable(refresh) else self.github.default_branch_sha())
+        repo = self.config.repo_path
+        run(["git", "fetch", "--no-tags", "origin", "main"], cwd=repo, timeout=300)
+        remote_sha = run(["git", "rev-parse", "refs/remotes/origin/main"], cwd=repo).strip()
+        if remote_sha != base_sha:
+            raise AuthorityUnavailable(
+                "GitHub and the local origin/main ref disagree while selecting a dependent lane base "
+                f"({base_sha[:12]} != {remote_sha[:12]})"
+            )
+        return self.database.update_job(job["job_id"], base_sha=base_sha)
+
     def _prepare_branch(self, branch: str, base_sha: str) -> None:
         repo = self.config.repo_path
         run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], cwd=repo)
@@ -1341,7 +1499,7 @@ class Controller:
             for line in status.splitlines()
             if line.strip() and line[3:].strip() not in RUNTIME_CONTROL_FILES
         ]
-        if head != str(plan["base_sha"]) or meaningful:
+        if head != self._job_base_sha(plan, job) or meaningful:
             return False
         started_value = (
             str(launch_status.get("started_at") or "")
@@ -1411,7 +1569,7 @@ class Controller:
         self.database.update_job(job["job_id"], state="blocked", last_error=error)
         self.database.release_lane(job["job_id"])
         self.notifier.send(
-            f"job:{job['job_id']}:launch-failed:{plan['base_sha']}",
+            f"job:{job['job_id']}:launch-failed:{self._job_base_sha(plan, job)}",
             f"Alfred #{issue['number']} lane {job['lane']} is blocked because its scoped agent did not launch: {error}.",
             {"job": job["job_id"], "workspace": job.get("workspace_id"), "error": error},
         )
@@ -1448,7 +1606,7 @@ class Controller:
         # paths before this recovery point. Pre-handshake and old false-marker
         # recoveries still require an otherwise pristine workspace.
         if not obsolete_launch_failure and self._changed_workspace_paths(
-            worktree, str(plan["base_sha"])
+            worktree, self._job_base_sha(plan, job)
         ):
             return False
         if not self.database.acquire_lane(job["lane"], job["job_id"]):
@@ -1485,7 +1643,7 @@ class Controller:
             job["job_id"], state="running", agent_id=agent_id, last_error=None
         )
         self.notifier.send(
-            f"job:{job['job_id']}:launch-retry:{plan['base_sha']}",
+            f"job:{job['job_id']}:launch-retry:{self._job_base_sha(plan, job)}",
             f"Alfred #{issue['number']} lane {job['lane']} safely retried its pre-progress scoped-agent launch in the existing workspace.",
             {"job": job["job_id"], "workspace": job.get("workspace_id")},
         )
@@ -1578,7 +1736,7 @@ class Controller:
             job["job_id"], state="running", agent_id=agent_id, last_error=None
         )
         self.notifier.send(
-            f"job:{job['job_id']}:policy-retry:{plan['base_sha']}",
+            f"job:{job['job_id']}:policy-retry:{self._job_base_sha(plan, job)}",
             f"Alfred #{issue['number']} lane {job['lane']} safely resumed its in-scope work under scoped policy revision {LAUNCH_REVISION}.",
             {"job": job["job_id"], "workspace": job.get("workspace_id")},
         )
@@ -1735,9 +1893,10 @@ class Controller:
             return "enforced .lane manifest drifted from the approved controller job"
         try:
             head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
-            if head != str(expected_head or plan["base_sha"]):
+            base_sha = self._job_base_sha(plan, job)
+            if head != str(expected_head or base_sha):
                 return "agent modified Git metadata; only the trusted controller may commit"
-            changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+            changed = self._changed_workspace_paths(worktree, base_sha)
         except (CommandError, OSError) as exc:
             return f"cannot prove workspace scope: {exc}"
         outside = [
@@ -1747,7 +1906,7 @@ class Controller:
             return f"workspace contains changes outside its approved plan: {', '.join(outside)}"
         try:
             deleted = run(
-                ["git", "diff", "--name-only", "--diff-filter=D", str(plan["base_sha"])],
+                ["git", "diff", "--name-only", "--diff-filter=D", base_sha],
                 cwd=worktree,
                 timeout=30,
             ).splitlines()
@@ -1767,7 +1926,7 @@ class Controller:
         self.database.update_job(job["job_id"], state="quarantined", last_error=error)
         self.database.release_lane(job["job_id"])
         self.notifier.send(
-            f"job:{job['job_id']}:security:{plan['base_sha']}",
+            f"job:{job['job_id']}:security:{self._job_base_sha(plan, job)}",
             f"Alfred #{issue['number']} lane {job['lane']} was quarantined by the scoped-agent policy: {error}.",
             {"job": job["job_id"], "workspace": job.get("workspace_id"), "error": error},
         )
@@ -1809,7 +1968,7 @@ class Controller:
         if not self.database.acquire_lane(job["lane"], job["job_id"]):
             self.database.update_job(job["job_id"], state="waiting_lane")
             return True
-        changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+        changed = self._changed_workspace_paths(worktree, self._job_base_sha(plan, job))
         if not changed:
             self._quarantine_worker(issue, plan, job, "worker claimed readiness without repository changes")
             return True
@@ -1824,7 +1983,7 @@ class Controller:
             if scope_error:
                 self._quarantine_worker(issue, plan, job, scope_error)
                 return True
-            changed = self._changed_workspace_paths(worktree, str(plan["base_sha"]))
+            changed = self._changed_workspace_paths(worktree, self._job_base_sha(plan, job))
             run(["git", "add", "--", *changed], cwd=worktree, timeout=60)
             staged = run(["git", "diff", "--cached", "--name-only"], cwd=worktree, timeout=30).splitlines()
             if not staged or set(staged) != set(changed):
@@ -1838,8 +1997,13 @@ class Controller:
             )
             run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
             evidence = verification.strip() or "(command exited 0 with no output)"
+            issue_reference = (
+                f"Closes #{issue['number']}"
+                if len(plan.get("jobs", [])) == 1
+                else f"Part of #{issue['number']}"
+            )
             body = (
-                f"Closes #{issue['number']}\n\n"
+                f"{issue_reference}\n\n"
                 f"Controller job: `{job['job_id']}` · lane `{job['lane']}`\n\n"
                 "## Smoke evidence\n\n"
                 f"`{job['verify_command']}`\n\n```text\n{evidence[:12000]}\n```\n\n"
@@ -1854,7 +2018,7 @@ class Controller:
             self.database.update_job(job["job_id"], state="blocked", last_error=f"controller finalization failed: {exc}")
             self.database.release_lane(job["job_id"])
             self.notifier.send(
-                f"job:{job['job_id']}:finalize-failed:{plan['base_sha']}",
+                f"job:{job['job_id']}:finalize-failed:{self._job_base_sha(plan, job)}",
                 f"Alfred #{issue['number']} lane {job['lane']} passed agent handoff but trusted finalization failed: {exc}",
                 {"job": job["job_id"], "workspace": job.get("workspace_id")},
             )
@@ -1982,7 +2146,7 @@ class Controller:
         contracts = job.get("contracts") or {}
         return f"""Implement only controller job {job['job_id']} for GitHub issue #{issue['number']} in {self.config.github.repo}.
 
-You own lane {job['lane']} on branch {job['branch']}, pinned from {plan['base_sha']}. The controller wrote .lane and the repository's actual lane hook is authoritative. Read current source, tests, CI configuration, and runtime logs; documentation is intent to verify, not proof.
+You own lane {job['lane']} on branch {job['branch']}, pinned from {self._job_base_sha(plan, job)}. The controller wrote .lane and the repository's actual lane hook is authoritative. Read current source, tests, CI configuration, and runtime logs; documentation is intent to verify, not proof.
 
 Allowed write scope: {json.dumps(job['paths'])}
 Required verification: {job['verify_command']}
@@ -2075,17 +2239,22 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
     def _planned_job(plan: dict[str, Any], job_id: str) -> dict[str, Any]:
         return next(item for item in plan["jobs"] if item["id"] == job_id)
 
-    def _derive_issue_state(self, issue_number: int) -> None:
+    def _derive_issue_state(self, issue_number: int) -> str:
         jobs = self.database.list_jobs(issue_number)
         states = {job["state"] for job in jobs}
         if jobs and states <= {"merged"}:
-            self.database.set_issue_state(issue_number, "completed")
+            state = "completed"
         elif states.intersection({"blocked", "quarantined", "closed"}):
-            self.database.set_issue_state(issue_number, "blocked")
+            state = "blocked"
         elif jobs and states <= {"ready_merge", "merged"}:
-            self.database.set_issue_state(issue_number, "ready_merge")
+            state = "ready_merge"
         elif jobs:
-            self.database.set_issue_state(issue_number, "building")
+            state = "building"
+        else:
+            issue = self.database.get_issue(issue_number) or {}
+            state = str(issue.get("controller_state") or "observed")
+        self.database.set_issue_state(issue_number, state)
+        return state
 
     def _sync_project(self, issue_number: int) -> None:
         if not self.project or not self.config.github.project_number:
