@@ -50,7 +50,4 @@ set +e
 "$PYTHON" -m alfred_code.agent_security "$@"
 status=$?
 set -e
-if (( status != 0 )); then
-  write_bootstrap_failure "$status"
-fi
 exit "$status"

@@ -549,9 +549,12 @@ class Controller:
                 {"job": job_id, "pr": pr.url, "files": outside},
             )
             return
-        if job.get("repair_sha") == pr.head_sha and job.get("state") == "repairing":
-            self._reconcile_review_repair(issue, plan, job, pr)
-            return
+        if job.get("repair_sha") == pr.head_sha:
+            if job.get("state") == "repairing":
+                self._reconcile_review_repair(issue, plan, job, pr)
+                return
+            if self._resume_legacy_review_repair(issue, plan, job, pr):
+                return
         if pr.ci == "RED":
             self.database.update_job(job_id, state="blocked", last_error="GitHub CI is red")
             self.notifier.send(
@@ -828,6 +831,66 @@ class Controller:
             },
         )
 
+    def _resume_legacy_review_repair(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+    ) -> bool:
+        """Recover revision-21 launcher clobbering without trusting partial work."""
+        if job.get("state") not in {"blocked", "quarantined"} or pr.ci != "GREEN":
+            return False
+        if int(job.get("repair_attempts") or 0) >= self.config.superset.review_repair_max_attempts:
+            return False
+        workspace_id = str(job.get("workspace_id") or "")
+        if not workspace_id:
+            return False
+        details = self.superset.workspace_details(workspace_id)
+        self.database.observe("superset", f"workspace:{workspace_id}", details)
+        worktree = self._workspace_path(details)
+        if worktree is None:
+            return False
+        launch_status = self._load_launch_status(worktree)
+        result = self._load_result(worktree / WORKER_RESULT)
+        attempt = int(job.get("repair_attempts") or 0)
+        legacy_clobber = bool(
+            launch_status
+            and str(launch_status.get("status") or "") == "failed"
+            and int(launch_status.get("revision") or 0) < LAUNCH_REVISION
+            and str(launch_status.get("reason") or "")
+            == "scoped launcher could not start a Python 3.11+ security runtime"
+            and not launch_status.get("head_sha")
+            and not launch_status.get("attempt")
+        )
+        result_bound = bool(
+            result
+            and str(result.get("status") or "") == "retrying"
+            and str(result.get("head_sha") or "") == pr.head_sha
+            and str(result.get("handoff_token") or "") == str(job.get("repair_token") or "")
+            and type(result.get("attempt")) is int
+            and result["attempt"] == attempt
+        )
+        if not legacy_clobber or not result_bound:
+            return False
+        if not self._uncommitted_workspace_paths(worktree):
+            return False
+        findings = self.github.review_feedback(
+            pr.number,
+            pr.head_sha,
+            not_before=job.get("review_requested_at"),
+        )
+        return self._resume_review_repair(
+            issue,
+            plan,
+            job,
+            pr,
+            details,
+            worktree,
+            str((findings or {}).get("body") or "Independent review failed without a findings body."),
+            "recovering safely scoped partial work from the revision-21 launcher marker bug",
+        )
+
     def _reconcile_review_repair(
         self,
         issue: dict[str, Any],
@@ -918,12 +981,36 @@ class Controller:
             return
         launch_error = self._launch_status_error(launch_status)
         if launch_error:
-            self.database.update_job(job["job_id"], state="blocked", last_error=launch_error)
-            self.notifier.send(
-                f"job:{job['job_id']}:repair-exited:{pr.head_sha}:{attempt}",
-                f"Alfred #{issue['number']} PR #{pr.number} scoped repair attempt {attempt} stopped: {launch_error}",
-                {"job": job["job_id"], "pr": pr.url, "attempt": attempt},
-            )
+            if (
+                result_bound
+                and str(result.get("status") or "") == "retrying"
+                and attempt < self.config.superset.review_repair_max_attempts
+            ):
+                findings = self.github.review_feedback(
+                    pr.number,
+                    pr.head_sha,
+                    not_before=job.get("review_requested_at"),
+                )
+                self._resume_review_repair(
+                    issue,
+                    plan,
+                    job,
+                    pr,
+                    details,
+                    worktree,
+                    str(
+                        (findings or {}).get("body")
+                        or "Independent review failed without a findings body."
+                    ),
+                    launch_error,
+                )
+            else:
+                self.database.update_job(job["job_id"], state="blocked", last_error=launch_error)
+                self.notifier.send(
+                    f"job:{job['job_id']}:repair-exited:{pr.head_sha}:{attempt}",
+                    f"Alfred #{issue['number']} PR #{pr.number} scoped repair attempt {attempt} stopped: {launch_error}",
+                    {"job": job["job_id"], "pr": pr.url, "attempt": attempt},
+                )
             return
         if self._launch_status_timed_out(
             job,
@@ -938,6 +1025,155 @@ class Controller:
             )
             return
         self.database.update_job(job["job_id"], state="repairing", last_error=None)
+
+    def _resume_review_repair(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+        workspace: dict[str, Any],
+        worktree: Path,
+        findings: str,
+        reason: str,
+    ) -> bool:
+        scope_error = self._worker_workspace_error(
+            issue,
+            plan,
+            job,
+            workspace,
+            expected_head=pr.head_sha,
+        )
+        if scope_error:
+            self._quarantine_worker(issue, plan, job, scope_error)
+            return True
+        staged = run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=worktree,
+            timeout=30,
+        ).splitlines()
+        if staged:
+            self._quarantine_worker(
+                issue,
+                plan,
+                job,
+                "repair agent modified the Git index before a bounded resume",
+            )
+            return True
+        maximum = self.config.superset.review_repair_max_attempts
+        previous_attempt = int(job.get("repair_attempts") or 0)
+        if previous_attempt >= maximum:
+            error = (
+                f"scoped review repair stopped after {previous_attempt} bounded attempt(s): "
+                f"{reason}"
+            )
+            self.database.update_job(job["job_id"], state="blocked", last_error=error[:1000])
+            return True
+        if not self.database.acquire_lane(job["lane"], job["job_id"]):
+            self.database.update_job(
+                job["job_id"],
+                state="blocked",
+                last_error="cannot reacquire the approved lane for review repair resume",
+            )
+            return True
+
+        attempt = previous_attempt + 1
+        token = secrets.token_hex(24)
+        started_at = utcnow()
+        job = self.database.update_job(
+            job["job_id"],
+            state="repairing",
+            repair_attempts=attempt,
+            repair_sha=pr.head_sha,
+            repair_requested_at=started_at,
+            repair_token=token,
+            repair_agent_id=None,
+            last_error=None,
+        )
+        self._write_json_control(worktree / ".lane", self._worker_lane_manifest(issue, job))
+        self._write_json_control(
+            worktree / WORKER_RESULT,
+            {
+                "status": "retrying",
+                "revision": LAUNCH_REVISION,
+                "head_sha": pr.head_sha,
+                "handoff_token": token,
+                "attempt": attempt,
+                "reason": reason[:500],
+            },
+        )
+        write_launch_status(
+            worktree,
+            "retrying",
+            provider="controller-review-repair-resume",
+            role="worker",
+            controller_job=job["job_id"],
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=attempt,
+            reason=reason[:500],
+            started_at=started_at,
+        )
+        try:
+            agent_id = self.superset.start_agent(
+                str(job["workspace_id"]),
+                self.config.superset.worker_agent,
+                self.repair_prompt(
+                    issue,
+                    plan,
+                    job,
+                    pr,
+                    findings,
+                    continuing=True,
+                ),
+            )
+        except Exception as exc:
+            error = f"scoped review repair resume failed: {exc}"
+            self._write_json_control(
+                worktree / WORKER_RESULT,
+                {
+                    "status": "blocked",
+                    "reason": error[:1000],
+                    "head_sha": pr.head_sha,
+                    "handoff_token": token,
+                    "attempt": attempt,
+                },
+            )
+            write_launch_status(
+                worktree,
+                "failed",
+                provider="controller-review-repair-resume",
+                role="worker",
+                controller_job=job["job_id"],
+                mode="repair",
+                head_sha=pr.head_sha,
+                attempt=attempt,
+                exit_code=78,
+                reason=error[:500],
+                started_at=started_at,
+                finished_at=utcnow(),
+            )
+            self.database.update_job(job["job_id"], state="blocked", last_error=error)
+            return True
+        self.database.update_job(
+            job["job_id"],
+            state="repairing",
+            repair_agent_id=agent_id,
+            last_error=None,
+        )
+        self.notifier.send(
+            f"job:{job['job_id']}:repair-resumed:{pr.head_sha}:{attempt}",
+            f"Alfred #{issue['number']} PR #{pr.number} resumed safely scoped repair attempt {attempt}/{maximum} after its prior agent stopped.",
+            {
+                "job": job["job_id"],
+                "pr": pr.url,
+                "sha": pr.head_sha,
+                "workspace": job.get("workspace_id"),
+                "attempt": attempt,
+                "reason": reason[:500],
+            },
+        )
+        return True
 
     def _finalize_review_repair(
         self,
@@ -1770,6 +2006,8 @@ Never merge, close, delete, reset, force-push, change another lane, use browser/
         job: dict[str, Any],
         pr: PullRequestObservation,
         findings: str,
+        *,
+        continuing: bool = False,
     ) -> str:
         planned_job = self._planned_job(plan, job["job_id"])
         acceptance = "\n".join(
@@ -1778,11 +2016,18 @@ Never merge, close, delete, reset, force-push, change another lane, use browser/
         token = str(job.get("repair_token") or "")
         attempt = int(job.get("repair_attempts") or 0)
         maximum = self.config.superset.review_repair_max_attempts
+        continuation = (
+            "A prior scoped agent stopped before handoff and may have left partial in-scope edits. "
+            "Treat them as untrusted: inspect the complete diff, keep only changes you independently "
+            "validate, and finish the repair without reverting or escaping the approved lane.\n\n"
+            if continuing
+            else ""
+        )
         return f"""Repair only controller job {job['job_id']} for GitHub issue #{issue['number']} on the existing PR #{pr.number}.
 
 This is bounded repair attempt {attempt}/{maximum} for exact head SHA {pr.head_sha}. The approved plan, lane, paths, and acceptance criteria have not changed. The controller has kept the original Superset worktree and wrote a repair-bound .lane manifest. Read .lane before acting.
 
-Allowed write scope: {json.dumps(job['paths'])}
+{continuation}Allowed write scope: {json.dumps(job['paths'])}
 Required verification: {job['verify_command']}
 
 Approved acceptance evidence:
