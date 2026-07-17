@@ -1323,9 +1323,21 @@ Never merge, close, delete, reset, force-push, change another lane, use browser/
         job: dict[str, Any],
         pr: PullRequestObservation,
     ) -> str:
+        planned_job = self._planned_job(plan, job["job_id"])
+        acceptance = "\n".join(
+            f"- {item}" for item in planned_job.get("acceptance", [])
+        )
+        contracts = job.get("contracts") or {}
         return f"""Independently review PR #{pr.number} for issue #{issue['number']} at exact head SHA {pr.head_sha}.
 
-Do not modify code. Verify the live diff, lane scope {json.dumps(job['paths'])}, contracts, acceptance criteria, and actual CI. Run the lane verification command `{job['verify_command']}` plus any focused tests needed to detect regressions. Documentation and PR prose are claims, not evidence.
+Issue title: {issue['title']}
+Approved lane scope: {json.dumps(job['paths'])}
+Contracts to verify: {json.dumps(contracts.get('read', []))}
+
+Approved acceptance evidence:
+{acceptance or '- Satisfy the approved job within its bounded lane scope and prove it with real tests.'}
+
+Do not modify code. Verify the live diff, contracts, approved acceptance evidence, and actual CI from the pinned checkout. Run the lane verification command `{job['verify_command']}` plus any focused tests needed to detect regressions. Documentation and PR prose are claims, not evidence. The review sandbox is intentionally offline; do not try GitHub, web, browser, or other external-control tools.
 
 Do not modify code, Git metadata, or GitHub. When finished, write `{REVIEW_RESULT}` as one JSON object containing `head_sha` exactly `{pr.head_sha}`, `verdict` set to `pass` only if this exact SHA is production-ready (otherwise `fail`), and a concise `findings` string with evidence. Then stop. The trusted controller reruns the enforced verification and posts the review marker to GitHub itself.
 

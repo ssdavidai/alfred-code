@@ -264,6 +264,32 @@ class ControllerTests(unittest.TestCase):
             str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
         )
 
+    def test_reviewer_prompt_embeds_approved_offline_evidence(self):
+        job = {
+            "job_id": "api-12",
+            "paths": ["file.txt"],
+            "verify_command": "true",
+            "contracts": {"read": ["CONTRACT.md"]},
+        }
+        pr = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            "b" * 40,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            "lane-1/12-api",
+        )
+
+        prompt = self.controller.reviewer_prompt(self.issue, self.plan, job, pr)
+
+        self.assertIn("Issue title: Feature", prompt)
+        self.assertIn("- works", prompt)
+        self.assertIn('Contracts to verify: ["CONTRACT.md"]', prompt)
+        self.assertIn("review sandbox is intentionally offline", prompt)
+
     def tearDown(self):
         self.db.close()
         self.temp.cleanup()
