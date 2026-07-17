@@ -61,7 +61,7 @@ class Controller:
             "PATH": node22 + (os.pathsep + path if path else ""),
             "npm_config_scripts_prepend_node_path": "false",
             "npm_config_script_shell": str(
-                Path.home() / ".claude/bin/alfred-code-npm-shell"
+                (Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()
             ),
         }
 

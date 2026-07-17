@@ -28,6 +28,7 @@ class InstallationTests(unittest.TestCase):
         self.assertNotIn('"revision":3', launcher)
         self.assertIn("node_modules/.bin", npm_shell)
         self.assertIn("! -d", npm_shell)
+        self.assertIn('/opt/homebrew/opt/node@22/bin', npm_shell)
         installer = (root / "install-controller.sh").read_text()
         self.assertIn('ln -sf "$ROOT/bin/alfred-code-npm-shell"', installer)
 

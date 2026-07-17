@@ -17,6 +17,14 @@ for entry in "${path_entries[@]}"; do
   fi
   clean_path+="$entry"
 done
+
+# Login shells used by provider harnesses may restore Homebrew default Node
+# ahead of the controller-pinned runtime. Reassert the repository CI major at
+# the final npm lifecycle boundary, after npm has added its package .bin paths.
+node22_bin="/opt/homebrew/opt/node@22/bin"
+if [[ -d "$node22_bin" && ":$clean_path:" != *":$node22_bin:"* ]]; then
+  clean_path="$node22_bin${clean_path:+:$clean_path}"
+fi
 export PATH="$clean_path"
 
 exec /bin/bash "$@"

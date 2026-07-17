@@ -18,7 +18,7 @@ from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 18
+LAUNCH_REVISION = 19
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
@@ -261,6 +261,12 @@ def _trusted_toolchain_paths() -> tuple[Path, ...]:
     return tuple(path.resolve() for path in candidates if path.exists())
 
 
+def _npm_shell_path() -> Path:
+    # Resolve the installed symlink so a deny-by-default home policy can grant
+    # the exact executable target without exposing the rest of ~/.claude/bin.
+    return (Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()
+
+
 def _toolchain_path_value(paths: tuple[Path, ...]) -> str:
     executable_dirs = [
         path if path.is_dir() else path.parent
@@ -416,7 +422,7 @@ def codex_profile(
     writes.append(WORKER_RESULT if manifest.role == "worker" else REVIEW_RESULT)
     verification_writes = _verification_write_paths(manifest)
     base_toolchains = _trusted_toolchain_paths() if toolchain_paths is None else toolchain_paths
-    npm_shell = Path.home() / ".claude/bin/alfred-code-npm-shell"
+    npm_shell = _npm_shell_path()
     toolchains = tuple(dict.fromkeys((*base_toolchains, npm_shell)))
     git_paths = _git_metadata_paths(manifest.workspace) if git_metadata_paths is None else git_metadata_paths
     dependency_paths = _verification_dependency_paths(manifest)
@@ -478,7 +484,7 @@ def codex_profile(
             'GIT_CONFIG_KEY_0 = "core.excludesFile"',
             'GIT_CONFIG_VALUE_0 = "/dev/null"',
             'npm_config_scripts_prepend_node_path = "false"',
-            f"npm_config_script_shell = {_toml_key(str(Path.home() / '.claude/bin/alfred-code-npm-shell'))}",
+            f"npm_config_script_shell = {_toml_key(str(npm_shell))}",
             "",
             "[[hooks.PreToolUse]]",
             'matcher = ".*"',
@@ -642,7 +648,7 @@ def claude_settings(manifest: LaneManifest, guard: Path) -> dict[str, Any]:
                         (
                             manifest.workspace,
                             *_verification_dependency_paths(manifest),
-                            Path.home() / ".claude/bin/alfred-code-npm-shell",
+                            _npm_shell_path(),
                         )
                     )
                 ],
@@ -852,9 +858,9 @@ def launch(provider: str, arguments: list[str]) -> int:
     env["ALFRED_CODE_AGENT_ROLE"] = manifest.role
     env["PATH"] = _toolchain_path_value(_trusted_toolchain_paths())
     env["npm_config_scripts_prepend_node_path"] = "false"
-    env["npm_config_script_shell"] = str(Path.home() / ".claude/bin/alfred-code-npm-shell")
+    env["npm_config_script_shell"] = str(_npm_shell_path())
     try:
-        npm_shell = Path.home() / ".claude/bin/alfred-code-npm-shell"
+        npm_shell = _npm_shell_path()
         if not npm_shell.is_file() or not os.access(npm_shell, os.X_OK):
             raise AgentSecurityError(f"required npm verification shell is unavailable: {npm_shell}")
         prepare_dependency_overlay(manifest)

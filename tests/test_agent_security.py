@@ -117,7 +117,7 @@ class AgentSecurityTests(unittest.TestCase):
         )
         self.assertEqual(
             parsed["shell_environment_policy"]["set"]["npm_config_script_shell"],
-            str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
+            str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
         )
         self.assertEqual(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -190,7 +190,10 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(settings["sandbox"]["filesystem"]["denyRead"], ["~/"])
         self.assertEqual(
             settings["sandbox"]["filesystem"]["allowRead"],
-            [str(self.workspace), str(Path.home() / ".claude/bin/alfred-code-npm-shell")],
+            [
+                str(self.workspace),
+                str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
+            ],
         )
         self.assertTrue(settings["sandbox"]["failIfUnavailable"])
         self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
@@ -206,7 +209,7 @@ class AgentSecurityTests(unittest.TestCase):
             [
                 str(self.workspace),
                 str(target.resolve()),
-                str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
+                str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
             ],
         )
 

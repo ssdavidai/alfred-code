@@ -261,7 +261,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(environment["npm_config_scripts_prepend_node_path"], "false")
         self.assertEqual(
             environment["npm_config_script_shell"],
-            str(Path.home() / ".claude/bin/alfred-code-npm-shell"),
+            str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
         )
 
     def test_reviewer_prompt_embeds_approved_offline_evidence(self):
