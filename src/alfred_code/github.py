@@ -171,9 +171,12 @@ class GitHubClient:
         ).strip()
 
     def post_pr_comment(self, number: int, body: str) -> str:
-        return self._run(
+        result = self._run(
             ["pr", "comment", str(number), "--repo", self.config.repo, "--body", body]
         ).strip()
+        self._pr_comments.pop(number, None)
+        self._issue_comments.pop(number, None)
+        return result
 
     def ensure_label(self, name: str, color: str, description: str) -> None:
         try:

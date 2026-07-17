@@ -59,6 +59,26 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(client.issue(7)["title"], "fresh")
         self.assertEqual(len(calls), 3)
 
+    def test_posting_pr_comment_invalidates_same_cycle_comment_cache(self):
+        client = GitHubClient(
+            GitHubConfig(
+                repo="owner/repo",
+                owner="owner",
+                approval_command="/approve-plan",
+                approvers=("owner",),
+                reviewers=("owner",),
+            )
+        )
+        client._pr_comments[5] = [{"id": 1, "body": "old"}]
+        client._issue_comments[5] = [{"id": 1, "body": "old"}]
+        client._run = lambda arguments, timeout=120: "https://example/comment"
+
+        result = client.post_pr_comment(5, "new")
+
+        self.assertEqual(result, "https://example/comment")
+        self.assertNotIn(5, client._pr_comments)
+        self.assertNotIn(5, client._issue_comments)
+
     def test_approval_must_be_full_exact_and_from_allowlist(self):
         client = FakeGitHub()
         digest = "a" * 64
