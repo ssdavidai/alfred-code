@@ -602,6 +602,17 @@ class Database:
             result.append(item)
         return result
 
+    def latest_event(self, issue_number: int, kind: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM events WHERE issue_number = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (issue_number, kind),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["detail"] = json.loads(item.pop("detail_json"))
+        return item
+
     def claim_notification(self, dedupe_key: str, channel: str, payload: dict[str, Any]) -> bool:
         now = utcnow()
         with self.transaction() as conn:
