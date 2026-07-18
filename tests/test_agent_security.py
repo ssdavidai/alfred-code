@@ -192,8 +192,6 @@ class AgentSecurityTests(unittest.TestCase):
         (package_root / "package.json").write_text(
             json.dumps({"dependencies": {"tsx": "1.0.0"}, "devDependencies": {"esbuild": "1.0.0"}})
         )
-        broken = package_root / "node_modules"
-        broken.symlink_to(broken, target_is_directory=True)
 
         source_checkout = self.workspace.parent / f"{self.workspace.name}-source"
         source_git = source_checkout / ".git"

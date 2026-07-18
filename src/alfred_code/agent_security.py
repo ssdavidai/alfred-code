@@ -450,7 +450,9 @@ def prepare_dependency_overlay(manifest: LaneManifest) -> Path | None:
             continue
         package_root = manifest.workspace / root
         local_modules = package_root / "node_modules"
-        if not local_modules.is_symlink() or local_modules.exists():
+        if os.path.lexists(local_modules) and (
+            not local_modules.is_symlink() or local_modules.exists()
+        ):
             continue
         candidates = _dependency_candidates(manifest, package_root)
         if not candidates:
