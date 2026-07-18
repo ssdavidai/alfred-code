@@ -50,6 +50,7 @@ class FakeGitHub:
         self.pr_calls = []
         self.closed_issues = []
         self.reopened_issues = []
+        self.updated_pr_bodies = []
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -76,6 +77,12 @@ class FakeGitHub:
     def reopen_issue(self, number):
         self.reopened_issues.append(number)
         self.issue_value["state"] = "OPEN"
+
+    def update_pr_body(self, number, body):
+        self.updated_pr_bodies.append((number, body))
+        for branch, pr in list(self.prs.items()):
+            if pr and pr.number == number:
+                self.prs[branch] = replace(pr, body=body)
 
     def post_plan(self, issue_number, plan, plan_hash):
         self.plans.append(plan_hash)
@@ -1242,8 +1249,53 @@ class ControllerTests(unittest.TestCase):
         result = self.controller.run_once()
 
         self.assertEqual(self.github.reopened_issues, [12])
+        self.assertEqual(self.github.updated_pr_bodies[0][0], 5)
+        self.assertTrue(self.github.updated_pr_bodies[0][1].startswith("Part of #12\n"))
         self.assertEqual(self.github.issue_value["state"], "OPEN")
         self.assertEqual(self.db.get_job("api-12")["state"], "merged")
+        self.assertEqual(self.db.get_job("web-12")["state"], "waiting_dependency")
+        self.assertEqual(result["issues"][0]["state"], "building")
+
+    def test_recovery_retries_a_github_reclose_from_the_pre_neutralization_release(self):
+        self.add_dependent_job()
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "MERGED",
+            "b" * 40,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "Closes #12\n\nController job: `api-12` · lane `I`",
+            "2026-07-17T20:16:35Z",
+        )
+        self.db.update_job("api-12", state="merged")
+        self.db.update_job(
+            "web-12",
+            state="closed",
+            last_error=(
+                "GitHub issue or PR closed without merge "
+                "(automatic multi-job close recovery not applicable)"
+            ),
+        )
+        self.db.event("issue.premature_close_recovered", {}, issue_number=12)
+        recovered_at = self.db.latest_event(12, "issue.premature_close_recovered")["created_at"]
+        self.github.issue_value["state"] = "CLOSED"
+        self.github.issue_value["updatedAt"] = recovered_at
+        self.db.upsert_issue(self.github.issue_value)
+        self.db.set_issue_state(12, "closed")
+
+        result = self.controller.run_once()
+
+        self.assertEqual(self.github.reopened_issues, [12])
+        self.assertEqual(self.github.updated_pr_bodies[0][0], 5)
+        self.assertNotIn("Closes #12", self.github.updated_pr_bodies[0][1])
         self.assertEqual(self.db.get_job("web-12")["state"], "waiting_dependency")
         self.assertEqual(result["issues"][0]["state"], "building")
 

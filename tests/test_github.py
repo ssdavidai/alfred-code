@@ -104,6 +104,16 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(calls[-1], ["issue", "reopen", "7", "--repo", "owner/repo"])
         self.assertNotIn(7, client._issues)
 
+        client._pull_requests["lane-1/7-api"] = None
+        client._pr_comments[8] = [{"id": 2}]
+        client.update_pr_body(8, "Part of #7")
+        self.assertEqual(
+            calls[-1],
+            ["pr", "edit", "8", "--repo", "owner/repo", "--body", "Part of #7"],
+        )
+        self.assertEqual(client._pull_requests, {})
+        self.assertNotIn(8, client._pr_comments)
+
     def test_approval_must_be_full_exact_and_from_allowlist(self):
         client = FakeGitHub()
         digest = "a" * 64

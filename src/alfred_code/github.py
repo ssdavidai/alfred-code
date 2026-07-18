@@ -173,6 +173,13 @@ class GitHubClient:
         self._issues.pop(number, None)
         self._issue_comments.pop(number, None)
 
+    def update_pr_body(self, number: int, body: str) -> None:
+        self._run(
+            ["pr", "edit", str(number), "--repo", self.config.repo, "--body", body]
+        )
+        self._pull_requests.clear()
+        self._pr_comments.pop(number, None)
+
     def create_pr(self, *, branch: str, title: str, body: str, base: str = "main") -> str:
         return self._run(
             [

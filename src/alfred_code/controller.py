@@ -348,9 +348,20 @@ class Controller:
             return False
         if any(job["state"] not in TERMINAL_JOB_STATES for job in jobs):
             return True
-        return any(
+        if any(
             str(job.get("last_error") or "") == "GitHub issue or PR closed without merge"
             for job in jobs
+        ):
+            return True
+        recovered = self.database.latest_event(
+            issue_number, "issue.premature_close_recovered"
+        )
+        neutralized = self.database.latest_event(
+            issue_number, "issue.auto_close_link_neutralized"
+        )
+        return bool(
+            recovered
+            and (neutralized is None or int(neutralized["id"]) > int(recovered["id"]))
         )
 
     @staticmethod
@@ -384,17 +395,53 @@ class Controller:
             return False
 
         issue_updated_at = str(issue.get("updatedAt") or "")
-        generated_auto_close = any(
-            pr
+        previous_recovery = self.database.latest_event(
+            int(issue["number"]), "issue.premature_close_recovered"
+        )
+        neutralized = self.database.latest_event(
+            int(issue["number"]), "issue.auto_close_link_neutralized"
+        )
+        immediate_reclose = bool(
+            previous_recovery
+            and self._timestamps_are_near(
+                issue_updated_at, str(previous_recovery.get("created_at") or "")
+            )
+        )
+        pending_neutralized_recovery = bool(
+            immediate_reclose
+            and neutralized
+            and previous_recovery
+            and int(neutralized["id"]) > int(previous_recovery["id"])
+        )
+        closing_prs = [
+            (job, pr)
+            for job, pr in observations
+            if pr
             and pr.merged
             and f"Closes #{issue['number']}" in {line.strip() for line in pr.body.splitlines()}
             and f"Controller job: `{job['job_id']}` · lane `{job['lane']}`" in pr.body
-            and self._timestamps_are_near(issue_updated_at, pr.merged_at)
-            for job, pr in observations
-        )
-        if not generated_auto_close:
+            and (
+                self._timestamps_are_near(issue_updated_at, pr.merged_at)
+                or immediate_reclose
+            )
+        ]
+        if not closing_prs and not pending_neutralized_recovery:
             return False
 
+        neutralized_prs: list[int] = []
+        for _, pr in closing_prs:
+            if pr is None:
+                continue
+            close_text = f"Closes #{issue['number']}"
+            body = pr.body.replace(close_text, f"Part of #{issue['number']}", 1)
+            self.github.update_pr_body(pr.number, body)
+            neutralized_prs.append(pr.number)
+        if neutralized_prs:
+            self.database.event(
+                "issue.auto_close_link_neutralized",
+                {"pull_requests": neutralized_prs, "closed_at": issue_updated_at},
+                issue_number=int(issue["number"]),
+            )
         self.github.reopen_issue(int(issue["number"]))
         for job, pr in observations:
             if pr and pr.merged:
