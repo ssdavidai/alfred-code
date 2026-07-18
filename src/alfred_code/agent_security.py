@@ -416,7 +416,12 @@ def _dependency_candidates(manifest: LaneManifest, package_root: Path) -> tuple[
         except OSError:
             siblings = ()
         for sibling in siblings:
-            if sibling == source_checkout or not (sibling / ".git").exists():
+            if sibling == source_checkout:
+                continue
+            try:
+                if not (sibling / ".git").exists():
+                    continue
+            except OSError:
                 continue
             if _normalized_git_origin(_git_origin_url(sibling)) != source_origin:
                 continue
