@@ -26,6 +26,7 @@ from alfred_code.agent_security import (
     main,
     path_allowed,
     prepare_dependency_overlay,
+    runtime_cache_environment,
     validate_provider_arguments,
 )
 from alfred_code.config import load_config
@@ -117,6 +118,7 @@ class AgentSecurityTests(unittest.TestCase):
             "read",
         )
         self.assertEqual(filesystem["packages/learn/dist"], "write")
+        self.assertNotIn("packages/learn/.cache", filesystem)
         self.assertEqual(parsed["shell_environment_policy"]["inherit"], "core")
         self.assertFalse(parsed["shell_environment_policy"]["ignore_default_excludes"])
         self.assertTrue(parsed["shell_environment_policy"]["set"]["PYTHONDONTWRITEBYTECODE"])
@@ -129,6 +131,18 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(
             parsed["shell_environment_policy"]["set"]["npm_config_script_shell"],
             str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
+        )
+        cache_environment = runtime_cache_environment(self.manifest)
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["npm_config_cache"],
+            cache_environment["npm_config_cache"],
+        )
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["XDG_CACHE_HOME"],
+            cache_environment["XDG_CACHE_HOME"],
+        )
+        self.assertFalse(
+            Path(cache_environment["npm_config_cache"]).is_relative_to(self.workspace)
         )
         self.assertEqual(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -291,6 +305,33 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(marker["status"], "exited")
         self.assertEqual(marker["exit_code"], 70)
         self.assertEqual(marker["controller_job"], "learn-299")
+
+    def test_launch_redirects_tool_caches_outside_the_lane_workspace(self):
+        self.prepare_fake_codex_runtime()
+        runtime_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime_temp.cleanup)
+        captured_environment = {}
+
+        def capture_launch(command, cwd, env):
+            captured_environment.update(env)
+            return 0
+
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security.tempfile.gettempdir", return_value=runtime_temp.name),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", side_effect=capture_launch),
+        ):
+            launch("codex", [])
+
+        for name in ("XDG_CACHE_HOME", "npm_config_cache"):
+            cache_path = Path(captured_environment[name])
+            self.assertTrue(cache_path.is_dir())
+            self.assertTrue(cache_path.is_relative_to(Path(runtime_temp.name)))
+            self.assertFalse(cache_path.is_relative_to(self.workspace))
 
     def test_repair_launch_overwrites_stale_result_and_requires_exact_binding(self):
         lane = json.loads((self.workspace / ".lane").read_text())

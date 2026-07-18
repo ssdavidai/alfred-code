@@ -9,6 +9,7 @@ import select
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 import time
 from dataclasses import dataclass
@@ -322,12 +323,22 @@ def _verification_roots(manifest: LaneManifest) -> tuple[str, ...]:
 
 def _verification_write_paths(manifest: LaneManifest) -> tuple[str, ...]:
     roots = _verification_roots(manifest)
-    outputs = (".pytest_cache", ".cache", "coverage", "dist", "build", ".next", "node_modules/.cache")
+    outputs = (".pytest_cache", "coverage", "dist", "build", ".next", "node_modules/.cache")
     return tuple(
         (Path(root) / output).as_posix()
         for root in sorted(roots)
         for output in outputs
     )
+
+
+def runtime_cache_environment(manifest: LaneManifest) -> dict[str, str]:
+    """Keep disposable tool caches outside the Git-controlled lane workspace."""
+    safe_job = re.sub(r"[^A-Za-z0-9_.-]", "-", manifest.controller_job)[:80] or "job"
+    root = Path(tempfile.gettempdir()) / "alfred-code-agent-cache" / f"{manifest.issue}-{safe_job}"
+    return {
+        "XDG_CACHE_HOME": str(root / "xdg"),
+        "npm_config_cache": str(root / "npm"),
+    }
 
 
 def _verification_dependency_paths(manifest: LaneManifest) -> tuple[Path, ...]:
@@ -459,6 +470,7 @@ def codex_profile(
     toolchains = tuple(dict.fromkeys((*base_toolchains, npm_shell)))
     git_paths = _git_metadata_paths(manifest.workspace) if git_metadata_paths is None else git_metadata_paths
     dependency_paths = _verification_dependency_paths(manifest)
+    cache_environment = runtime_cache_environment(manifest)
     lines = [
         'default_permissions = "alfred_scoped"',
         'approval_policy = "never"',
@@ -518,6 +530,8 @@ def codex_profile(
             'GIT_CONFIG_VALUE_0 = "/dev/null"',
             'npm_config_scripts_prepend_node_path = "false"',
             f"npm_config_script_shell = {_toml_key(str(npm_shell))}",
+            f"XDG_CACHE_HOME = {_toml_key(cache_environment['XDG_CACHE_HOME'])}",
+            f"npm_config_cache = {_toml_key(cache_environment['npm_config_cache'])}",
             "",
             "[[hooks.PreToolUse]]",
             'matcher = ".*"',
@@ -906,6 +920,12 @@ def launch(provider: str, arguments: list[str]) -> int:
     env["PATH"] = _toolchain_path_value(_trusted_toolchain_paths())
     env["npm_config_scripts_prepend_node_path"] = "false"
     env["npm_config_script_shell"] = str(_npm_shell_path())
+    cache_environment = runtime_cache_environment(manifest)
+    for path in cache_environment.values():
+        target = Path(path)
+        target.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o700)
+    env.update(cache_environment)
     try:
         npm_shell = _npm_shell_path()
         if not npm_shell.is_file() or not os.access(npm_shell, os.X_OK):
