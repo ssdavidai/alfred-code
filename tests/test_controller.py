@@ -48,6 +48,8 @@ class FakeGitHub:
         self.created_prs = []
         self.review_comments = []
         self.pr_calls = []
+        self.closed_issues = []
+        self.reopened_issues = []
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -63,6 +65,17 @@ class FakeGitHub:
 
     def default_branch_sha(self):
         return self.sha
+
+    def refresh_default_branch_sha(self):
+        return self.sha
+
+    def close_issue(self, number):
+        self.closed_issues.append(number)
+        self.issue_value["state"] = "CLOSED"
+
+    def reopen_issue(self, number):
+        self.reopened_issues.append(number)
+        self.issue_value["state"] = "OPEN"
 
     def post_plan(self, issue_number, plan, plan_hash):
         self.plans.append(plan_hash)
@@ -309,6 +322,24 @@ class ControllerTests(unittest.TestCase):
             "created_at": "2026-01-01T00:00:00Z",
         }
 
+    def add_dependent_job(self):
+        self.plan["jobs"].append(
+            {
+                "id": "web-12",
+                "lane": "II",
+                "title": "Web",
+                "branch": "lane-2/12-web",
+                "paths": ["file.txt"],
+                "verify": "true",
+                "contracts_read": [],
+                "contracts_changed": [],
+                "depends_on": ["api-12"],
+                "acceptance": ["uses the API"],
+            }
+        )
+        self.plan_hash = content_hash(self.plan)
+        self.planner.plan_hash = self.plan_hash
+
     def write_worker_lane(self):
         (self.repo / ".lane").write_text(
             json.dumps(
@@ -401,6 +432,30 @@ class ControllerTests(unittest.TestCase):
         self.controller.reconcile_job(issue, self.plan, job)
 
         self.assertEqual(self.github.pr_calls, [])
+
+    def test_dependent_job_records_current_main_as_its_immutable_launch_base(self):
+        self.add_dependent_job()
+        remote = self.root / "dependency-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "file.txt").write_text("merged dependency\n")
+        subprocess.run(["git", "add", "file.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "dependency merged"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=self.repo, check=True, capture_output=True)
+        merged_main = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        self.github.sha = merged_main
+        self.db.upsert_issue(self.issue)
+        self.db.save_plan(12, self.plan_hash, self.plan)
+        self.db.record_approval(12, self.plan_hash, "owner", "1", None, "now")
+        self.db.materialize_jobs(12, self.plan_hash, self.plan)
+
+        child = self.controller._ensure_job_base_sha(self.plan, self.db.get_job("web-12"))
+
+        self.assertEqual(child["base_sha"], merged_main)
+        self.assertEqual(self.db.get_job("api-12")["base_sha"], self.sha)
 
     def test_exact_rejection_blocks_without_materializing_jobs(self):
         self.controller.run_once()
@@ -768,6 +823,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(job["state"], "pr_open")
         self.assertEqual(job["pr_url"], "https://example/pr/new")
         self.assertEqual(self.github.created_prs[0]["branch"], "lane-1/12-api")
+        self.assertTrue(self.github.created_prs[0]["body"].startswith("Closes #12\n"))
         remote_sha = subprocess.run(
             ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/lane-1/12-api"],
             text=True,
@@ -780,6 +836,28 @@ class ControllerTests(unittest.TestCase):
                 ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
             ).stdout.strip(),
         )
+
+    def test_multi_job_pull_request_does_not_close_parent_issue(self):
+        self.add_dependent_job()
+        remote = self.root / "multi-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        subprocess.run(["git", "checkout", job["branch"]], cwd=self.repo, check=True, capture_output=True)
+        self.write_worker_lane()
+        (self.repo / "file.txt").write_text("implemented first lane\n")
+        (self.repo / WORKER_RESULT).write_text(json.dumps({"status": "ready", "summary": "done"}))
+        self.write_launch_status("completed", exit_code=0)
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.get_job("api-12")["state"], "pr_open")
+        self.assertTrue(self.github.created_prs[0]["body"].startswith("Part of #12\n"))
+        self.assertNotIn("Closes #12", self.github.created_prs[0]["body"])
 
     def test_old_exit_194_finalization_retries_ready_in_scope_work_once(self):
         remote = self.root / "remote-retry.git"
@@ -1137,6 +1215,89 @@ class ControllerTests(unittest.TestCase):
         self.controller.run_once()
         self.assertEqual(self.db.get_job("api-12")["state"], "quarantined")
         self.assertEqual(self.db.get_issue(12)["controller_state"], "closed")
+
+    def test_controller_generated_multi_job_auto_close_is_reopened_and_resumed(self):
+        self.add_dependent_job()
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        merged_at = "2026-07-17T20:16:35Z"
+        branch = "lane-1/12-api"
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "MERGED",
+            "b" * 40,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "Closes #12\n\nController job: `api-12` · lane `I`\n\n## Smoke evidence\nreal",
+            merged_at,
+        )
+        self.github.issue_value["state"] = "CLOSED"
+        self.github.issue_value["updatedAt"] = "2026-07-17T20:16:36Z"
+
+        result = self.controller.run_once()
+
+        self.assertEqual(self.github.reopened_issues, [12])
+        self.assertEqual(self.github.issue_value["state"], "OPEN")
+        self.assertEqual(self.db.get_job("api-12")["state"], "merged")
+        self.assertEqual(self.db.get_job("web-12")["state"], "waiting_dependency")
+        self.assertEqual(result["issues"][0]["state"], "building")
+
+    def test_operator_close_is_not_reopened_even_with_an_older_controller_pr(self):
+        self.add_dependent_job()
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "MERGED",
+            "b" * 40,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "Closes #12\n\nController job: `api-12` · lane `I`",
+            "2026-07-17T20:00:00Z",
+        )
+        self.github.issue_value["state"] = "CLOSED"
+        self.github.issue_value["updatedAt"] = "2026-07-17T20:16:36Z"
+
+        result = self.controller.run_once()
+
+        self.assertEqual(self.github.reopened_issues, [])
+        self.assertEqual(result["issues"][0]["state"], "closed")
+        self.assertEqual(self.db.get_job("web-12")["state"], "closed")
+
+    def test_multi_job_issue_closes_only_after_every_job_is_merged(self):
+        self.add_dependent_job()
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        first = "lane-1/12-api"
+        second = "lane-2/12-web"
+        self.github.prs[first] = PullRequestObservation(
+            5, "https://example/pr/5", "MERGED", "a" * 40, "GREEN", "CLEAN", "MERGEABLE", False, first,
+            "Part of #12\n\nController job: `api-12` · lane `I`",
+        )
+        self.db.update_job("web-12", state="running")
+        self.github.prs[second] = PullRequestObservation(
+            6, "https://example/pr/6", "MERGED", "b" * 40, "GREEN", "CLEAN", "MERGEABLE", False, second,
+            "Part of #12\n\nController job: `web-12` · lane `II`",
+        )
+
+        result = self.controller.run_once()
+
+        self.assertEqual(self.github.closed_issues, [12])
+        self.assertEqual(self.github.issue_value["state"], "CLOSED")
+        self.assertEqual(result["issues"][0]["state"], "completed")
+        self.assertEqual(result["issues"][0]["github_state"], "CLOSED")
 
     def test_passing_review_cannot_ready_a_draft(self):
         self.controller.run_once()

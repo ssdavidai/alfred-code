@@ -26,6 +26,7 @@ class PullRequestObservation:
     is_draft: bool
     branch: str
     body: str = ""
+    merged_at: str = ""
 
     @property
     def merged(self) -> bool:
@@ -151,6 +152,26 @@ class GitHubClient:
         ).strip()
         self._issue_comments.pop(number, None)
         return result
+
+    def close_issue(self, number: int) -> None:
+        self._run(
+            [
+                "issue",
+                "close",
+                str(number),
+                "--repo",
+                self.config.repo,
+                "--reason",
+                "completed",
+            ]
+        )
+        self._issues.pop(number, None)
+        self._issue_comments.pop(number, None)
+
+    def reopen_issue(self, number: int) -> None:
+        self._run(["issue", "reopen", str(number), "--repo", self.config.repo])
+        self._issues.pop(number, None)
+        self._issue_comments.pop(number, None)
 
     def create_pr(self, *, branch: str, title: str, body: str, base: str = "main") -> str:
         return self._run(
@@ -357,6 +378,10 @@ class GitHubClient:
         ).strip()
         return self._default_branch_sha
 
+    def refresh_default_branch_sha(self) -> str:
+        self._default_branch_sha = None
+        return self.default_branch_sha()
+
     @staticmethod
     def _ci_state(checks: list[dict[str, Any]]) -> str:
         if not checks:
@@ -389,7 +414,7 @@ class GitHubClient:
                 "--limit",
                 "1",
                 "--json",
-                "number,url,state,headRefOid,headRefName,mergeStateStatus,mergeable,statusCheckRollup,isDraft,body",
+                "number,url,state,headRefOid,headRefName,mergeStateStatus,mergeable,statusCheckRollup,isDraft,body,mergedAt",
             ]
         )
         if not result:
@@ -407,6 +432,7 @@ class GitHubClient:
             is_draft=bool(pr.get("isDraft")),
             branch=str(pr.get("headRefName") or branch),
             body=str(pr.get("body") or ""),
+            merged_at=str(pr.get("mergedAt") or ""),
         )
         self._pull_requests[branch] = observation
         return observation
