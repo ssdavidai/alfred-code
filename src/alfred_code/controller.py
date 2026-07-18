@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_security import (
+    AgentSecurityError,
     LAUNCH_STATUS,
     LAUNCH_STATUS_TEMP,
     LAUNCH_REVISION,
@@ -16,6 +17,9 @@ from .agent_security import (
     RUNTIME_CONTROL_FILES,
     SECURITY_POLICY,
     WORKER_RESULT,
+    LaneManifest,
+    _verification_dependency_paths,
+    runtime_cache_environment,
     write_launch_status,
 )
 from .audit import AuditLog
@@ -55,16 +59,31 @@ class Controller:
         self.audit = audit or AuditLog(config.state_dir / "controller.jsonl")
 
     @staticmethod
-    def _verification_environment() -> dict[str, str]:
+    def _verification_environment(worktree: Path | None = None) -> dict[str, str]:
         path = os.environ.get("PATH", "")
         node22 = "/opt/homebrew/opt/node@22/bin"
-        return {
-            "PATH": node22 + (os.pathsep + path if path else ""),
+        dependency_bins: list[str] = []
+        manifest = None
+        if worktree is not None:
+            try:
+                manifest = LaneManifest.load(worktree)
+                dependency_bins = [
+                    str(candidate / "bin")
+                    for candidate in _verification_dependency_paths(manifest)
+                    if (candidate / "bin").is_dir()
+                ]
+            except (AgentSecurityError, OSError, ValueError):
+                dependency_bins = []
+        values = {
+            "PATH": os.pathsep.join([node22, *dependency_bins, *([path] if path else [])]),
             "npm_config_scripts_prepend_node_path": "false",
             "npm_config_script_shell": str(
                 (Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()
             ),
         }
+        if manifest is not None:
+            values.update(runtime_cache_environment(manifest))
+        return values
 
     def _record(self, kind: str, **detail: Any) -> None:
         self.audit.write(kind, **detail)
@@ -1390,7 +1409,7 @@ class Controller:
             verification = run(
                 ["bash", "-c", job["verify_command"]],
                 cwd=worktree,
-                env=self._verification_environment(),
+                env=self._verification_environment(worktree),
                 timeout=1200,
             )
             scope_error = self._worker_workspace_error(
@@ -1423,7 +1442,7 @@ class Controller:
             run(
                 self._trusted_commit_command(job, commit_message),
                 cwd=worktree,
-                env=self._verification_environment(),
+                env=self._verification_environment(worktree),
                 timeout=1200,
             )
             new_sha = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
@@ -2023,7 +2042,7 @@ class Controller:
             verification = run(
                 ["bash", "-c", job["verify_command"]],
                 cwd=worktree,
-                env=self._verification_environment(),
+                env=self._verification_environment(worktree),
                 timeout=1200,
             )
             scope_error = self._worker_workspace_error(issue, plan, job, workspace)
@@ -2039,7 +2058,7 @@ class Controller:
             run(
                 self._trusted_commit_command(job, commit_message),
                 cwd=worktree,
-                env=self._verification_environment(),
+                env=self._verification_environment(worktree),
                 timeout=1200,
             )
             run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
@@ -2167,7 +2186,7 @@ class Controller:
             verification = run(
                 ["bash", "-c", job["verify_command"]],
                 cwd=worktree,
-                env=self._verification_environment(),
+                env=self._verification_environment(worktree),
                 timeout=1200,
             )
         except (CommandError, OSError) as exc:

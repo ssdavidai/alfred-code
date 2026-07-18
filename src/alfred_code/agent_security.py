@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import fnmatch
+import fcntl
 import hashlib
 import json
 import os
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,8 @@ LAUNCH_REVISION = 22
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
+PYTEST_REQUIREMENT = "pytest==9.1.1"
+PYTEST_ASYNCIO_REQUIREMENT = "pytest-asyncio==1.4.0"
 WORKER_RESULT = ".alfred-code-result.json"
 REVIEW_RESULT = ".alfred-code-review.json"
 WORKER_RESULT_TEMP = ".alfred-code-result.json.tmp"
@@ -462,6 +466,88 @@ def prepare_dependency_overlay(manifest: LaneManifest) -> Path | None:
     return None
 
 
+def _dependency_command(command: list[str], *, timeout: int = 1200) -> None:
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentSecurityError(f"cannot provision scoped Python dependencies: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()[-1000:]
+        raise AgentSecurityError(f"scoped Python dependency provisioning failed: {detail}")
+
+
+def prepare_python_dependency_overlays(
+    manifest: LaneManifest,
+    *,
+    cache_root: Path | None = None,
+    uv_binary: str | None = None,
+) -> tuple[Path, ...]:
+    """Provision requirements-hashed test environments outside the worktree."""
+    cache = cache_root or Path.home() / ".cache/alfred-code-python"
+    uv = uv_binary or shutil.which("uv")
+    if not uv:
+        return ()
+    environments: list[Path] = []
+    for root in _verification_roots(manifest):
+        if root == ".":
+            continue
+        package_root = manifest.workspace / root
+        requirements = package_root / "requirements.txt"
+        if not requirements.is_file():
+            continue
+        local_environment = package_root / ".venv"
+        if os.path.lexists(local_environment):
+            if local_environment.is_symlink() and local_environment.resolve().is_dir():
+                environments.append(local_environment.resolve())
+            continue
+        pytest_config = package_root / "pytest.ini"
+        pytest_config_text = pytest_config.read_text() if pytest_config.is_file() else ""
+        asyncio_enabled = "asyncio_mode" in pytest_config_text
+        digest = hashlib.sha256()
+        digest.update(b"python=3.12\0")
+        digest.update(requirements.read_bytes())
+        digest.update(PYTEST_REQUIREMENT.encode())
+        digest.update(pytest_config_text.encode())
+        if asyncio_enabled:
+            digest.update(PYTEST_ASYNCIO_REQUIREMENT.encode())
+        target = cache / digest.hexdigest()[:20]
+        ready = target / ".alfred-code-ready"
+        cache.mkdir(parents=True, exist_ok=True)
+        lock_path = cache / f"{target.name}.lock"
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if not ready.is_file():
+                if target.exists():
+                    raise AgentSecurityError(
+                        f"incomplete scoped Python environment requires inspection: {target}"
+                    )
+                _dependency_command([uv, "venv", "--python", "3.12", str(target)])
+                python = target / "bin/python"
+                install = [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python),
+                    "-r",
+                    str(requirements),
+                    PYTEST_REQUIREMENT,
+                ]
+                if asyncio_enabled:
+                    install.append(PYTEST_ASYNCIO_REQUIREMENT)
+                _dependency_command(install)
+                ready.write_text(digest.hexdigest() + "\n")
+                ready.chmod(0o600)
+        local_environment.symlink_to(target, target_is_directory=True)
+        environments.append(target.resolve())
+    return tuple(environments)
+
+
 def codex_profile(
     manifest: LaneManifest,
     *,
@@ -478,6 +564,9 @@ def codex_profile(
     toolchains = tuple(dict.fromkeys((*base_toolchains, npm_shell)))
     git_paths = _git_metadata_paths(manifest.workspace) if git_metadata_paths is None else git_metadata_paths
     dependency_paths = _verification_dependency_paths(manifest)
+    dependency_bins = tuple(
+        path / "bin" for path in dependency_paths if (path / "bin").is_dir()
+    )
     cache_environment = runtime_cache_environment(manifest)
     lines = [
         'default_permissions = "alfred_scoped"',
@@ -529,7 +618,7 @@ def codex_profile(
             'exclude = ["AWS_*", "AZURE_*", "GH_*", "GITHUB_*", "SUPERSET_*", "*_KEY", "*_TOKEN", "*_SECRET"]',
             "",
             "[shell_environment_policy.set]",
-            f"PATH = {_toml_key(_toolchain_path_value(toolchains))}",
+            f"PATH = {_toml_key(_toolchain_path_value((*dependency_bins, *toolchains)))}",
             'PYTHONDONTWRITEBYTECODE = "1"',
             'GIT_CONFIG_GLOBAL = "/dev/null"',
             'GIT_CONFIG_NOSYSTEM = "1"',
@@ -939,6 +1028,13 @@ def launch(provider: str, arguments: list[str]) -> int:
         if not npm_shell.is_file() or not os.access(npm_shell, os.X_OK):
             raise AgentSecurityError(f"required npm verification shell is unavailable: {npm_shell}")
         prepare_dependency_overlay(manifest)
+        prepare_python_dependency_overlays(manifest)
+        dependency_bins = tuple(
+            path / "bin"
+            for path in _verification_dependency_paths(manifest)
+            if (path / "bin").is_dir()
+        )
+        env["PATH"] = _toolchain_path_value((*dependency_bins, *_trusted_toolchain_paths()))
         if provider == "codex":
             digest = hashlib.sha256(f"{workspace}:{os.getpid()}".encode()).hexdigest()[:16]
             profile_name = f"alfred-scoped-{digest}"
