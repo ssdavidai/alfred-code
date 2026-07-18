@@ -410,6 +410,7 @@ def _dependency_candidates(manifest: LaneManifest, package_root: Path) -> tuple[
     source_origin = _normalized_git_origin(_git_origin_url(source_checkout)) if source_checkout else ""
     relative_root = package_root.relative_to(manifest.workspace)
     if source_checkout and source_origin:
+        candidates.append(source_checkout / relative_root / "node_modules")
         try:
             siblings = source_checkout.parent.iterdir()
         except OSError:

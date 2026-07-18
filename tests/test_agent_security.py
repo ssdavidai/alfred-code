@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -184,6 +185,36 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(overlay, self.workspace / "node_modules")
         self.assertTrue(overlay.is_symlink())
         self.assertEqual(overlay.resolve(), dependency_target.resolve())
+
+    def test_dependency_overlay_reuses_the_primary_checkout_offline(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"dependencies": {"tsx": "1.0.0"}, "devDependencies": {"esbuild": "1.0.0"}})
+        )
+        broken = package_root / "node_modules"
+        broken.symlink_to(broken, target_is_directory=True)
+
+        source_checkout = self.workspace.parent / f"{self.workspace.name}-source"
+        source_git = source_checkout / ".git"
+        source_modules = source_checkout / "packages/learn/node_modules"
+        source_git.mkdir(parents=True)
+        (source_modules / "tsx").mkdir(parents=True)
+        (source_modules / "esbuild").mkdir()
+        self.addCleanup(shutil.rmtree, source_checkout, True)
+
+        with (
+            patch("alfred_code.agent_security._git_metadata_paths", return_value=(source_git,)),
+            patch(
+                "alfred_code.agent_security._git_origin_url",
+                return_value="https://github.com/ssdavidai/alfred",
+            ),
+            patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": ""}),
+        ):
+            overlay = prepare_dependency_overlay(self.manifest)
+
+        self.assertEqual(overlay, self.workspace / "node_modules")
+        self.assertEqual(overlay.resolve(), source_modules.resolve())
 
     def test_dependency_overlay_never_replaces_an_existing_path(self):
         overlay = self.workspace / "node_modules"
