@@ -745,13 +745,23 @@ class Controller:
                 return
         pr = self.github.pr_for_branch(job["branch"])
         if pr:
+            self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+            job = self.database.update_job(
+                job_id,
+                pr_number=pr.number,
+                pr_url=pr.url,
+                head_sha=pr.head_sha,
+            )
             if (
                 not pr.merged
                 and not pr.closed_unmerged
-                and not self._ensure_existing_job_lane(issue, job)
+                and not self._ensure_existing_job_lane(
+                    issue,
+                    job,
+                    wait=job.get("state") != "repairing",
+                )
             ):
                 return
-            self.database.observe("github", f"pr:{pr.number}", asdict(pr))
             if not job.get("workspace_id"):
                 workspace = self.superset.workspace_by_name(
                     self._worker_workspace_name(int(issue["number"]), job["lane"])
@@ -762,12 +772,6 @@ class Controller:
                         workspace_id=workspace.id,
                         workspace_url=workspace.url,
                     )
-            job = self.database.update_job(
-                job_id,
-                pr_number=pr.number,
-                pr_url=pr.url,
-                head_sha=pr.head_sha,
-            )
             self._reconcile_pr(issue, plan, job, pr)
             return
         if job["state"] in TERMINAL_JOB_STATES and not (
@@ -896,6 +900,8 @@ class Controller:
         self,
         issue: dict[str, Any],
         job: dict[str, Any],
+        *,
+        wait: bool = False,
     ) -> bool:
         """Adopt or heartbeat a durable lane before touching existing work."""
         lane = str(job["lane"])
@@ -904,10 +910,12 @@ class Controller:
             return True
         owner = self.database.lease_owner(lane) or "another active job"
         error = f"lane {lane} is owned by {owner}; existing work cannot resume concurrently"
-        self.database.update_job(job_id, state="blocked", last_error=error)
+        state = "waiting_lane" if wait else "blocked"
+        self.database.update_job(job_id, state=state, last_error=error)
         self.notifier.send(
-            f"job:{job_id}:lane-conflict:{owner}",
-            f"Alfred #{issue['number']} lane {lane} is blocked by concurrent owner {owner}.",
+            f"job:{job_id}:lane-{'waiting' if wait else 'conflict'}:{owner}",
+            f"Alfred #{issue['number']} lane {lane} is "
+            f"{'waiting for' if wait else 'blocked by'} concurrent owner {owner}.",
             {"job": job_id, "lane": lane, "owner": owner},
         )
         return False

@@ -760,6 +760,60 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.get_job("api-12")["state"], "running")
         self.assertEqual(self.db.lease_owner("I"), "api-12")
 
+    def test_open_pr_observation_stays_current_while_its_lane_is_busy(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        self.db.release_lane("api-12")
+
+        issue_13 = {
+            "id": "I_13",
+            "number": 13,
+            "title": "Lane owner",
+            "body": "Hold the lane",
+            "state": "OPEN",
+            "url": "https://example/issues/13",
+            "labels": [{"name": "alfred-code"}],
+        }
+        plan_13 = copy.deepcopy(self.plan)
+        plan_13["issue"] = 13
+        plan_13["issue_body_hash"] = content_hash(issue_13["body"])
+        plan_13["jobs"][0]["id"] = "api-13"
+        plan_13["jobs"][0]["branch"] = "lane-1/13-api"
+        plan_hash_13 = content_hash(plan_13)
+        self.db.upsert_issue(issue_13)
+        self.db.save_plan(13, plan_hash_13, plan_13)
+        self.db.record_approval(13, plan_hash_13, "owner", "13", None, "now")
+        self.db.materialize_jobs(13, plan_hash_13, plan_13)
+        self.assertTrue(self.db.acquire_lane("I", "api-13"))
+
+        branch = "lane-1/12-api"
+        head_sha = "d" * 40
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            head_sha,
+            "PENDING",
+            "BLOCKED",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+
+        self.controller.reconcile_job(
+            self.db.get_issue(12),
+            self.plan,
+            self.db.get_job("api-12"),
+        )
+
+        waiting = self.db.get_job("api-12")
+        self.assertEqual(waiting["state"], "waiting_lane")
+        self.assertEqual(waiting["head_sha"], head_sha)
+        self.assertEqual(waiting["pr_number"], 5)
+        self.assertEqual(self.db.lease_owner("I"), "api-13")
+
     def test_independent_lanes_launch_workers_in_the_same_cycle(self):
         self.plan["jobs"].append(
             {
