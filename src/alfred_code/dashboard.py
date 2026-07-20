@@ -778,6 +778,7 @@ class DashboardData:
 
         runtime = _controller_runtime()
         runtime["max_parallel_planners"] = self.config.max_parallel_planners
+        runtime["auto_replan_max_attempts"] = self.config.auto_replan_max_attempts
         superset_running, superset_pid = _pid_is_running(
             Path("~/.superset/terminal-host.pid").expanduser()
         )

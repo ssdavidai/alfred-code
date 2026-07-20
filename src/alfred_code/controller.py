@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import secrets
@@ -34,11 +35,19 @@ from .planner import Planner, PreparedPlan
 from .plans import path_matches
 from .project import ProjectBoard
 from .states import TERMINAL_JOB_STATES
-from .superset import SupersetClient
-from .util import run, utcnow
+from .superset import SupersetClient, worker_workspace_name
+from .util import content_hash, run, utcnow
 
 
 class Controller:
+    _AUTO_REPLAN_QUIESCENT_STATES = {
+        "merged",
+        "blocked",
+        "queued",
+        "waiting_dependency",
+        "waiting_lane",
+    }
+
     def __init__(
         self,
         config: ControllerConfig,
@@ -263,7 +272,9 @@ class Controller:
                         issue_summaries[number] = self._issue_summary(number)
                         continue
                     try:
-                        self._publish_generated_plan(number, plan, plan_hash)
+                        plan, plan_hash = self._publish_generated_plan(
+                            number, plan, plan_hash
+                        )
                         self._record("planning.completed", issue=number, plan_hash=plan_hash)
                     except Exception as exc:
                         self._record_issue_error(summary, number, exc)
@@ -371,7 +382,7 @@ class Controller:
         """Apply serial plan invalidation rules before model work is scheduled."""
         issue_number = int(issue["number"])
         current = self.database.current_plan(issue_number)
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
 
         if current and current["plan"].get("issue_body_hash") != issue["body_hash"]:
             active = [job for job in jobs if job["state"] not in TERMINAL_JOB_STATES]
@@ -390,6 +401,10 @@ class Controller:
                 return current, jobs, True
             self.database.invalidate_plan(issue_number, "issue body changed")
             current = None
+
+        if current and jobs and self._attempt_auto_replan(issue, current, jobs):
+            current = None
+            jobs = []
 
         if current and not jobs and not self.database.is_approved(current["plan_hash"]):
             if current["status"] == "rejected":
@@ -422,12 +437,211 @@ class Controller:
             self.database.set_issue_state(issue_number, "planning")
         return current, jobs, False
 
+    @staticmethod
+    def _auto_replan_blocker_kind(reason: str) -> str | None:
+        value = " ".join(reason.lower().split())
+        if value == "pr conflicts with its base":
+            return "base_conflict"
+        if (
+            "not in the authoritative .lane allowed list" in value
+            or "not in .lane allowed list" in value
+            or ("requires the controller to add" in value and "write scope" in value)
+        ):
+            return "lane_scope"
+        if (
+            "no contract change is approved" in value
+            or (
+                "contract" in value
+                and "requires" in value
+                and "acceptance requires" in value
+            )
+        ):
+            return "contract_plan"
+        return None
+
+    def _auto_replan_blockers(
+        self,
+        jobs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        if not jobs or any(
+            job["state"] not in self._AUTO_REPLAN_QUIESCENT_STATES for job in jobs
+        ):
+            return None
+        blockers: list[dict[str, Any]] = []
+        for job in jobs:
+            if job["state"] in {"queued", "waiting_dependency", "waiting_lane"} and any(
+                job.get(field)
+                for field in ("workspace_id", "pr_number", "head_sha")
+            ):
+                return None
+            if job["state"] != "blocked":
+                continue
+            reason = str(job.get("last_error") or "")
+            kind = self._auto_replan_blocker_kind(reason)
+            if kind is None:
+                return None
+            blockers.append(
+                {
+                    "job_id": job["job_id"],
+                    "lane": job["lane"],
+                    "kind": kind,
+                    "reason": reason,
+                }
+            )
+        return blockers or None
+
+    @staticmethod
+    def _controller_owns_pr(job: dict[str, Any], pr: PullRequestObservation) -> bool:
+        marker = f"Controller job: `{job['job_id']}` · lane `{job['lane']}`"
+        return bool(
+            marker in pr.body
+            and (job.get("pr_number") is None or int(job["pr_number"]) == pr.number)
+            and (not job.get("head_sha") or str(job["head_sha"]) == pr.head_sha)
+        )
+
+    def _attempt_auto_replan(
+        self,
+        issue: dict[str, Any],
+        current: dict[str, Any],
+        jobs: list[dict[str, Any]],
+    ) -> bool:
+        issue_number = int(issue["number"])
+        plan_hash = str(current["plan_hash"])
+        blockers = self._auto_replan_blockers(jobs)
+        if blockers is None:
+            return False
+        attempts = self.database.event_count(
+            issue_number, "plan.auto_replan_requested"
+        )
+        if attempts >= self.config.auto_replan_max_attempts:
+            self.notifier.send(
+                f"issue:{issue_number}:auto-replan-cap:{plan_hash}",
+                f"Alfred #{issue_number} remains blocked after {attempts} automatic re-plan attempt(s). It now requires operator guidance.",
+                {"issue": issue_number, "plan_hash": plan_hash, "attempts": attempts},
+            )
+            return False
+
+        prepared = self.database.latest_event(
+            issue_number, "plan.auto_replan_prepared"
+        )
+        previously_prepared_prs = {
+            int(number)
+            for number in (
+                (prepared or {}).get("detail", {}).get("pull_requests", [])
+                if (prepared or {}).get("detail", {}).get("plan_hash") == plan_hash
+                else []
+            )
+        }
+        open_prs: list[tuple[dict[str, Any], PullRequestObservation]] = []
+        refreshed_merged = False
+        for job in jobs:
+            if job["state"] == "merged":
+                continue
+            pr = self.github.pr_for_branch(str(job["branch"]))
+            if pr is None:
+                if job.get("pr_number"):
+                    return False
+                continue
+            self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+            if pr.merged:
+                self.database.update_job(
+                    job["job_id"],
+                    state="merged",
+                    pr_number=pr.number,
+                    pr_url=pr.url,
+                    head_sha=pr.head_sha,
+                    review_sha=pr.head_sha,
+                    last_error=None,
+                )
+                refreshed_merged = True
+                continue
+            if pr.closed_unmerged:
+                if pr.number not in previously_prepared_prs:
+                    return False
+                continue
+            if job["state"] != "blocked" or not self._controller_owns_pr(job, pr):
+                return False
+            open_prs.append((job, pr))
+
+        if refreshed_merged:
+            jobs = self.database.list_current_jobs(issue_number)
+            blockers = self._auto_replan_blockers(jobs)
+            if blockers is None:
+                return False
+
+        completed = [
+            {
+                "job_id": job["job_id"],
+                "lane": job["lane"],
+                "pr_number": job.get("pr_number"),
+            }
+            for job in jobs
+            if job["state"] == "merged"
+        ]
+        notice_url = self.github.post_auto_replan(
+            issue_number,
+            plan_hash,
+            blockers,
+            completed,
+        )
+        pr_numbers = sorted(
+            previously_prepared_prs | {pr.number for _, pr in open_prs}
+        )
+        self.database.prepare_auto_replan(
+            issue_number,
+            plan_hash,
+            {"blockers": blockers, "pull_requests": pr_numbers, "notice": notice_url},
+        )
+        for job, pr in open_prs:
+            self.github.close_pr(
+                pr.number,
+                f"Superseded by Alfred Code automatic re-planning of job `{job['job_id']}`. The branch and commits are retained; replacement work requires a fresh plan approval.",
+            )
+        if not self.database.supersede_plan_for_replan(
+            issue_number,
+            plan_hash,
+            reason="recognized execution blockers require a replacement plan",
+            blockers=blockers,
+        ):
+            return False
+        self.notifier.send(
+            f"issue:{issue_number}:auto-replan:{plan_hash}",
+            f"Alfred #{issue_number} automatically retired blocked plan {plan_hash[:12]} and is specifying a replacement. Merged work is preserved and a fresh approval will be required.",
+            {"issue": issue_number, "plan_hash": plan_hash, "notice": notice_url},
+        )
+        return True
+
+    def _version_plan_identities(
+        self,
+        issue_number: int,
+        plan: dict[str, Any],
+        plan_hash: str,
+    ) -> tuple[dict[str, Any], str]:
+        revision = self.database.plan_count(issue_number) + 1
+        if revision <= 1:
+            return plan, plan_hash
+        revised = copy.deepcopy(plan)
+        suffix = f"-r{revision}"
+        identities = {
+            str(job["id"]): f"{job['id']}{suffix}" for job in revised["jobs"]
+        }
+        for job in revised["jobs"]:
+            job["id"] = identities[str(job["id"])]
+            job["branch"] = f"{job['branch']}{suffix}"
+            job["depends_on"] = [identities[item] for item in job.get("depends_on", [])]
+        revised_hash = content_hash(revised)
+        self.planner.revalidate(revised, revised_hash)
+        return revised, revised_hash
+
     def _publish_generated_plan(
         self,
         issue_number: int,
         plan: dict[str, Any],
         plan_hash: str,
-    ) -> None:
+    ) -> tuple[dict[str, Any], str]:
+        plan, plan_hash = self._version_plan_identities(
+            issue_number, plan, plan_hash
+        )
         self.database.save_plan(issue_number, plan_hash, plan)
         plan_url = self.github.post_plan(issue_number, plan, plan_hash)
         issue = self.database.get_issue(issue_number) or {}
@@ -436,6 +650,7 @@ class Controller:
             f"Alfred #{issue_number} is specified in {len(plan['jobs'])} lane job(s). Approve plan {plan_hash[:12]} in GitHub: {plan_url or issue.get('url')}",
             {"issue": issue_number, "plan_hash": plan_hash, "url": plan_url},
         )
+        return plan, plan_hash
 
     def process_issue(
         self,
@@ -446,7 +661,7 @@ class Controller:
         live = self.github.issue(issue_number)
         issue = self.database.upsert_issue(live)
         current = self.database.current_plan(issue_number)
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         if issue["github_state"] == "CLOSED":
             if (
                 self.config.apply
@@ -477,7 +692,9 @@ class Controller:
                 )
                 self._sync_project(issue_number)
                 raise
-            self._publish_generated_plan(issue_number, plan, plan_hash)
+            plan, plan_hash = self._publish_generated_plan(
+                issue_number, plan, plan_hash
+            )
             current = self.database.current_plan(issue_number)
             if current is None:
                 raise RuntimeError("saved plan disappeared")
@@ -531,7 +748,7 @@ class Controller:
                 {"issue": issue_number, "plan_hash": plan_hash},
             )
 
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         if not jobs:
             jobs = self.database.materialize_jobs(issue_number, plan_hash, plan)
         for job in jobs:
@@ -546,7 +763,7 @@ class Controller:
 
     def _closed_issue_needs_recovery_audit(self, issue_number: int) -> bool:
         current = self.database.current_plan(issue_number)
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         if not current or len(current["plan"].get("jobs", [])) <= 1 or len(jobs) <= 1:
             return False
         if any(job["state"] not in TERMINAL_JOB_STATES for job in jobs):
@@ -702,7 +919,7 @@ class Controller:
         return True
 
     def _close_issue(self, issue_number: int, *, recovery_checked: bool = False) -> None:
-        for job in self.database.list_jobs(issue_number):
+        for job in self.database.list_current_jobs(issue_number):
             pr = self.github.pr_for_branch(job["branch"])
             if pr:
                 self.database.observe("github", f"pr:{pr.number}", asdict(pr))
@@ -733,7 +950,7 @@ class Controller:
                     last_error=error,
                 )
             self.database.release_lane(job["job_id"])
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         state = "completed" if jobs and all(job["state"] == "merged" for job in jobs) else "closed"
         self.database.set_issue_state(issue_number, state)
 
@@ -764,7 +981,9 @@ class Controller:
                 return
             if not job.get("workspace_id"):
                 workspace = self.superset.workspace_by_name(
-                    self._worker_workspace_name(int(issue["number"]), job["lane"])
+                    self._worker_workspace_name(
+                        int(issue["number"]), job["lane"], job["job_id"]
+                    )
                 )
                 if workspace and workspace.branch == job["branch"]:
                     job = self.database.update_job(
@@ -865,7 +1084,9 @@ class Controller:
             job = self._ensure_job_base_sha(plan, job)
             base_sha = self._job_base_sha(plan, job)
             self._prepare_branch(job["branch"], base_sha)
-            workspace_name = self._worker_workspace_name(int(issue["number"]), job["lane"])
+            workspace_name = self._worker_workspace_name(
+                int(issue["number"]), job["lane"], job["job_id"]
+            )
             existing = self.superset.workspace_by_name(workspace_name)
             if existing:
                 if existing.branch != job["branch"]:
@@ -2437,8 +2658,13 @@ class Controller:
         self.github.post_pr_comment(pr.number, body)
         return False
 
-    def _worker_workspace_name(self, issue_number: int, lane: str) -> str:
-        return f"{self.config.superset.workspace_prefix}-{issue_number}-{lane.lower()}"
+    def _worker_workspace_name(self, issue_number: int, lane: str, job_id: str) -> str:
+        return worker_workspace_name(
+            self.config.superset.workspace_prefix,
+            issue_number,
+            lane,
+            job_id,
+        )
 
     def _review_workspace_name(self, pr_number: int, head_sha: str) -> str:
         return f"{self.config.superset.workspace_prefix}-review-{pr_number}-{head_sha[:8]}"
@@ -2542,7 +2768,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         return next(item for item in plan["jobs"] if item["id"] == job_id)
 
     def _derive_issue_state(self, issue_number: int) -> str:
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         states = {job["state"] for job in jobs}
         if jobs and states <= {"merged"}:
             state = "completed"
@@ -2563,7 +2789,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
             return
         issue = self.database.get_issue(issue_number)
         current = self.database.current_plan(issue_number)
-        jobs = self.database.list_jobs(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
         if not issue:
             return
         try:
@@ -2603,6 +2829,6 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
                     "workspace": job.get("workspace_id"),
                     "error": job.get("last_error"),
                 }
-                for job in self.database.list_jobs(issue_number)
+                for job in self.database.list_current_jobs(issue_number)
             ],
         }

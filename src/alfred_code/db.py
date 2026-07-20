@@ -338,6 +338,95 @@ class Database:
                 connection=conn,
             )
 
+    def prepare_auto_replan(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        detail: dict[str, Any],
+    ) -> None:
+        """Durably record external cleanup intent before any PR is closed."""
+        latest = self.latest_event(issue_number, "plan.auto_replan_prepared")
+        if latest and latest["detail"].get("plan_hash") == plan_hash:
+            return
+        self.event(
+            "plan.auto_replan_prepared",
+            {"plan_hash": plan_hash, **detail},
+            issue_number=issue_number,
+        )
+
+    def supersede_plan_for_replan(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        *,
+        reason: str,
+        blockers: list[dict[str, Any]],
+    ) -> bool:
+        """Atomically retire the approved execution graph and request a fresh plan."""
+        now = utcnow()
+        with self.transaction() as conn:
+            current = conn.execute(
+                "SELECT current_plan_hash FROM issues WHERE number = ?",
+                (issue_number,),
+            ).fetchone()
+            if current is None or current["current_plan_hash"] != plan_hash:
+                return False
+            jobs = list(
+                conn.execute(
+                    "SELECT * FROM jobs WHERE issue_number = ? AND plan_hash = ? ORDER BY created_at, job_id",
+                    (issue_number, plan_hash),
+                )
+            )
+            for job in jobs:
+                if job["state"] == "merged":
+                    continue
+                lease = conn.execute(
+                    "SELECT lane FROM lane_leases WHERE job_id = ?",
+                    (job["job_id"],),
+                ).fetchone()
+                conn.execute("DELETE FROM lane_leases WHERE job_id = ?", (job["job_id"],))
+                if lease is not None:
+                    self.event(
+                        "lane.released",
+                        {"lane": lease["lane"], "reason": "job entered superseded"},
+                        issue_number=issue_number,
+                        job_id=job["job_id"],
+                        connection=conn,
+                    )
+                last_error = job["last_error"] or reason
+                conn.execute(
+                    "UPDATE jobs SET state='superseded', last_error=?, updated_at=? WHERE job_id=?",
+                    (last_error, now, job["job_id"]),
+                )
+                if job["state"] != "superseded":
+                    self.event(
+                        "job.transition",
+                        {"from": job["state"], "to": "superseded"},
+                        issue_number=issue_number,
+                        job_id=job["job_id"],
+                        connection=conn,
+                    )
+            conn.execute(
+                "UPDATE plans SET status='superseded', superseded_at=? WHERE plan_hash=?",
+                (now, plan_hash),
+            )
+            conn.execute("UPDATE approvals SET revoked_at=? WHERE plan_hash=?", (now, plan_hash))
+            conn.execute(
+                "UPDATE issues SET current_plan_hash=NULL, controller_state='planning', updated_at=? WHERE number=?",
+                (now, issue_number),
+            )
+            self.event(
+                "plan.auto_replan_requested",
+                {
+                    "plan_hash": plan_hash,
+                    "reason": reason,
+                    "blockers": blockers,
+                },
+                issue_number=issue_number,
+                connection=conn,
+            )
+        return True
+
     def current_plan(self, issue_number: int) -> dict[str, Any] | None:
         row = self.connection.execute(
             """
@@ -477,7 +566,7 @@ class Database:
                 issue_number=issue_number,
                 connection=conn,
             )
-        return self.list_jobs(issue_number)
+        return self.list_current_jobs(issue_number)
 
     @staticmethod
     def decode_job(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -499,6 +588,32 @@ class Database:
                 "SELECT * FROM jobs WHERE issue_number = ? ORDER BY created_at, job_id", (issue_number,)
             )
         return [self.decode_job(row) for row in rows]
+
+    def list_current_jobs(self, issue_number: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT j.* FROM jobs j
+            JOIN issues i ON i.number = j.issue_number AND i.current_plan_hash = j.plan_hash
+            WHERE j.issue_number = ?
+            ORDER BY j.created_at, j.job_id
+            """,
+            (issue_number,),
+        )
+        return [self.decode_job(row) for row in rows]
+
+    def plan_count(self, issue_number: int) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM plans WHERE issue_number = ?",
+            (issue_number,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def event_count(self, issue_number: int, kind: str) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM events WHERE issue_number = ? AND kind = ?",
+            (issue_number, kind),
+        ).fetchone()
+        return int(row["count"] if row else 0)
 
     def update_job(self, job_id: str, *, state: str | None = None, **fields: Any) -> dict[str, Any]:
         if state is not None and state not in JOB_STATES:
