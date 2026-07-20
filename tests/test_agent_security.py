@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -26,6 +28,8 @@ from alfred_code.agent_security import (
     main,
     path_allowed,
     prepare_dependency_overlay,
+    prepare_python_dependency_overlays,
+    runtime_cache_environment,
     validate_provider_arguments,
 )
 from alfred_code.config import load_config
@@ -92,6 +96,12 @@ class AgentSecurityTests(unittest.TestCase):
         dependency_link = self.workspace / "packages/learn/node_modules"
         dependency_link.parent.mkdir(parents=True)
         dependency_link.symlink_to(dependency_target, target_is_directory=True)
+        python_target = self.workspace.parent / f"{self.workspace.name}-python"
+        (python_target / "bin").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, python_target, True)
+        (self.workspace / "packages/learn/.venv").symlink_to(
+            python_target, target_is_directory=True
+        )
         profile = codex_profile(
             self.manifest,
             profile_path=profile_path,
@@ -117,7 +127,12 @@ class AgentSecurityTests(unittest.TestCase):
             "read",
         )
         self.assertEqual(filesystem["packages/learn/dist"], "write")
+        self.assertNotIn("packages/learn/.cache", filesystem)
         self.assertEqual(parsed["shell_environment_policy"]["inherit"], "core")
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["PATH"].split(os.pathsep)[0],
+            str(python_target.resolve() / "bin"),
+        )
         self.assertFalse(parsed["shell_environment_policy"]["ignore_default_excludes"])
         self.assertTrue(parsed["shell_environment_policy"]["set"]["PYTHONDONTWRITEBYTECODE"])
         self.assertEqual(parsed["shell_environment_policy"]["set"]["GIT_CONFIG_GLOBAL"], "/dev/null")
@@ -129,6 +144,18 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(
             parsed["shell_environment_policy"]["set"]["npm_config_script_shell"],
             str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
+        )
+        cache_environment = runtime_cache_environment(self.manifest)
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["npm_config_cache"],
+            cache_environment["npm_config_cache"],
+        )
+        self.assertEqual(
+            parsed["shell_environment_policy"]["set"]["XDG_CACHE_HOME"],
+            cache_environment["XDG_CACHE_HOME"],
+        )
+        self.assertFalse(
+            Path(cache_environment["npm_config_cache"]).is_relative_to(self.workspace)
         )
         self.assertEqual(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -171,12 +198,77 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertTrue(overlay.is_symlink())
         self.assertEqual(overlay.resolve(), dependency_target.resolve())
 
+    def test_dependency_overlay_reuses_the_primary_checkout_offline(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"dependencies": {"tsx": "1.0.0"}, "devDependencies": {"esbuild": "1.0.0"}})
+        )
+
+        source_checkout = self.workspace.parent / f"{self.workspace.name}-source"
+        source_git = source_checkout / ".git"
+        source_modules = source_checkout / "packages/learn/node_modules"
+        source_git.mkdir(parents=True)
+        (source_modules / "tsx").mkdir(parents=True)
+        (source_modules / "esbuild").mkdir()
+        self.addCleanup(shutil.rmtree, source_checkout, True)
+
+        with (
+            patch("alfred_code.agent_security._git_metadata_paths", return_value=(source_git,)),
+            patch(
+                "alfred_code.agent_security._git_origin_url",
+                return_value="https://github.com/ssdavidai/alfred",
+            ),
+            patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": ""}),
+        ):
+            overlay = prepare_dependency_overlay(self.manifest)
+
+        self.assertEqual(overlay, self.workspace / "node_modules")
+        self.assertEqual(overlay.resolve(), source_modules.resolve())
+
     def test_dependency_overlay_never_replaces_an_existing_path(self):
         overlay = self.workspace / "node_modules"
         overlay.write_text("keep")
         with patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": "/tmp/dependencies"}):
             self.assertIsNone(prepare_dependency_overlay(self.manifest))
         self.assertEqual(overlay.read_text(), "keep")
+
+    def test_python_dependencies_are_provisioned_once_outside_the_worktree(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "requirements.txt").write_text("fastapi==0.115.0\n")
+        (package_root / "pytest.ini").write_text("[pytest]\nasyncio_mode = auto\n")
+        cache_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_temp.cleanup)
+        commands = []
+
+        def provision(command, **kwargs):
+            commands.append(command)
+            if command[1] == "venv":
+                python = Path(command[-1]) / "bin/python"
+                python.parent.mkdir(parents=True)
+                python.write_text("#!/bin/sh\n")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch("alfred_code.agent_security.subprocess.run", side_effect=provision):
+            environments = prepare_python_dependency_overlays(
+                self.manifest,
+                cache_root=Path(cache_temp.name),
+                uv_binary="/trusted/uv",
+            )
+            repeated = prepare_python_dependency_overlays(
+                self.manifest,
+                cache_root=Path(cache_temp.name),
+                uv_binary="/trusted/uv",
+            )
+
+        self.assertEqual(environments, repeated)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0][:4], ["/trusted/uv", "venv", "--python", "3.12"])
+        self.assertIn("pytest==9.1.1", commands[1])
+        self.assertIn("pytest-asyncio==1.4.0", commands[1])
+        self.assertTrue((package_root / ".venv").is_symlink())
+        self.assertTrue((environments[0] / ".alfred-code-ready").is_file())
 
     def test_codex_uses_unattended_exec_for_the_exact_worktree(self):
         with (
@@ -291,6 +383,33 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(marker["status"], "exited")
         self.assertEqual(marker["exit_code"], 70)
         self.assertEqual(marker["controller_job"], "learn-299")
+
+    def test_launch_redirects_tool_caches_outside_the_lane_workspace(self):
+        self.prepare_fake_codex_runtime()
+        runtime_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime_temp.cleanup)
+        captured_environment = {}
+
+        def capture_launch(command, cwd, env):
+            captured_environment.update(env)
+            return 0
+
+        with (
+            patch("alfred_code.agent_security.workspace_from_environment", return_value=self.workspace),
+            patch.object(Path, "home", return_value=self.workspace),
+            patch("alfred_code.agent_security.tempfile.gettempdir", return_value=runtime_temp.name),
+            patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),
+            patch("alfred_code.agent_security.codex_hook_trust_hash", return_value="sha256:test"),
+            patch("alfred_code.agent_security.build_provider_command", return_value=["codex"]),
+            patch("alfred_code.agent_security.subprocess.call", side_effect=capture_launch),
+        ):
+            launch("codex", [])
+
+        for name in ("XDG_CACHE_HOME", "npm_config_cache"):
+            cache_path = Path(captured_environment[name])
+            self.assertTrue(cache_path.is_dir())
+            self.assertTrue(cache_path.is_relative_to(Path(runtime_temp.name)))
+            self.assertFalse(cache_path.is_relative_to(self.workspace))
 
     def test_repair_launch_overwrites_stale_result_and_requires_exact_binding(self):
         lane = json.loads((self.workspace / ".lane").read_text())
