@@ -21,7 +21,7 @@ from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 22
+LAUNCH_REVISION = 23
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
@@ -322,6 +322,27 @@ def _verification_roots(manifest: LaneManifest) -> tuple[str, ...]:
         path = Path(value)
         if value and not path.is_absolute() and ".." not in path.parts:
             roots.add(path.as_posix())
+    # Plans can require an acceptance build even when the lane authority's
+    # immutable verification is intentionally `true` (for example a
+    # contracts-only phase-0 job). Locate only package roots already named by
+    # the lane's write allowlist so their validated, read-only dependency cache
+    # is available without widening repository access.
+    for pattern in manifest.allowed:
+        normalized = pattern.removeprefix("./")
+        static_prefix = re.split(r"[*?[]", normalized, maxsplit=1)[0].rstrip("/")
+        if not static_prefix:
+            continue
+        candidate = manifest.workspace / static_prefix
+        for package_root in (candidate, *candidate.parents):
+            if package_root == manifest.workspace:
+                break
+            if manifest.workspace not in package_root.parents:
+                break
+            if (package_root / "package.json").is_file() or (
+                package_root / "requirements.txt"
+            ).is_file():
+                roots.add(package_root.relative_to(manifest.workspace).as_posix())
+                break
     return tuple(sorted(roots))
 
 
@@ -352,7 +373,13 @@ def _verification_dependency_paths(manifest: LaneManifest) -> tuple[Path, ...]:
         for name in ("node_modules", ".venv", "venv"):
             candidate = base / name
             if candidate.is_symlink():
-                paths.append(candidate.resolve())
+                try:
+                    paths.append(candidate.resolve(strict=True))
+                except (OSError, RuntimeError):
+                    # A broken or self-referential link is not a dependency
+                    # capability and must never abort discovery of the safe
+                    # root overlay prepared by the controller.
+                    continue
     return tuple(dict.fromkeys(paths))
 
 

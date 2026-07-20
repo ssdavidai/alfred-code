@@ -20,6 +20,7 @@ from alfred_code.agent_security import (
     _codex_isolation_arguments,
     _codex_legacy_sandbox_conflict,
     _normalized_git_origin,
+    _verification_dependency_paths,
     build_provider_command,
     claude_settings,
     codex_profile,
@@ -179,7 +180,7 @@ class AgentSecurityTests(unittest.TestCase):
             _normalized_git_origin("git@github.com:ssdavidai/alfred"),
         )
 
-    def test_broken_package_dependency_link_gets_non_overwriting_root_overlay(self):
+    def test_allowed_package_gets_root_overlay_when_verification_is_true(self):
         package_root = self.workspace / "packages/learn"
         package_root.mkdir(parents=True, exist_ok=True)
         (package_root / "package.json").write_text(
@@ -190,13 +191,23 @@ class AgentSecurityTests(unittest.TestCase):
         dependency_target = self.workspace / ".dependency-cache"
         (dependency_target / "tsx").mkdir(parents=True)
         (dependency_target / "esbuild").mkdir()
+        manifest = LaneManifest(
+            workspace=self.workspace,
+            role="worker",
+            lane="phase0",
+            issue=316,
+            allowed=("packages/learn/CONTRACT.md",),
+            verify="true",
+            controller_job="contracts-316",
+        )
 
         with patch.dict(os.environ, {"ALFRED_CODE_NODE_MODULES": str(dependency_target)}):
-            overlay = prepare_dependency_overlay(self.manifest)
+            overlay = prepare_dependency_overlay(manifest)
 
         self.assertEqual(overlay, self.workspace / "node_modules")
         self.assertTrue(overlay.is_symlink())
         self.assertEqual(overlay.resolve(), dependency_target.resolve())
+        self.assertEqual(_verification_dependency_paths(manifest), (dependency_target.resolve(),))
 
     def test_dependency_overlay_reuses_the_primary_checkout_offline(self):
         package_root = self.workspace / "packages/learn"
