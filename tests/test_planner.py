@@ -2,7 +2,11 @@ import json
 import unittest
 
 from alfred_code.errors import PlanValidationError
-from alfred_code.planner import extract_json, structured_planner_command
+from alfred_code.planner import (
+    extract_json,
+    extract_planner_result,
+    structured_planner_command,
+)
 
 
 class PlannerOutputTests(unittest.TestCase):
@@ -24,6 +28,21 @@ class PlannerOutputTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["issue"]["const"], 292)
         self.assertEqual(schema["properties"]["base_sha"]["const"], sha)
         self.assertEqual(schema["properties"]["jobs"]["minItems"], 1)
+        self.assertIn("--output-format", command)
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+
+    def test_claude_json_envelope_preserves_usage_and_returns_structured_output(self):
+        plan = {"issue": 292, "jobs": []}
+        envelope = {
+            "type": "result",
+            "session_id": "session-1",
+            "structured_output": plan,
+            "usage": {"output_tokens": 12},
+            "modelUsage": {"claude-test": {"outputTokens": 12}},
+        }
+        result, metadata = extract_planner_result(json.dumps(envelope))
+        self.assertEqual(result, plan)
+        self.assertEqual(metadata, envelope)
 
     def test_non_claude_planner_command_is_unchanged(self):
         command = ("custom-planner", "--json")

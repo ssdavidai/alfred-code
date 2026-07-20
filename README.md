@@ -31,6 +31,26 @@ Installation creates `~/.config/alfred-code/controller.toml` with `apply = false
 
 The principal read-only commands are `alfred-code doctor`, `alfred-code status`, `alfred-code run-once --dry-run`, and `alfred-code worktrees-audit`. External mutation is explicit through `project-setup`, `plan <issue> --publish`, or an apply-enabled reconciliation cycle.
 
+## Local operations dashboard
+
+Alfred Operations is a loopback-only, read-only dashboard over the durable controller database, append-only events, Superset workspace/session bindings, and persisted Codex/Claude token telemetry. It shows the complete Kanban, the active safe planner process, every materialized lane job and lease, PR links, block reasons, plan churn, model usage, output/reasoning/input/cache totals, per-issue session attribution, and the live activity feed. It exposes no write endpoint and refuses non-loopback binding.
+
+Run it for the current terminal:
+
+```bash
+~/.claude/bin/alfred-code dashboard --open
+```
+
+Install it as an always-on macOS launch agent:
+
+```bash
+cd ~/.claude/alfred-code
+./install-dashboard.sh
+open http://127.0.0.1:7331
+```
+
+The page refreshes every two seconds. Build and review token totals are recovered from the exact persisted Superset-bound CLI sessions. Planner model and token telemetry is captured from Claude's structured result envelope for plans generated after this dashboard instrumentation is deployed; older no-persistence planner runs remain visibly unavailable rather than estimated.
+
 Plans include the issue-body hash, operator-feedback context hash, and pinned base SHA. Regeneration, issue edits, operator feedback, and pre-approval base changes invalidate approval. An exact `/reject-plan` decision is durable and starts no workers. The planner runs with zero tools against controller-collected git evidence, and any verification command it returns is discarded and replaced by the live lane policy's command. Every lifecycle transition refreshes GitHub or Superset first; an unavailable authority freezes advancement. The controller fetches the full PR file list and rejects scope escapes before review. Independent review is accepted only from an allow-listed actor, after review was requested, for the current PR HEAD, after green CI and smoke evidence. A failed review launches at most two exact-SHA, nonce-bound repair attempts in the original scoped workspace; the trusted controller alone validates, commits, and pushes each repair before a new CI and review cycle. Deterministic workspace names plus intent-before-effect records adopt accepted work after a crash instead of launching duplicates.
 
 Read [the executable v2 architecture](docs/control-plane-v2.md) for the full authority and state model. Run the test suite with:

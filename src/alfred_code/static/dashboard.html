@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Alfred Operations</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0c0b;
+      --panel: #111513;
+      --panel-2: #171c19;
+      --panel-3: #1d2420;
+      --text: #f2f1e9;
+      --muted: #9aa39c;
+      --dim: #69736c;
+      --line: #29312c;
+      --line-soft: #202722;
+      --green: #67d391;
+      --green-soft: rgba(103, 211, 145, .13);
+      --amber: #e4b45f;
+      --amber-soft: rgba(228, 180, 95, .14);
+      --red: #ef7e72;
+      --red-soft: rgba(239, 126, 114, .14);
+      --blue: #7fa8f8;
+      --blue-soft: rgba(127, 168, 248, .14);
+      --violet: #aa92ed;
+      --violet-soft: rgba(170, 146, 237, .14);
+      --radius: 13px;
+      --shadow: 0 18px 70px rgba(0, 0, 0, .28);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body { min-width: 320px; }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    a { color: inherit; }
+    [hidden] { display: none !important; }
+
+    .shell { min-height: 100vh; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 22px;
+      padding: 17px 24px;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(18px);
+    }
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+    .mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border: 1px solid #3d4b42;
+      border-radius: 10px;
+      background: linear-gradient(145deg, #24372b, #121814);
+      color: var(--green);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      font-weight: 700;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+    }
+    .brand-copy { min-width: 0; }
+    .brand h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.015em; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .live-row { display: flex; align-items: center; justify-content: flex-end; gap: 15px; min-width: 0; }
+    .live-chip { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+    .dot.ok { background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+    .dot.busy { background: var(--amber); box-shadow: 0 0 0 4px var(--amber-soft); animation: breathe 1.5s ease-in-out infinite; }
+    .dot.bad { background: var(--red); box-shadow: 0 0 0 4px var(--red-soft); }
+    @keyframes breathe { 50% { opacity: .55; } }
+
+    main { padding: 22px 24px 48px; }
+    .nav-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    .tabs { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .tab {
+      border: 0;
+      border-radius: 7px;
+      padding: 7px 12px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active { background: var(--panel-3); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+    .updated { color: var(--dim); font-size: 12px; white-space: nowrap; }
+
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; margin-bottom: 19px; }
+    .stat {
+      min-height: 93px;
+      padding: 14px 15px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(155deg, var(--panel-2), var(--panel));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
+    }
+    .stat-label { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    .stat-value { margin-top: 9px; font-size: 25px; font-weight: 560; letter-spacing: -.045em; }
+    .stat-note { margin-top: 4px; color: var(--dim); font-size: 11px; }
+
+    .board-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
+    .search-wrap { position: relative; width: min(340px, 100%); }
+    .search-wrap span { position: absolute; left: 11px; top: 8px; color: var(--dim); font-size: 14px; pointer-events: none; }
+    .search {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 8px 11px 8px 31px;
+      background: var(--panel);
+      color: var(--text);
+      outline: none;
+    }
+    .search:focus { border-color: #496254; box-shadow: 0 0 0 3px var(--green-soft); }
+    .coverage { color: var(--muted); font-size: 12px; text-align: right; }
+
+    .board {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(255px, 1fr));
+      gap: 10px;
+      align-items: start;
+      overflow-x: auto;
+      padding-bottom: 14px;
+      scrollbar-color: #39433d transparent;
+    }
+    .column { min-width: 255px; }
+    .column-head { display: flex; align-items: center; justify-content: space-between; padding: 7px 5px 10px; }
+    .column-title { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .025em; text-transform: uppercase; }
+    .column-mark { width: 8px; height: 8px; border-radius: 3px; background: var(--dim); }
+    .column[data-column="specifying"] .column-mark { background: var(--violet); }
+    .column[data-column="approval"] .column-mark { background: var(--amber); }
+    .column[data-column="building"] .column-mark { background: var(--blue); }
+    .column[data-column="ready_merge"] .column-mark { background: var(--green); }
+    .column[data-column="blocked"] .column-mark { background: var(--red); }
+    .column-count { min-width: 22px; padding: 2px 6px; border-radius: 999px; background: var(--panel-3); color: var(--muted); font-size: 11px; text-align: center; }
+    .column-body { display: grid; gap: 8px; }
+    .empty-column { padding: 18px 8px; border-top: 1px dashed var(--line); color: var(--dim); font-size: 11px; text-align: center; }
+
+    .issue-card {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      padding: 12px;
+      background: var(--panel);
+      text-align: left;
+      cursor: pointer;
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .issue-card:hover { transform: translateY(-1px); border-color: #3c4941; background: var(--panel-2); }
+    .issue-card:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+    .card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .issue-number { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+    .age { color: var(--dim); font-size: 10px; white-space: nowrap; }
+    .issue-title { display: -webkit-box; overflow: hidden; margin: 0; color: var(--text); font-size: 13px; font-weight: 510; line-height: 1.38; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+    .card-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+    .badge { display: inline-flex; align-items: center; min-height: 20px; padding: 2px 6px; border-radius: 5px; background: var(--panel-3); color: var(--muted); font-size: 10px; }
+    .badge.lane { background: var(--blue-soft); color: #b9cff9; }
+    .badge.error { background: var(--red-soft); color: #f4b1a9; }
+    .badge.ready { background: var(--green-soft); color: #a8e6bd; }
+    .badge.plan { background: var(--violet-soft); color: #c8baf2; }
+    .token-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--line-soft); color: var(--dim); font-size: 10px; }
+    .token-line strong { color: var(--muted); font-weight: 500; }
+
+    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(330px, .7fr); gap: 12px; }
+    .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 16px; }
+    .panel + .panel { margin-top: 12px; }
+    .panel h2 { margin: 0 0 4px; font-size: 14px; font-weight: 560; }
+    .panel-sub { margin: 0 0 16px; color: var(--muted); font-size: 11px; }
+    .chart-list { display: grid; gap: 10px; }
+    .bar-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(150px, 2fr) 70px; gap: 10px; align-items: center; }
+    .bar-label { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-track { height: 7px; overflow: hidden; border-radius: 999px; background: var(--panel-3); }
+    .bar-fill { height: 100%; min-width: 2px; border-radius: inherit; background: var(--green); }
+    .bar-value { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-align: right; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th { padding: 8px 7px; border-bottom: 1px solid var(--line); color: var(--dim); font-weight: 500; text-align: right; }
+    td { padding: 10px 7px; border-bottom: 1px solid var(--line-soft); color: var(--muted); text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    td strong { color: var(--text); font-weight: 500; }
+    .notice { padding: 12px; border: 1px solid #52462d; border-radius: 9px; background: var(--amber-soft); color: #d9c59c; font-size: 11px; line-height: 1.5; }
+    .lease-list { display: grid; gap: 8px; }
+    .lease { display: grid; grid-template-columns: 52px 1fr auto; gap: 8px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line-soft); font-size: 11px; }
+    .lease:last-child { border-bottom: 0; }
+    .lease-lane { color: var(--blue); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .lease-job { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+    .lease-state { color: var(--dim); }
+
+    .activity { display: grid; gap: 0; border-top: 1px solid var(--line); }
+    .activity-row { display: grid; grid-template-columns: 88px minmax(0, 1fr) 120px; gap: 13px; align-items: baseline; padding: 11px 4px; border-bottom: 1px solid var(--line-soft); }
+    .activity-kind { overflow: hidden; color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-text { color: var(--muted); font-size: 12px; }
+    .activity-time { color: var(--dim); font-size: 10px; text-align: right; }
+
+    .drawer-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.55); backdrop-filter: blur(3px); }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 50;
+      width: min(620px, 100%);
+      overflow-y: auto;
+      padding: 22px;
+      border-left: 1px solid var(--line);
+      background: #0f1311;
+      box-shadow: var(--shadow);
+    }
+    .drawer-head { display: flex; justify-content: space-between; gap: 15px; }
+    .drawer-kicker { color: var(--green); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+    .drawer h2 { margin: 8px 0 0; font-size: 21px; font-weight: 560; line-height: 1.25; letter-spacing: -.025em; }
+    .close { width: 34px; height: 34px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); cursor: pointer; }
+    .close:hover { background: var(--panel-3); }
+    .drawer-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 16px 0 20px; }
+    .link-button { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: var(--panel); color: var(--muted); font-size: 11px; text-decoration: none; }
+    .link-button:hover { color: var(--text); border-color: #3c4941; }
+    .detail-section { margin-top: 23px; }
+    .detail-section h3 { margin: 0 0 10px; color: var(--muted); font-size: 11px; font-weight: 560; letter-spacing: .05em; text-transform: uppercase; }
+    .detail-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .detail-cell { padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+    .detail-cell span { display: block; color: var(--dim); font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+    .detail-cell strong { display: block; overflow: hidden; margin-top: 6px; color: var(--text); font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+    .job { padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .job:last-child { border-bottom: 0; }
+    .job-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .job-title { color: var(--text); font-size: 12px; font-weight: 500; }
+    .job-meta { margin-top: 5px; color: var(--dim); font-size: 10px; }
+    .job-error { margin-top: 9px; padding: 9px; border-radius: 7px; background: var(--red-soft); color: #e7aaa4; font-size: 10px; line-height: 1.45; }
+    .session { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+    .session-model { color: var(--text); font-size: 11px; }
+    .session-role { color: var(--dim); font-size: 10px; }
+    .session-tokens { grid-row: span 2; align-self: center; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-align: right; }
+    .error-screen { padding: 40px; color: var(--red); text-align: center; }
+
+    @media (max-width: 1100px) {
+      .stats { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
+      .analytics-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 700px) {
+      .topbar { align-items: flex-start; padding: 14px; }
+      .live-row { flex-direction: column; align-items: flex-end; gap: 6px; }
+      .live-chip:nth-child(2) { display: none; }
+      main { padding: 15px 14px 36px; }
+      .nav-row { align-items: flex-start; flex-direction: column; }
+      .stats { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+      .stat { min-height: 82px; }
+      .stat-value { font-size: 21px; }
+      .board-toolbar { align-items: flex-start; flex-direction: column; }
+      .coverage { text-align: left; }
+      .detail-grid { grid-template-columns: repeat(2, 1fr); }
+      .activity-row { grid-template-columns: 75px 1fr; }
+      .activity-time { grid-column: 2; text-align: left; }
+      .drawer { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark">A/</div>
+        <div class="brand-copy">
+          <h1>Alfred Operations</h1>
+          <p>Read-only control-plane telemetry</p>
+        </div>
+      </div>
+      <div class="live-row">
+        <div class="live-chip"><span id="controllerDot" class="dot"></span><span id="controllerStatus">Connecting</span></div>
+        <div class="live-chip"><span id="supersetDot" class="dot"></span><span id="supersetStatus">Superset</span></div>
+      </div>
+    </header>
+
+    <main>
+      <div class="nav-row">
+        <nav class="tabs" aria-label="Dashboard sections">
+          <button class="tab active" type="button" data-view="board">Board</button>
+          <button class="tab" type="button" data-view="analytics">Analytics</button>
+          <button class="tab" type="button" data-view="activity">Activity</button>
+        </nav>
+        <div id="updated" class="updated">Waiting for first snapshot…</div>
+      </div>
+
+      <section id="stats" class="stats" aria-label="Key metrics"></section>
+
+      <section id="boardView">
+        <div class="board-toolbar">
+          <label class="search-wrap">
+            <span aria-hidden="true">⌕</span>
+            <input id="search" class="search" type="search" placeholder="Find issue, lane, PR, model…" aria-label="Search board">
+          </label>
+          <div id="coverage" class="coverage"></div>
+        </div>
+        <div id="board" class="board" aria-live="polite"></div>
+      </section>
+
+      <section id="analyticsView" hidden>
+        <div class="analytics-grid">
+          <div>
+            <section class="panel">
+              <h2>Output tokens by issue</h2>
+              <p class="panel-sub">Exact persisted build and review session telemetry</p>
+              <div id="issueBars" class="chart-list"></div>
+            </section>
+            <section class="panel">
+              <h2>Models</h2>
+              <p class="panel-sub">Every measured model, attributed through its Superset workspace</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Model</th><th>Sessions</th><th>Issues</th><th>Output</th><th>Reasoning</th><th>Processed</th></tr></thead>
+                  <tbody id="modelRows"></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+          <div>
+            <section class="panel">
+              <h2>Telemetry coverage</h2>
+              <p class="panel-sub">What is measured versus intentionally unknown</p>
+              <div id="telemetryNotice" class="notice"></div>
+            </section>
+            <section class="panel">
+              <h2>Lane leases</h2>
+              <p class="panel-sub">Current controller ownership, including blocked leases</p>
+              <div id="leaseList" class="lease-list"></div>
+            </section>
+            <section class="panel">
+              <h2>State distribution</h2>
+              <p class="panel-sub">All durable issue records</p>
+              <div id="stateBars" class="chart-list"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section id="activityView" hidden>
+        <section class="panel">
+          <h2>Controller activity</h2>
+          <p class="panel-sub">Newest durable events first; refreshes every two seconds</p>
+          <div id="activity" class="activity"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <aside id="drawer" class="drawer" aria-label="Issue details" hidden>
+    <div class="drawer-head">
+      <div>
+        <div id="drawerKicker" class="drawer-kicker"></div>
+        <h2 id="drawerTitle"></h2>
+      </div>
+      <button id="closeDrawer" class="close" type="button" aria-label="Close issue details">×</button>
+    </div>
+    <div id="drawerActions" class="drawer-actions"></div>
+    <div id="drawerBody"></div>
+  </aside>
+
+  <script>
+    const state = { snapshot: null, view: 'board', selected: null, query: '', loading: false };
+    const $ = (id) => document.getElementById(id);
+
+    function node(tag, className, text) {
+      const value = document.createElement(tag);
+      if (className) value.className = className;
+      if (text !== undefined && text !== null) value.textContent = text;
+      return value;
+    }
+
+    function compact(value) {
+      const number = Number(value || 0);
+      if (number >= 1e9) return `${(number / 1e9).toFixed(number >= 1e10 ? 0 : 1)}B`;
+      if (number >= 1e6) return `${(number / 1e6).toFixed(number >= 1e7 ? 0 : 1)}M`;
+      if (number >= 1e3) return `${(number / 1e3).toFixed(number >= 1e4 ? 0 : 1)}K`;
+      return String(number);
+    }
+
+    function duration(seconds) {
+      if (seconds === null || seconds === undefined) return '—';
+      if (seconds < 60) return `${seconds}s`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+      return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+    }
+
+    function relative(iso) {
+      if (!iso) return 'unknown';
+      const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+      return `${duration(seconds)} ago`;
+    }
+
+    function stateBadge(jobState) {
+      if (jobState === 'ready_merge' || jobState === 'merged') return 'ready';
+      if (jobState === 'blocked' || jobState === 'quarantined') return 'error';
+      return '';
+    }
+
+    function renderRuntime() {
+      const runtime = state.snapshot.runtime;
+      const controller = runtime.controller;
+      $('controllerDot').className = `dot ${controller.running ? (controller.planner ? 'busy' : 'ok') : 'bad'}`;
+      $('controllerStatus').textContent = !controller.running
+        ? 'Controller stopped'
+        : controller.planner
+          ? `Safely planning #${controller.planner.issue || '?'} · ${controller.planner.elapsed}`
+          : `Controller live · ${controller.elapsed}`;
+      $('supersetDot').className = `dot ${runtime.superset.running ? 'ok' : 'bad'}`;
+      $('supersetStatus').textContent = runtime.superset.running ? 'Superset healthy' : 'Superset unavailable';
+      $('updated').textContent = `Updated ${new Date(state.snapshot.generated_at).toLocaleTimeString()} · event ${relative(runtime.latest_event_at)}`;
+    }
+
+    function stat(label, value, note) {
+      const card = node('div', 'stat');
+      card.append(node('div', 'stat-label', label), node('div', 'stat-value', value), node('div', 'stat-note', note));
+      return card;
+    }
+
+    function renderStats() {
+      const analytics = state.snapshot.analytics;
+      const tokens = analytics.tokens;
+      const container = $('stats');
+      container.replaceChildren(
+        stat('Open issues', analytics.open_issues, `${analytics.tracked_issues} durable records`),
+        stat('Active jobs', analytics.active_jobs, `${analytics.blocked_jobs} blocked or quarantined`),
+        stat('Output tokens', compact(tokens.output_tokens), `${compact(tokens.reasoning_tokens)} reasoning`),
+        stat('Processed tokens', compact(tokens.total_tokens), `${compact(tokens.cached_input_tokens)} cached input`),
+        stat('Measured sessions', analytics.measured_sessions, `${analytics.measured_issues} attributed issues`)
+      );
+    }
+
+    function issueMatches(issue) {
+      if (!state.query) return true;
+      const haystack = [
+        issue.number, issue.title, issue.state, issue.labels.join(' '), issue.models.join(' '),
+        ...issue.jobs.flatMap((job) => [job.job_id, job.lane, job.state, job.pr_number || ''])
+      ].join(' ').toLowerCase();
+      return haystack.includes(state.query);
+    }
+
+    function renderCard(issue) {
+      const button = node('button', 'issue-card');
+      button.type = 'button';
+      button.addEventListener('click', () => openIssue(issue.number));
+      const top = node('div', 'card-top');
+      top.append(node('span', 'issue-number', `#${issue.number}`), node('span', 'age', duration(issue.age_seconds)));
+      button.append(top, node('p', 'issue-title', issue.title));
+      const meta = node('div', 'card-meta');
+      issue.jobs.slice(0, 3).forEach((job) => {
+        const badge = node('span', `badge lane ${stateBadge(job.state)}`, `${job.lane} · ${job.state.replaceAll('_', ' ')}`);
+        meta.append(badge);
+      });
+      if (!issue.jobs.length && issue.plan) meta.append(node('span', 'badge plan', `${issue.plan.job_count} planned lane${issue.plan.job_count === 1 ? '' : 's'}`));
+      if (issue.invalidated_count) meta.append(node('span', 'badge', `${issue.invalidated_count} replan${issue.invalidated_count === 1 ? '' : 's'}`));
+      button.append(meta);
+      const tokenLine = node('div', 'token-line');
+      const model = issue.models.length ? issue.models.join(', ') : (issue.plan ? 'Planner telemetry unavailable' : 'No measured session');
+      tokenLine.append(node('span', '', model), node('strong', '', `${compact(issue.tokens.output_tokens)} out`));
+      button.append(tokenLine);
+      return button;
+    }
+
+    function renderBoard() {
+      const board = $('board');
+      board.replaceChildren();
+      state.snapshot.columns.forEach((column) => {
+        const section = node('section', 'column');
+        section.dataset.column = column.id;
+        const head = node('div', 'column-head');
+        const title = node('div', 'column-title');
+        title.append(node('span', 'column-mark'), node('span', '', column.label));
+        const visible = state.snapshot.issues.filter((issue) => issue.column === column.id && issueMatches(issue));
+        head.append(title, node('span', 'column-count', visible.length));
+        const body = node('div', 'column-body');
+        if (visible.length) visible.forEach((issue) => body.append(renderCard(issue)));
+        else body.append(node('div', 'empty-column', state.query ? 'No matches' : 'Empty'));
+        section.append(head, body);
+        board.append(section);
+      });
+      $('coverage').textContent = `${state.snapshot.analytics.measured_sessions} measured agent sessions · planner tokens clearly marked unavailable`;
+    }
+
+    function renderIssueBars() {
+      const rows = [...state.snapshot.issues]
+        .filter((issue) => issue.tokens.output_tokens > 0)
+        .sort((a, b) => b.tokens.output_tokens - a.tokens.output_tokens)
+        .slice(0, 16);
+      const max = Math.max(...rows.map((issue) => issue.tokens.output_tokens), 1);
+      const container = $('issueBars');
+      container.replaceChildren();
+      if (!rows.length) {
+        container.append(node('div', 'empty-column', 'No attributed token telemetry yet'));
+        return;
+      }
+      rows.forEach((issue) => {
+        const row = node('div', 'bar-row');
+        const label = node('div', 'bar-label', `#${issue.number} ${issue.title}`);
+        const track = node('div', 'bar-track');
+        const fill = node('div', 'bar-fill');
+        fill.style.width = `${Math.max(1, issue.tokens.output_tokens / max * 100)}%`;
+        track.append(fill);
+        row.append(label, track, node('div', 'bar-value', compact(issue.tokens.output_tokens)));
+        row.addEventListener('click', () => openIssue(issue.number));
+        container.append(row);
+      });
+    }
+
+    function renderModelRows() {
+      const body = $('modelRows');
+      body.replaceChildren();
+      state.snapshot.analytics.models.forEach((model) => {
+        const row = document.createElement('tr');
+        const name = document.createElement('td');
+        name.append(node('strong', '', model.model), node('div', 'session-role', model.provider));
+        row.append(
+          name,
+          node('td', '', model.sessions),
+          node('td', '', model.issues),
+          node('td', '', compact(model.output_tokens)),
+          node('td', '', compact(model.reasoning_tokens)),
+          node('td', '', compact(model.total_tokens))
+        );
+        body.append(row);
+      });
+    }
+
+    function renderLeases() {
+      const list = $('leaseList');
+      list.replaceChildren();
+      if (!state.snapshot.leases.length) {
+        list.append(node('div', 'empty-column', 'No lanes leased'));
+        return;
+      }
+      state.snapshot.leases.forEach((lease) => {
+        const row = node('div', 'lease');
+        row.append(
+          node('div', 'lease-lane', lease.lane),
+          node('div', 'lease-job', `${lease.job_id} · #${lease.issue_number}`),
+          node('div', 'lease-state', lease.job_state.replaceAll('_', ' '))
+        );
+        list.append(row);
+      });
+    }
+
+    function renderStateBars() {
+      const max = Math.max(...state.snapshot.columns.map((column) => column.count), 1);
+      const container = $('stateBars');
+      container.replaceChildren();
+      state.snapshot.columns.forEach((column) => {
+        const row = node('div', 'bar-row');
+        const track = node('div', 'bar-track');
+        const fill = node('div', 'bar-fill');
+        fill.style.width = `${Math.max(column.count ? 2 : 0, column.count / max * 100)}%`;
+        track.append(fill);
+        row.append(node('div', 'bar-label', column.label), track, node('div', 'bar-value', column.count));
+        container.append(row);
+      });
+    }
+
+    function renderAnalytics() {
+      renderIssueBars();
+      renderModelRows();
+      renderLeases();
+      renderStateBars();
+      $('telemetryNotice').textContent = state.snapshot.analytics.telemetry_note;
+    }
+
+    function renderActivity() {
+      const container = $('activity');
+      container.replaceChildren();
+      state.snapshot.events.forEach((event) => {
+        const row = node('div', 'activity-row');
+        row.append(
+          node('div', 'activity-kind', event.kind),
+          node('div', 'activity-text', event.text),
+          node('div', 'activity-time', relative(event.created_at))
+        );
+        if (event.issue_number) {
+          row.style.cursor = 'pointer';
+          row.addEventListener('click', () => openIssue(event.issue_number));
+        }
+        container.append(row);
+      });
+    }
+
+    function detailCell(label, value) {
+      const cell = node('div', 'detail-cell');
+      cell.append(node('span', '', label), node('strong', '', value ?? '—'));
+      return cell;
+    }
+
+    function link(label, href) {
+      const value = node('a', 'link-button', label);
+      value.href = href;
+      value.target = '_blank';
+      value.rel = 'noreferrer';
+      return value;
+    }
+
+    function openIssue(number) {
+      const issue = state.snapshot.issues.find((item) => item.number === number);
+      if (!issue) return;
+      state.selected = number;
+      $('drawerKicker').textContent = `ISSUE #${number} · ${issue.state.replaceAll('_', ' ').toUpperCase()}`;
+      $('drawerTitle').textContent = issue.title;
+      const actions = $('drawerActions');
+      actions.replaceChildren();
+      if (issue.url) actions.append(link('Open GitHub issue ↗', issue.url));
+      issue.jobs.filter((job) => job.pr_url).forEach((job) => actions.append(link(`PR #${job.pr_number} ↗`, job.pr_url)));
+
+      const body = $('drawerBody');
+      body.replaceChildren();
+      const overview = node('section', 'detail-section');
+      const grid = node('div', 'detail-grid');
+      grid.append(
+        detailCell('State', issue.state.replaceAll('_', ' ')),
+        detailCell('Age', duration(issue.age_seconds)),
+        detailCell('Events', issue.event_count),
+        detailCell('Plan', issue.plan ? issue.plan.short_hash : 'None'),
+        detailCell('Risk', issue.plan?.risk || '—'),
+        detailCell('Replans', issue.invalidated_count)
+      );
+      overview.append(grid);
+      body.append(overview);
+
+      if (issue.plan?.summary) {
+        const section = node('section', 'detail-section');
+        section.append(node('h3', '', 'Current plan'), node('div', 'notice', issue.plan.summary));
+        body.append(section);
+      }
+
+      const jobs = node('section', 'detail-section');
+      jobs.append(node('h3', '', `Jobs · ${issue.jobs.length}`));
+      if (!issue.jobs.length) jobs.append(node('div', 'empty-column', 'No jobs materialized yet'));
+      issue.jobs.forEach((job) => {
+        const item = node('div', 'job');
+        const head = node('div', 'job-head');
+        head.append(node('div', 'job-title', `${job.lane} · ${job.title}`), node('span', `badge ${stateBadge(job.state)}`, job.state.replaceAll('_', ' ')));
+        item.append(head, node('div', 'job-meta', `${job.job_id}${job.pr_number ? ` · PR #${job.pr_number}` : ''} · ${job.branch}`));
+        if (job.last_error) item.append(node('div', 'job-error', job.last_error));
+        jobs.append(item);
+      });
+      body.append(jobs);
+
+      const telemetry = node('section', 'detail-section');
+      telemetry.append(node('h3', '', `Agent telemetry · ${issue.sessions.length} sessions`));
+      if (!issue.sessions.length) telemetry.append(node('div', 'notice', issue.planner_telemetry || 'No persisted agent telemetry for this issue.'));
+      issue.sessions.forEach((session) => {
+        const item = node('div', 'session');
+        item.append(
+          node('div', 'session-model', session.model),
+          node('div', 'session-tokens', `${compact(session.output_tokens)} output\n${compact(session.total_tokens)} processed`),
+          node('div', 'session-role', `${session.provider} · ${session.role} · ${session.status}`)
+        );
+        telemetry.append(item);
+      });
+      body.append(telemetry);
+      $('drawerBackdrop').hidden = false;
+      $('drawer').hidden = false;
+      document.body.style.overflow = 'hidden';
+      $('closeDrawer').focus();
+    }
+
+    function closeIssue() {
+      state.selected = null;
+      $('drawerBackdrop').hidden = true;
+      $('drawer').hidden = true;
+      document.body.style.overflow = '';
+    }
+
+    function setView(view) {
+      state.view = view;
+      document.querySelectorAll('.tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.view === view));
+      $('boardView').hidden = view !== 'board';
+      $('analyticsView').hidden = view !== 'analytics';
+      $('activityView').hidden = view !== 'activity';
+    }
+
+    function render() {
+      if (!state.snapshot) return;
+      renderRuntime();
+      renderStats();
+      renderBoard();
+      renderAnalytics();
+      renderActivity();
+      if (state.selected) openIssue(state.selected);
+    }
+
+    async function refresh() {
+      if (state.loading) return;
+      state.loading = true;
+      try {
+        const response = await fetch('/api/snapshot', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Snapshot failed: ${response.status}`);
+        state.snapshot = await response.json();
+        render();
+      } catch (error) {
+        $('updated').textContent = error.message;
+        $('controllerDot').className = 'dot bad';
+      } finally {
+        state.loading = false;
+      }
+    }
+
+    document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click', () => setView(tab.dataset.view)));
+    $('search').addEventListener('input', (event) => { state.query = event.target.value.trim().toLowerCase(); renderBoard(); });
+    $('closeDrawer').addEventListener('click', closeIssue);
+    $('drawerBackdrop').addEventListener('click', closeIssue);
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && state.selected) closeIssue(); });
+
+    const requestedView = new URLSearchParams(window.location.search).get('view');
+    if (['board', 'analytics', 'activity'].includes(requestedView)) setView(requestedView);
+    const requestedIssue = Number(new URLSearchParams(window.location.search).get('issue'));
+    if (Number.isInteger(requestedIssue) && requestedIssue > 0) state.selected = requestedIssue;
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

@@ -193,6 +193,13 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--apply", action="store_true", help="Allow planning and Superset launches")
     serve.add_argument("--dry-run", action="store_true", help="Force read-only observation")
 
+    dashboard = sub.add_parser(
+        "dashboard", help="Run the read-only local operations dashboard"
+    )
+    dashboard.add_argument("--host", default="127.0.0.1", help="Loopback address to bind")
+    dashboard.add_argument("--port", type=int, default=7331, help="Local port to bind")
+    dashboard.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
+
     migrate = sub.add_parser("migrate-legacy", help="Import old JSON and log evidence without trusting its state")
     migrate.add_argument("--legacy-dir", type=Path, default=Path("~/.alfred-code-state").expanduser())
 
@@ -286,6 +293,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "worktrees-audit":
             emit(audit_worktrees(config.repo_path, GitHubClient(config.github)))
             return 0
+        if args.command == "dashboard":
+            from .dashboard import serve_dashboard
+
+            return serve_dashboard(
+                config,
+                host=args.host,
+                port=args.port,
+                open_browser=args.open,
+            )
         effective = resolved_apply(config, args)
         if args.command in {"run-once", "serve"} and effective.apply:
             report, healthy = doctor(effective)

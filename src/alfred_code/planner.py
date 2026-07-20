@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .audit import AuditLog
 from .config import ControllerConfig
 from .errors import CommandError, PlanValidationError
 from .github import GitHubClient
@@ -88,6 +91,9 @@ def structured_planner_command(
     command: tuple[str, ...], issue_number: int, base_sha: str
 ) -> list[str]:
     argv = list(command)
+    if Path(argv[0]).name == "claude":
+        if "--output-format" not in argv:
+            argv.extend(["--output-format", "json"])
     if Path(argv[0]).name == "claude" and "--json-schema" not in argv:
         argv.extend(
             [
@@ -98,11 +104,56 @@ def structured_planner_command(
     return argv
 
 
+def extract_planner_result(text: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Return the structured plan and an optional Claude JSON result envelope."""
+    try:
+        envelope = json.loads(text.strip())
+    except json.JSONDecodeError:
+        return extract_json(text), None
+    if not isinstance(envelope, dict):
+        return extract_json(text), None
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        return structured, envelope
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        return result, envelope
+    if isinstance(result, str):
+        return extract_json(result), envelope
+    return envelope, None
+
+
 class Planner:
     def __init__(self, config: ControllerConfig, github: GitHubClient, validator: PlanValidator):
         self.config = config
         self.github = github
         self.validator = validator
+        self.telemetry = AuditLog(config.state_dir / "planner-telemetry.jsonl")
+
+    def _record_usage(
+        self,
+        issue_number: int,
+        envelope: dict[str, Any],
+        *,
+        started_at: str,
+        duration_ms: int,
+    ) -> None:
+        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+        model_usage = (
+            envelope.get("modelUsage") if isinstance(envelope.get("modelUsage"), dict) else {}
+        )
+        self.telemetry.write(
+            "planner.usage",
+            issue_number=issue_number,
+            provider="claude",
+            session_id=str(envelope.get("session_id") or ""),
+            started_at=started_at,
+            duration_ms=int(envelope.get("duration_ms") or duration_ms),
+            duration_api_ms=int(envelope.get("duration_api_ms") or 0),
+            num_turns=int(envelope.get("num_turns") or 0),
+            usage=usage,
+            model_usage=model_usage,
+        )
 
     def repository_evidence(self, base_sha: str) -> str:
         repo = self.config.repo_path
@@ -203,13 +254,22 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
         base_sha = self.github.default_branch_sha()
         run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
         policy, policy_text = self.policy_at(base_sha)
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        started = time.monotonic()
         output = run(
             structured_planner_command(self.config.planner_command, issue_number, base_sha),
             cwd=self.config.repo_path,
             input_text=self.prompt(issue, base_sha, policy_text, decision_comments),
             timeout=self.config.planner_timeout_seconds,
         )
-        raw = extract_json(output)
+        raw, envelope = extract_planner_result(output)
+        if envelope is not None:
+            self._record_usage(
+                issue_number,
+                envelope,
+                started_at=started_at,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
         return PlanValidator(policy).validate(
             raw,
             issue_number=issue_number,
