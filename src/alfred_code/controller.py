@@ -1659,6 +1659,7 @@ class Controller:
             )
             new_sha = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
             run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
+            self.github.invalidate_pr(str(job["branch"]))
         except (AuthorityUnavailable, CommandError, OSError) as exc:
             error = f"review repair finalization failed: {exc}"
             self.database.update_job(job["job_id"], state="blocked", last_error=error)

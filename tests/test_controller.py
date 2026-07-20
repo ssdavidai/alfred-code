@@ -54,6 +54,7 @@ class FakeGitHub:
         self.closed_issues = []
         self.reopened_issues = []
         self.updated_pr_bodies = []
+        self.invalidated_prs = []
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -107,6 +108,9 @@ class FakeGitHub:
     def pr_for_branch(self, branch):
         self.pr_calls.append(branch)
         return self.prs.get(branch)
+
+    def invalidate_pr(self, branch):
+        self.invalidated_prs.append(branch)
 
     def review_verdict(self, number, sha, not_before=None):
         return self.verdicts.get((number, sha))
@@ -1236,6 +1240,7 @@ class ControllerTests(unittest.TestCase):
             check=True,
         ).stdout.strip()
         self.assertEqual(remote_sha, repaired["head_sha"])
+        self.assertEqual(self.github.invalidated_prs, [pr.branch])
         repair_events = [event for event in self.db.events() if event["kind"] == "job.repair_pushed"]
         self.assertEqual(repair_events[0]["detail"]["from_sha"], pr.head_sha)
         self.assertEqual(repair_events[0]["detail"]["to_sha"], repaired["head_sha"])
