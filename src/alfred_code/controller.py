@@ -1039,7 +1039,7 @@ class Controller:
             )
             return
         if job.get("review_sha") == pr.head_sha and job.get("review_requested_at"):
-            self.database.update_job(job_id, state="reviewing")
+            self.database.update_job(job_id, state="reviewing", last_error=None)
             return
         review_name = self._review_workspace_name(pr.number, pr.head_sha)
         existing = self.superset.workspace_by_name(review_name)
@@ -1049,6 +1049,7 @@ class Controller:
                 state="reviewing",
                 review_sha=pr.head_sha,
                 review_workspace_id=existing.id,
+                last_error=None,
             )
             return
         self.database.update_job(
@@ -1056,6 +1057,7 @@ class Controller:
             state="reviewing",
             review_sha=pr.head_sha,
             review_requested_at=utcnow(),
+            last_error=None,
         )
         review_branch = f"review/{pr.number}-{pr.head_sha[:12]}"
         self._prepare_exact_branch(review_branch, pr.head_sha)
@@ -1075,6 +1077,7 @@ class Controller:
             state="reviewing",
             review_workspace_id=workspace.id,
             review_agent_id=agent_id,
+            last_error=None,
         )
 
     def _start_review_repair(

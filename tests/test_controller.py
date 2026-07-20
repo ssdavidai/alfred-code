@@ -814,6 +814,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(waiting["pr_number"], 5)
         self.assertEqual(self.db.lease_owner("I"), "api-13")
 
+        self.db.release_lane("api-13")
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            head_sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+        self.controller.reconcile_job(
+            self.db.get_issue(12),
+            self.plan,
+            self.db.get_job("api-12"),
+        )
+
+        reviewing = self.db.get_job("api-12")
+        self.assertEqual(reviewing["state"], "reviewing")
+        self.assertIsNone(reviewing["last_error"])
+
     def test_independent_lanes_launch_workers_in_the_same_cycle(self):
         self.plan["jobs"].append(
             {
