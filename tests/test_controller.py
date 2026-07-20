@@ -3,9 +3,12 @@ import json
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from alfred_code.audit import AuditLog
 from alfred_code.agent_security import (
@@ -138,6 +141,70 @@ class FakePlanner:
     def plan_issue(self, issue_number):
         self.calls += 1
         return copy.deepcopy(self.plan), self.plan_hash
+
+    def prepare_plans(self, issue_numbers):
+        return [SimpleNamespace(issue_number=number) for number in issue_numbers]
+
+    def execute_plan(self, prepared):
+        return self.plan_issue(prepared.issue_number)
+
+    def revalidate(self, plan, expected_hash):
+        if content_hash(plan) != expected_hash:
+            raise AssertionError("corrupt test plan")
+
+
+class ConcurrentPlanner:
+    def __init__(self, sha, bodies, expected_parallel):
+        self.sha = sha
+        self.bodies = bodies
+        self.expected_parallel = expected_parallel
+        self.lock = threading.Lock()
+        self.all_started = threading.Event()
+        self.active = 0
+        self.maximum_active = 0
+        self.calls = []
+
+    def prepare_plans(self, issue_numbers):
+        return [SimpleNamespace(issue_number=number) for number in issue_numbers]
+
+    def execute_plan(self, prepared):
+        number = prepared.issue_number
+        with self.lock:
+            self.calls.append(number)
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            if self.active == self.expected_parallel:
+                self.all_started.set()
+        self.all_started.wait(timeout=2)
+        time.sleep(0.02)
+        plan = {
+            "schema": 1,
+            "issue": number,
+            "base_sha": self.sha,
+            "issue_body_hash": content_hash(self.bodies[number]),
+            "summary": f"Plan {number}",
+            "risk": "low",
+            "jobs": [
+                {
+                    "id": f"api-{number}",
+                    "lane": "I",
+                    "title": f"API {number}",
+                    "branch": f"lane-1/{number}-api",
+                    "paths": ["file.txt"],
+                    "verify": "true",
+                    "contracts_read": [],
+                    "contracts_changed": [],
+                    "depends_on": [],
+                    "acceptance": ["works"],
+                }
+            ],
+        }
+        with self.lock:
+            self.active -= 1
+        return plan, content_hash(plan)
+
+    def plan_issue(self, issue_number):
+        return self.execute_plan(SimpleNamespace(issue_number=issue_number))
 
     def revalidate(self, plan, expected_hash):
         if content_hash(plan) != expected_hash:
@@ -427,6 +494,19 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.list_jobs(), [])
         self.assertEqual(self.superset.worker_creates, 0)
 
+    def test_plan_publication_failure_preserves_the_valid_plan_for_retry(self):
+        def fail_post(*_args, **_kwargs):
+            raise RuntimeError("GitHub comment authority unavailable")
+
+        self.github.post_plan = fail_post
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertIsNotNone(self.db.current_plan(12))
+        self.assertEqual(result["errors"][0]["type"], "RuntimeError")
+        self.assertNotEqual(self.db.get_issue(12)["controller_state"], "blocked")
+
     def test_unmet_dependency_does_not_spend_a_pull_request_query(self):
         issue = self.db.upsert_issue(self.issue)
         job = {
@@ -568,6 +648,31 @@ class ControllerTests(unittest.TestCase):
         ]
         self.assertEqual(projected_states, ["planning", "awaiting_approval"])
 
+    def test_planning_pool_is_parallel_but_respects_its_configured_bound(self):
+        bodies = {12: self.issue["body"]}
+        for number in range(13, 17):
+            body = f"Build feature {number}"
+            bodies[number] = body
+            self.github.extra_issues[number] = {
+                "id": f"I_{number}",
+                "number": number,
+                "title": f"Feature {number}",
+                "body": body,
+                "state": "OPEN",
+                "url": f"https://example/issues/{number}",
+                "labels": [{"name": "alfred-code"}],
+            }
+        planner = ConcurrentPlanner(self.sha, bodies, expected_parallel=2)
+        self.controller.planner = planner
+        self.controller.config = replace(self.config, max_parallel_planners=2)
+
+        result = self.controller.run_once()
+
+        self.assertEqual(planner.maximum_active, 2)
+        self.assertEqual(sorted(planner.calls), [12, 13, 14, 15, 16])
+        self.assertEqual([item["number"] for item in result["issues"]], [12, 13, 14, 15, 16])
+        self.assertTrue(all(item["state"] == "awaiting_approval" for item in result["issues"]))
+
     def test_approval_launches_once_and_restart_adopts_workspace(self):
         self.controller.run_once()
         self.approve()
@@ -577,6 +682,46 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.superset.worker_creates, 1)
         self.controller.run_once()
         self.assertEqual(self.superset.worker_creates, 1)
+
+    def test_running_workspace_reacquires_a_missing_lane_lease(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        self.db.release_lane("api-12")
+        self.assertIsNone(self.db.lease_owner("I"))
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.get_job("api-12")["state"], "running")
+        self.assertEqual(self.db.lease_owner("I"), "api-12")
+
+    def test_independent_lanes_launch_workers_in_the_same_cycle(self):
+        self.plan["jobs"].append(
+            {
+                "id": "web-12",
+                "lane": "II",
+                "title": "Web",
+                "branch": "lane-2/12-web",
+                "paths": ["web.txt"],
+                "verify": "true",
+                "contracts_read": [],
+                "contracts_changed": [],
+                "depends_on": [],
+                "acceptance": ["works independently"],
+            }
+        )
+        self.plan_hash = content_hash(self.plan)
+        self.planner.plan_hash = self.plan_hash
+        self.controller.run_once()
+        self.approve()
+
+        self.controller.run_once()
+
+        self.assertEqual(self.superset.worker_creates, 2)
+        self.assertEqual(self.db.get_job("api-12")["state"], "running")
+        self.assertEqual(self.db.get_job("web-12")["state"], "running")
+        self.assertEqual(self.db.lease_owner("I"), "api-12")
+        self.assertEqual(self.db.lease_owner("II"), "web-12")
 
     def test_prepare_exact_review_branch_is_pinned_and_immutable(self):
         branch = f"review/5-{self.sha[:12]}"

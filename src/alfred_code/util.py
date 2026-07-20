@@ -52,7 +52,10 @@ def run(
     except subprocess.TimeoutExpired as exc:
         raise CommandError(argv, 124, f"timed out after {timeout}s") from exc
     if completed.returncode:
-        raise CommandError(argv, completed.returncode, completed.stderr)
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        if len(detail) > 8000:
+            detail = detail[-8000:] + "\n[command failure output truncated to final 8000 characters]"
+        raise CommandError(argv, completed.returncode, detail)
     return completed.stdout
 
 

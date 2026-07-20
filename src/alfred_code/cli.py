@@ -35,7 +35,8 @@ repo_path = "~/dev/alfred"
 state_dir = "~/.alfred-code-state-v2"
 apply = false
 poll_seconds = 60
-planner_command = ["claude", "-p", "--safe-mode", "--permission-mode", "plan", "--tools", "", "--no-session-persistence", "--no-chrome", "--disable-slash-commands"]
+max_parallel_planners = 3
+planner_command = ["claude", "-p", "--model", "sonnet", "--effort", "high", "--safe-mode", "--permission-mode", "plan", "--tools", "", "--no-session-persistence", "--no-chrome", "--disable-slash-commands"]
 planner_timeout_seconds = 900
 
 [github]
@@ -98,7 +99,11 @@ def build(config: ControllerConfig) -> tuple[Controller, Database]:
 
 
 def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
-    report: dict[str, Any] = {"apply": config.apply, "checks": {}}
+    report: dict[str, Any] = {
+        "apply": config.apply,
+        "scheduler": {"max_parallel_planners": config.max_parallel_planners},
+        "checks": {},
+    }
     healthy = True
 
     def check(name: str, callback: Any, *, required: bool = True) -> None:

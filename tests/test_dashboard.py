@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from alfred_code import dashboard
 from alfred_code.config import ControllerConfig
 from alfred_code.dashboard import DashboardData, TelemetryScanner, serve_dashboard
 from alfred_code.db import Database
@@ -185,3 +186,38 @@ def test_planner_telemetry_is_attributed_to_issue_and_model(tmp_path: Path) -> N
 def test_dashboard_refuses_non_loopback_binding() -> None:
     with pytest.raises(ValueError, match="loopback"):
         serve_dashboard(ControllerConfig(), host="0.0.0.0", port=0)
+
+
+def test_runtime_reports_every_parallel_safe_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        dashboard,
+        "_read_processes",
+        lambda: [
+            {
+                "pid": 100,
+                "ppid": 1,
+                "elapsed": "01:00",
+                "command": "python -m alfred_code.cli serve",
+            },
+            {
+                "pid": 101,
+                "ppid": 100,
+                "elapsed": "00:10",
+                "command": 'claude --model sonnet --effort high --permission-mode plan --json-schema {"properties":{"issue":{"const":325}}}',
+            },
+            {
+                "pid": 102,
+                "ppid": 100,
+                "elapsed": "00:08",
+                "command": 'claude --model sonnet --effort high --permission-mode plan --json-schema {"properties":{"issue":{"const":326}}}',
+            },
+        ],
+    )
+
+    runtime = dashboard._controller_runtime()
+
+    assert [planner["issue"] for planner in runtime["planners"]] == [325, 326]
+    assert runtime["planner"]["issue"] == 325
+    assert runtime["planner"]["model"] == "sonnet"
+    assert runtime["planner"]["effort"] == "high"
+    assert all(planner["safe_mode"] for planner in runtime["planners"])

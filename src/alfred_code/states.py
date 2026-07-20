@@ -34,7 +34,6 @@ ACTIVE_LEASE_STATES = {
     "reviewing",
     "repairing",
     "ready_merge",
-    "blocked",
 }
 
 PROJECT_STATUS = {

@@ -58,9 +58,14 @@ class ControllerConfig:
     state_dir: Path = Path("~/.alfred-code-state-v2").expanduser()
     apply: bool = False
     poll_seconds: int = 60
+    max_parallel_planners: int = 3
     planner_command: tuple[str, ...] = (
         "claude",
         "-p",
+        "--model",
+        "sonnet",
+        "--effort",
+        "high",
         "--safe-mode",
         "--permission-mode",
         "plan",
@@ -111,6 +116,10 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         [
             "claude",
             "-p",
+            "--model",
+            "sonnet",
+            "--effort",
+            "high",
             "--safe-mode",
             "--permission-mode",
             "plan",
@@ -135,6 +144,7 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         state_dir=state_dir,
         apply=bool(raw.get("apply", False)),
         poll_seconds=int(raw.get("poll_seconds", 60)),
+        max_parallel_planners=int(raw.get("max_parallel_planners", 3)),
         planner_command=tuple(planner),
         planner_timeout_seconds=int(raw.get("planner_timeout_seconds", 900)),
         github=GitHubConfig(
@@ -175,6 +185,8 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     )
     if config.poll_seconds < 10:
         raise ConfigurationError("poll_seconds must be at least 10")
+    if not 1 <= config.max_parallel_planners <= 8:
+        raise ConfigurationError("max_parallel_planners must be between 1 and 8")
     if config.superset.worker_launch_timeout_seconds < 30:
         raise ConfigurationError("superset.worker_launch_timeout_seconds must be at least 30")
     if config.superset.worker_progress_timeout_seconds < 60:

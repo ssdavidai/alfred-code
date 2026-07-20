@@ -50,6 +50,8 @@ UUID_RE = re.compile(
 ISSUE_PATH_RE = re.compile(r"/(?:lane-[^/]+|phase0)/(\d+)-")
 REVIEW_PATH_RE = re.compile(r"/review/(\d+)-")
 PLANNER_ISSUE_RE = re.compile(r'\\?"const\\?"\s*:\s*(\d+)')
+PLANNER_MODEL_RE = re.compile(r"(?:^|\s)--model\s+(\S+)")
+PLANNER_EFFORT_RE = re.compile(r"(?:^|\s)--effort\s+(\S+)")
 
 
 def _json(value: str | None, fallback: Any) -> Any:
@@ -115,32 +117,36 @@ def _controller_runtime() -> dict[str, Any]:
         ),
         None,
     )
-    planner = None
+    planners: list[dict[str, Any]] = []
     if controller:
-        child = next(
-            (
-                row
-                for row in rows
-                if row["ppid"] == controller["pid"]
-                and "--permission-mode plan" in row["command"]
-            ),
-            None,
-        )
-        if child:
+        children = [
+            row
+            for row in rows
+            if row["ppid"] == controller["pid"]
+            and "--permission-mode plan" in row["command"]
+        ]
+        for child in children:
             match = PLANNER_ISSUE_RE.search(child["command"])
-            planner = {
-                "pid": child["pid"],
-                "elapsed": child["elapsed"],
-                "issue": int(match.group(1)) if match else None,
-                "provider": "claude",
-                "model": "Configured default (CLI does not report it)",
-                "safe_mode": True,
-            }
+            model_match = PLANNER_MODEL_RE.search(child["command"])
+            effort_match = PLANNER_EFFORT_RE.search(child["command"])
+            planners.append(
+                {
+                    "pid": child["pid"],
+                    "elapsed": child["elapsed"],
+                    "issue": int(match.group(1)) if match else None,
+                    "provider": "claude",
+                    "model": model_match.group(1) if model_match else "configured default",
+                    "effort": effort_match.group(1) if effort_match else None,
+                    "safe_mode": True,
+                }
+            )
+        planners.sort(key=lambda item: (item["issue"] is None, item["issue"] or 0))
     return {
         "running": controller is not None,
         "pid": controller["pid"] if controller else None,
         "elapsed": controller["elapsed"] if controller else None,
-        "planner": planner,
+        "planner": planners[0] if planners else None,
+        "planners": planners,
     }
 
 
@@ -733,6 +739,7 @@ class DashboardData:
         ]
 
         runtime = _controller_runtime()
+        runtime["max_parallel_planners"] = self.config.max_parallel_planners
         superset_running, superset_pid = _pid_is_running(
             Path("~/.superset/terminal-host.pid").expanduser()
         )

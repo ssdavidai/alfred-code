@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,18 @@ def extract_planner_result(text: str) -> tuple[dict[str, Any], dict[str, Any] | 
     return envelope, None
 
 
+@dataclass(frozen=True)
+class PreparedPlan:
+    """Immutable, read-only planner input captured at one repository/GitHub snapshot."""
+
+    issue_number: int
+    base_sha: str
+    issue_body_hash: str
+    decision_context_hash: str
+    policy: LanePolicy
+    prompt: str
+
+
 class Planner:
     def __init__(self, config: ControllerConfig, github: GitHubClient, validator: PlanValidator):
         self.config = config
@@ -190,9 +203,14 @@ class Planner:
         base_sha: str,
         policy_text: str,
         decision_comments: list[dict[str, str]],
+        *,
+        open_prs: list[dict[str, Any]] | None = None,
+        evidence: str | None = None,
     ) -> str:
-        open_prs = self.github.open_prs()
-        evidence = self.repository_evidence(base_sha)
+        if open_prs is None:
+            open_prs = self.github.open_prs()
+        if evidence is None:
+            evidence = self.repository_evidence(base_sha)
         return f"""You are specifying GitHub issue #{issue['number']} for deterministic multi-agent execution.
 
 The plan is executable input, not prose. Trust the live source tree, tests, git objects, and current GitHub state. Markdown documents are claims: use them to find intent, but verify every claim against code and configuration. Do not modify anything. Do not create branches or issues. Return exactly one JSON object and no commentary.
@@ -242,41 +260,76 @@ Required schema:
 Rules: one job per lane; one agent per job. Jobs in different lanes must not have overlapping write paths. Use phase0 only for forbidden-zone or contract changes, and make every downstream lane depend directly on it. Identify all impacted lanes from actual code. Do not invent lanes VI/VII unless the live authority defines them. Every verify command must exercise the real package. Never include merge, deletion, deployment, or secret-reading steps.
 """
 
-    def plan_issue(self, issue_number: int) -> tuple[dict[str, Any], str]:
-        issue = self.github.issue(issue_number)
-        decision_comments = self.github.decision_comments(issue_number)
-        decision_context_hash = content_hash(
-            {
-                "body": str(issue.get("body") or ""),
-                "comments": decision_comments,
-            }
-        )
+    def prepare_plans(self, issue_numbers: list[int]) -> list[PreparedPlan]:
+        """Capture shared repository evidence once before parallel model execution."""
+        if not issue_numbers:
+            return []
         base_sha = self.github.default_branch_sha()
         run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
         policy, policy_text = self.policy_at(base_sha)
+        evidence = self.repository_evidence(base_sha)
+        open_prs = self.github.open_prs()
+        prepared: list[PreparedPlan] = []
+        for issue_number in issue_numbers:
+            issue = self.github.issue(issue_number)
+            decision_comments = self.github.decision_comments(issue_number)
+            decision_context_hash = content_hash(
+                {
+                    "body": str(issue.get("body") or ""),
+                    "comments": decision_comments,
+                }
+            )
+            prepared.append(
+                PreparedPlan(
+                    issue_number=issue_number,
+                    base_sha=base_sha,
+                    issue_body_hash=content_hash(str(issue.get("body") or "")),
+                    decision_context_hash=decision_context_hash,
+                    policy=policy,
+                    prompt=self.prompt(
+                        issue,
+                        base_sha,
+                        policy_text,
+                        decision_comments,
+                        open_prs=open_prs,
+                        evidence=evidence,
+                    ),
+                )
+            )
+        return prepared
+
+    def execute_plan(self, prepared: PreparedPlan) -> tuple[dict[str, Any], str]:
+        """Run only the isolated model command; safe to call in a bounded worker thread."""
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         started = time.monotonic()
         output = run(
-            structured_planner_command(self.config.planner_command, issue_number, base_sha),
+            structured_planner_command(
+                self.config.planner_command,
+                prepared.issue_number,
+                prepared.base_sha,
+            ),
             cwd=self.config.repo_path,
-            input_text=self.prompt(issue, base_sha, policy_text, decision_comments),
+            input_text=prepared.prompt,
             timeout=self.config.planner_timeout_seconds,
         )
         raw, envelope = extract_planner_result(output)
         if envelope is not None:
             self._record_usage(
-                issue_number,
+                prepared.issue_number,
                 envelope,
                 started_at=started_at,
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
-        return PlanValidator(policy).validate(
+        return PlanValidator(prepared.policy).validate(
             raw,
-            issue_number=issue_number,
-            base_sha=base_sha,
-            issue_body_hash=content_hash(str(issue.get("body") or "")),
-            decision_context_hash=decision_context_hash,
+            issue_number=prepared.issue_number,
+            base_sha=prepared.base_sha,
+            issue_body_hash=prepared.issue_body_hash,
+            decision_context_hash=prepared.decision_context_hash,
         )
+
+    def plan_issue(self, issue_number: int) -> tuple[dict[str, Any], str]:
+        return self.execute_plan(self.prepare_plans([issue_number])[0])
 
     def revalidate(self, plan: dict[str, Any], expected_hash: str) -> None:
         run(

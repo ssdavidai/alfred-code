@@ -406,11 +406,12 @@
     function renderRuntime() {
       const runtime = state.snapshot.runtime;
       const controller = runtime.controller;
-      $('controllerDot').className = `dot ${controller.running ? (controller.planner ? 'busy' : 'ok') : 'bad'}`;
+      const planners = controller.planners || (controller.planner ? [controller.planner] : []);
+      $('controllerDot').className = `dot ${controller.running ? (planners.length ? 'busy' : 'ok') : 'bad'}`;
       $('controllerStatus').textContent = !controller.running
         ? 'Controller stopped'
-        : controller.planner
-          ? `Safely planning #${controller.planner.issue || '?'} · ${controller.planner.elapsed}`
+        : planners.length
+          ? `${planners.length}/${controller.max_parallel_planners || '?'} safe planners · ${planners.map((planner) => `#${planner.issue || '?'}`).join(', ')}`
           : `Controller live · ${controller.elapsed}`;
       $('supersetDot').className = `dot ${runtime.superset.running ? 'ok' : 'bad'}`;
       $('supersetStatus').textContent = runtime.superset.running ? 'Superset healthy' : 'Superset unavailable';
@@ -484,7 +485,7 @@
         section.append(head, body);
         board.append(section);
       });
-      $('coverage').textContent = `${state.snapshot.analytics.measured_sessions} measured agent sessions · planner tokens clearly marked unavailable`;
+      $('coverage').textContent = `${state.snapshot.analytics.measured_sessions} measured agent sessions · ${state.snapshot.analytics.measured_plans} measured planner runs`;
     }
 
     function renderIssueBars() {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ from .db import Database
 from .errors import AlfredCodeError, AuthorityUnavailable, CommandError, PlanValidationError
 from .github import GitHubClient, PullRequestObservation
 from .notify import DurableNotifier
-from .planner import Planner
+from .planner import Planner, PreparedPlan
 from .plans import path_matches
 from .project import ProjectBoard
 from .states import TERMINAL_JOB_STATES
@@ -194,17 +195,82 @@ class Controller:
         except Exception as exc:
             self._record("reconcile.authority_failed", authority="github", error=str(exc))
             raise
-        for issue in issues:
-            number = int(issue["number"])
+        reconciled_leases = self.database.prune_lane_leases()
+        if reconciled_leases:
+            self._record("lanes.reconciled", released=reconciled_leases)
+        issue_numbers = [int(issue["number"]) for issue in issues]
+        planning: list[int] = []
+        ready: list[int] = []
+        issue_summaries: dict[int, dict[str, Any]] = {}
+
+        for number in issue_numbers:
+            live = self.github.issue(number)
+            issue = self.database.upsert_issue(live)
+            if issue["github_state"] == "OPEN" and self.config.apply:
+                current, _jobs, halted = self._prepare_plan_state(issue)
+                if current is None and not halted:
+                    planning.append(number)
+                    continue
+            ready.append(number)
+
+        prepared: list[PreparedPlan] = []
+        if planning:
             try:
-                result = self.process_issue(number)
+                prepared = self.planner.prepare_plans(planning)
             except Exception as exc:
-                error = {"issue": number, "error": str(exc), "type": type(exc).__name__}
-                summary["errors"].append(error)
-                self.database.event("issue.reconcile_failed", error, issue_number=number)
-                self._record("issue.reconcile_failed", **error)
-                continue
-            summary["issues"].append(result)
+                for number in planning:
+                    self._record_planning_failure(summary, number, exc)
+                    issue_summaries[number] = self._issue_summary(number)
+                planning = []
+
+        with ThreadPoolExecutor(
+            max_workers=min(self.config.max_parallel_planners, max(1, len(prepared))),
+            thread_name_prefix="alfred-planner",
+        ) as pool:
+            futures: dict[Future[tuple[dict[str, Any], str]], int] = {
+                pool.submit(self.planner.execute_plan, item): item.issue_number
+                for item in prepared
+            }
+            if futures:
+                self._record(
+                    "planning.batch_started",
+                    issues=sorted(futures.values()),
+                    max_parallel=self.config.max_parallel_planners,
+                )
+
+            # Existing approvals, jobs, and reviews keep moving while the read-only
+            # planners work. This prevents a specification backlog from blocking builds.
+            for number in ready:
+                self._process_issue_into(summary, issue_summaries, number)
+
+            for future in as_completed(futures):
+                number = futures[future]
+                try:
+                    plan, plan_hash = future.result()
+                except Exception as exc:
+                    self._record_planning_failure(summary, number, exc)
+                    issue_summaries[number] = self._issue_summary(number)
+                    continue
+                try:
+                    self._publish_generated_plan(number, plan, plan_hash)
+                    self._record("planning.completed", issue=number, plan_hash=plan_hash)
+                except Exception as exc:
+                    self._record_issue_error(summary, number, exc)
+                    issue_summaries[number] = self._issue_summary(number)
+                    continue
+                self._process_issue_into(
+                    summary,
+                    issue_summaries,
+                    number,
+                    plan_state_prepared=True,
+                )
+
+        summary["issues"] = [
+            issue_summaries[number]
+            for number in issue_numbers
+            if number in issue_summaries
+        ]
+        summary["errors"].sort(key=lambda item: int(item["issue"]))
         summary["finished_at"] = utcnow()
         self._record(
             "reconcile.finished",
@@ -213,24 +279,71 @@ class Controller:
         )
         return summary
 
-    def process_issue(self, issue_number: int) -> dict[str, Any]:
-        live = self.github.issue(issue_number)
-        issue = self.database.upsert_issue(live)
+    def _process_issue_into(
+        self,
+        summary: dict[str, Any],
+        issue_summaries: dict[int, dict[str, Any]],
+        issue_number: int,
+        *,
+        plan_state_prepared: bool = False,
+    ) -> None:
+        try:
+            issue_summaries[issue_number] = self.process_issue(
+                issue_number,
+                plan_state_prepared=plan_state_prepared,
+            )
+        except Exception as exc:
+            self._record_issue_error(summary, issue_number, exc)
+
+    def _record_issue_error(
+        self,
+        summary: dict[str, Any],
+        issue_number: int,
+        exc: Exception,
+    ) -> None:
+        error = {
+            "issue": issue_number,
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+        summary["errors"].append(error)
+        self.database.event(
+            "issue.reconcile_failed",
+            error,
+            issue_number=issue_number,
+        )
+        self._record("issue.reconcile_failed", **error)
+
+    def _record_planning_failure(
+        self,
+        summary: dict[str, Any],
+        issue_number: int,
+        exc: Exception,
+    ) -> None:
+        self.database.set_issue_state(issue_number, "blocked", {"reason": str(exc)})
+        self.notifier.send(
+            f"issue:{issue_number}:planning-failed:{type(exc).__name__}",
+            f"Alfred #{issue_number} could not be specified: {exc}",
+            {"issue": issue_number},
+        )
+        self._sync_project(issue_number)
+        error = {
+            "issue": issue_number,
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+        summary["errors"].append(error)
+        self.database.event("issue.reconcile_failed", error, issue_number=issue_number)
+        self._record("issue.reconcile_failed", **error)
+
+    def _prepare_plan_state(
+        self,
+        issue: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool]:
+        """Apply serial plan invalidation rules before model work is scheduled."""
+        issue_number = int(issue["number"])
         current = self.database.current_plan(issue_number)
         jobs = self.database.list_jobs(issue_number)
-        if issue["github_state"] == "CLOSED":
-            if (
-                self.config.apply
-                and current
-                and self._recover_premature_multi_job_close(live, current["plan"], jobs)
-            ):
-                self._sync_project(issue_number)
-                return self._issue_summary(issue_number)
-            self._close_issue(issue_number, recovery_checked=True)
-            self._sync_project(issue_number)
-            return self._issue_summary(issue_number)
-        if not self.config.apply:
-            return self._issue_summary(issue_number)
 
         if current and current["plan"].get("issue_body_hash") != issue["body_hash"]:
             active = [job for job in jobs if job["state"] not in TERMINAL_JOB_STATES]
@@ -246,14 +359,14 @@ class Controller:
                     {"issue": issue_number, "url": issue.get("url")},
                 )
                 self._sync_project(issue_number)
-                return self._issue_summary(issue_number)
+                return current, jobs, True
             self.database.invalidate_plan(issue_number, "issue body changed")
             current = None
 
         if current and not jobs and not self.database.is_approved(current["plan_hash"]):
             if current["status"] == "rejected":
                 self._sync_project(issue_number)
-                return self._issue_summary(issue_number)
+                return current, jobs, True
             feedback = self.github.find_feedback(issue_number, after=current["created_at"])
             if feedback:
                 self.database.invalidate_plan(
@@ -271,11 +384,60 @@ class Controller:
         if current and not jobs and not self.database.is_approved(current["plan_hash"]):
             live_sha = self.github.default_branch_sha()
             if live_sha != current["base_sha"]:
-                self.database.invalidate_plan(issue_number, "default branch advanced before approval")
+                self.database.invalidate_plan(
+                    issue_number,
+                    "default branch advanced before approval",
+                )
                 current = None
 
         if current is None:
             self.database.set_issue_state(issue_number, "planning")
+        return current, jobs, False
+
+    def _publish_generated_plan(
+        self,
+        issue_number: int,
+        plan: dict[str, Any],
+        plan_hash: str,
+    ) -> None:
+        self.database.save_plan(issue_number, plan_hash, plan)
+        plan_url = self.github.post_plan(issue_number, plan, plan_hash)
+        issue = self.database.get_issue(issue_number) or {}
+        self.notifier.send(
+            f"issue:{issue_number}:plan:{plan_hash}",
+            f"Alfred #{issue_number} is specified in {len(plan['jobs'])} lane job(s). Approve plan {plan_hash[:12]} in GitHub: {plan_url or issue.get('url')}",
+            {"issue": issue_number, "plan_hash": plan_hash, "url": plan_url},
+        )
+
+    def process_issue(
+        self,
+        issue_number: int,
+        *,
+        plan_state_prepared: bool = False,
+    ) -> dict[str, Any]:
+        live = self.github.issue(issue_number)
+        issue = self.database.upsert_issue(live)
+        current = self.database.current_plan(issue_number)
+        jobs = self.database.list_jobs(issue_number)
+        if issue["github_state"] == "CLOSED":
+            if (
+                self.config.apply
+                and current
+                and self._recover_premature_multi_job_close(live, current["plan"], jobs)
+            ):
+                self._sync_project(issue_number)
+                return self._issue_summary(issue_number)
+            self._close_issue(issue_number, recovery_checked=True)
+            self._sync_project(issue_number)
+            return self._issue_summary(issue_number)
+        if not self.config.apply:
+            return self._issue_summary(issue_number)
+        if not plan_state_prepared:
+            current, jobs, halted = self._prepare_plan_state(issue)
+            if halted:
+                return self._issue_summary(issue_number)
+
+        if current is None:
             try:
                 plan, plan_hash = self.planner.plan_issue(issue_number)
             except (AlfredCodeError, OSError) as exc:
@@ -287,13 +449,7 @@ class Controller:
                 )
                 self._sync_project(issue_number)
                 raise
-            self.database.save_plan(issue_number, plan_hash, plan)
-            plan_url = self.github.post_plan(issue_number, plan, plan_hash)
-            self.notifier.send(
-                f"issue:{issue_number}:plan:{plan_hash}",
-                f"Alfred #{issue_number} is specified in {len(plan['jobs'])} lane job(s). Approve plan {plan_hash[:12]} in GitHub: {plan_url or issue.get('url')}",
-                {"issue": issue_number, "plan_hash": plan_hash, "url": plan_url},
-            )
+            self._publish_generated_plan(issue_number, plan, plan_hash)
             current = self.database.current_plan(issue_number)
             if current is None:
                 raise RuntimeError("saved plan disappeared")
@@ -561,6 +717,12 @@ class Controller:
                 return
         pr = self.github.pr_for_branch(job["branch"])
         if pr:
+            if (
+                not pr.merged
+                and not pr.closed_unmerged
+                and not self._ensure_existing_job_lane(issue, job)
+            ):
+                return
             self.database.observe("github", f"pr:{pr.number}", asdict(pr))
             if not job.get("workspace_id"):
                 workspace = self.superset.workspace_by_name(
@@ -588,6 +750,8 @@ class Controller:
         ):
             return
         if job["workspace_id"]:
+            if not self._ensure_existing_job_lane(issue, job):
+                return
             details = self.superset.workspace_details(job["workspace_id"])
             self.database.observe("superset", f"workspace:{job['workspace_id']}", details)
             scope_error = self._worker_workspace_error(issue, plan, job, details)
@@ -699,6 +863,26 @@ class Controller:
             self.database.update_job(job_id, state="blocked", last_error=str(exc))
             self.database.release_lane(job_id)
             raise
+
+    def _ensure_existing_job_lane(
+        self,
+        issue: dict[str, Any],
+        job: dict[str, Any],
+    ) -> bool:
+        """Adopt or heartbeat a durable lane before touching existing work."""
+        lane = str(job["lane"])
+        job_id = str(job["job_id"])
+        if self.database.acquire_lane(lane, job_id):
+            return True
+        owner = self.database.lease_owner(lane) or "another active job"
+        error = f"lane {lane} is owned by {owner}; existing work cannot resume concurrently"
+        self.database.update_job(job_id, state="blocked", last_error=error)
+        self.notifier.send(
+            f"job:{job_id}:lane-conflict:{owner}",
+            f"Alfred #{issue['number']} lane {lane} is blocked by concurrent owner {owner}.",
+            {"job": job_id, "lane": lane, "owner": owner},
+        )
+        return False
 
     def _reconcile_pr(
         self,
