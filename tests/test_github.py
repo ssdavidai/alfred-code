@@ -82,6 +82,19 @@ class GitHubTests(unittest.TestCase):
         self.assertNotIn(5, client._pr_comments)
         self.assertNotIn(5, client._issue_comments)
 
+    def test_creating_pr_invalidates_cached_missing_branch_observation(self):
+        client = GitHubClient(
+            GitHubConfig(repo="owner/repo", owner="owner", approvers=("owner",))
+        )
+        branch = "lane-1/7-api"
+        client._pull_requests[branch] = None
+        client._run = lambda arguments, timeout=120: "https://example/pr/7\n"
+
+        result = client.create_pr(branch=branch, title="Feature", body="Evidence")
+
+        self.assertEqual(result, "https://example/pr/7")
+        self.assertNotIn(branch, client._pull_requests)
+
     def test_close_and_reopen_issue_use_explicit_state_commands_and_invalidate_cache(self):
         client = GitHubClient(
             GitHubConfig(repo="owner/repo", owner="owner", approvers=("owner",))

@@ -64,6 +64,35 @@ class DatabaseTests(unittest.TestCase):
         self.database.release_lane("job-7")
         self.assertIsNone(self.database.lease_owner("I"))
 
+    def test_non_active_job_transition_releases_its_lane_atomically(self):
+        digest = "p" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        self.database.materialize_jobs(7, digest, self.plan)
+        self.assertTrue(self.database.acquire_lane("I", "job-7"))
+        self.database.update_job("job-7", state="running")
+        self.assertEqual(self.database.lease_owner("I"), "job-7")
+
+        self.database.update_job("job-7", state="blocked", last_error="needs attention")
+
+        self.assertIsNone(self.database.lease_owner("I"))
+        released = [event for event in self.database.events() if event["kind"] == "lane.released"]
+        self.assertEqual(released[-1]["detail"]["reason"], "job entered blocked")
+
+    def test_startup_reconciliation_prunes_a_legacy_blocked_lease(self):
+        digest = "p" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        self.database.materialize_jobs(7, digest, self.plan)
+        self.database.update_job("job-7", state="blocked", last_error="legacy blocker")
+        self.assertTrue(self.database.acquire_lane("I", "job-7"))
+
+        removed = self.database.prune_lane_leases()
+
+        self.assertEqual(removed[0]["job_id"], "job-7")
+        self.assertEqual(removed[0]["state"], "blocked")
+        self.assertIsNone(self.database.lease_owner("I"))
+
     def test_new_plan_revokes_old_approval(self):
         self.database.save_plan(7, "a" * 64, self.plan)
         self.database.record_approval(7, "a" * 64, "ssdavidai", "1", None, "now")

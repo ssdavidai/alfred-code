@@ -55,6 +55,10 @@ class GitHubClient:
         self._pr_comments.clear()
         self._default_branch_sha = None
 
+    def invalidate_pr(self, branch: str) -> None:
+        """Forget a PR observation after this controller mutates its branch."""
+        self._pull_requests.pop(branch, None)
+
     def _run(self, arguments: list[str], *, timeout: int = 120) -> str:
         try:
             return run([self.binary, *arguments], timeout=timeout)
@@ -181,7 +185,7 @@ class GitHubClient:
         self._pr_comments.pop(number, None)
 
     def create_pr(self, *, branch: str, title: str, body: str, base: str = "main") -> str:
-        return self._run(
+        url = self._run(
             [
                 "pr",
                 "create",
@@ -197,6 +201,8 @@ class GitHubClient:
                 body,
             ]
         ).strip()
+        self.invalidate_pr(branch)
+        return url
 
     def post_pr_comment(self, number: int, body: str) -> str:
         result = self._run(

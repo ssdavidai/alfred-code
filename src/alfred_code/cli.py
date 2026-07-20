@@ -14,7 +14,14 @@ from typing import Any
 
 from .audit import AuditLog
 from .agent_security import SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID
-from .config import DEFAULT_CONFIG, ControllerConfig, load_config
+from .config import (
+    DEFAULT_CONFIG,
+    DEFAULT_PLANNER_COMMAND,
+    ControllerConfig,
+    load_config,
+    planner_profile_path,
+    validate_planner_profile,
+)
 from .controller import Controller
 from .db import Database
 from .errors import AlfredCodeError, AuthorityUnavailable
@@ -35,7 +42,8 @@ repo_path = "~/dev/alfred"
 state_dir = "~/.alfred-code-state-v2"
 apply = false
 poll_seconds = 60
-planner_command = ["claude", "-p", "--safe-mode", "--permission-mode", "plan", "--tools", "", "--no-session-persistence", "--no-chrome", "--disable-slash-commands"]
+max_parallel_planners = 3
+planner_command = {json.dumps(list(DEFAULT_PLANNER_COMMAND))}
 planner_timeout_seconds = 900
 
 [github]
@@ -98,7 +106,11 @@ def build(config: ControllerConfig) -> tuple[Controller, Database]:
 
 
 def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
-    report: dict[str, Any] = {"apply": config.apply, "checks": {}}
+    report: dict[str, Any] = {
+        "apply": config.apply,
+        "scheduler": {"max_parallel_planners": config.max_parallel_planners},
+        "checks": {},
+    }
     healthy = True
 
     def check(name: str, callback: Any, *, required: bool = True) -> None:
@@ -131,14 +143,17 @@ def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
         return {"path": str(config.database_path), "schema": version}
 
     check("database", database_check)
-    check(
-        "planner",
-        lambda: {
+    def planner_check() -> dict[str, Any]:
+        binary = shutil.which(config.planner_command[0])
+        if not binary:
+            raise FileNotFoundError(config.planner_command[0])
+        return {
             "command": list(config.planner_command),
-            "binary": shutil.which(config.planner_command[0])
-            or (_ for _ in ()).throw(FileNotFoundError(config.planner_command[0])),
-        },
-    )
+            "binary": binary,
+            "profile": validate_planner_profile(planner_profile_path(config.planner_command)),
+        }
+
+    check("planner", planner_check)
     check("github", lambda: GitHubClient(config.github).doctor())
     check("superset", lambda: SupersetClient(config.superset).doctor())
     check("superset_scoped_agents", inspect_agent_configs)
@@ -192,6 +207,13 @@ def parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="Run the reconciliation loop with a singleton lock")
     serve.add_argument("--apply", action="store_true", help="Allow planning and Superset launches")
     serve.add_argument("--dry-run", action="store_true", help="Force read-only observation")
+
+    dashboard = sub.add_parser(
+        "dashboard", help="Run the read-only local operations dashboard"
+    )
+    dashboard.add_argument("--host", default="127.0.0.1", help="Loopback address to bind")
+    dashboard.add_argument("--port", type=int, default=7331, help="Local port to bind")
+    dashboard.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
 
     migrate = sub.add_parser("migrate-legacy", help="Import old JSON and log evidence without trusting its state")
     migrate.add_argument("--legacy-dir", type=Path, default=Path("~/.alfred-code-state").expanduser())
@@ -286,6 +308,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "worktrees-audit":
             emit(audit_worktrees(config.repo_path, GitHubClient(config.github)))
             return 0
+        if args.command == "dashboard":
+            from .dashboard import serve_dashboard
+
+            return serve_dashboard(
+                config,
+                host=args.host,
+                port=args.port,
+                open_browser=args.open,
+            )
         effective = resolved_apply(config, args)
         if args.command in {"run-once", "serve"} and effective.apply:
             report, healthy = doctor(effective)

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ssdavidai.alfred-code-dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ALFRED_CODE_BIN__</string>
+    <string>--config</string>
+    <string>__ALFRED_CODE_CONFIG__</string>
+    <string>dashboard</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>7331</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>WorkingDirectory</key>
+  <string>__ALFRED_CODE_ROOT__</string>
+  <key>StandardOutPath</key>
+  <string>__ALFRED_CODE_STATE__/dashboard.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ALFRED_CODE_STATE__/dashboard.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:__HOME__/.claude/bin:__HOME__/.superset/bin:/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

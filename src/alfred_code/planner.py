@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
+from .audit import AuditLog
 from .config import ControllerConfig
 from .errors import CommandError, PlanValidationError
 from .github import GitHubClient
@@ -85,17 +90,116 @@ def plan_json_schema(issue_number: int, base_sha: str) -> dict[str, Any]:
 
 
 def structured_planner_command(
-    command: tuple[str, ...], issue_number: int, base_sha: str
+    command: tuple[str, ...],
+    issue_number: int,
+    base_sha: str,
+    *,
+    schema_path: Path | None = None,
 ) -> list[str]:
     argv = list(command)
-    if Path(argv[0]).name == "claude" and "--json-schema" not in argv:
+    provider = planner_provider(command)
+    if provider == "claude":
+        if "--output-format" not in argv:
+            argv.extend(["--output-format", "json"])
+    if provider == "claude" and "--json-schema" not in argv:
         argv.extend(
             [
                 "--json-schema",
                 json.dumps(plan_json_schema(issue_number, base_sha), separators=(",", ":")),
             ]
         )
+    if provider == "codex":
+        if schema_path is None:
+            raise ValueError("Codex planner requires a JSON schema file")
+        if argv[-1:] == ["-"]:
+            argv.pop()
+        if "--output-schema" not in argv:
+            argv.extend(["--output-schema", str(schema_path)])
+        if "--json" not in argv:
+            argv.append("--json")
+        argv.append("-")
     return argv
+
+
+def planner_provider(command: tuple[str, ...]) -> str:
+    name = Path(command[0]).name
+    if name in {"claude", "codex"}:
+        return name
+    return "custom"
+
+
+def planner_model(command: tuple[str, ...]) -> str:
+    for index, argument in enumerate(command[:-1]):
+        if argument in {"--model", "-m"}:
+            return command[index + 1]
+    return "configured default"
+
+
+def _codex_jsonl_result(text: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("type"), str):
+            events.append(value)
+    if not events or not any(event.get("type") == "turn.completed" for event in events):
+        return None
+    messages = [
+        str(item.get("text") or "")
+        for event in events
+        if event.get("type") == "item.completed"
+        and isinstance((item := event.get("item")), dict)
+        and item.get("type") == "agent_message"
+    ]
+    if not messages:
+        raise PlanValidationError(["Codex planner completed without a final agent message"])
+    usage_events = [event for event in events if event.get("type") == "turn.completed"]
+    usage = usage_events[-1].get("usage") if usage_events else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    thread = next((event for event in events if event.get("type") == "thread.started"), {})
+    return extract_json(messages[-1]), {
+        "provider": "codex",
+        "session_id": str(thread.get("thread_id") or ""),
+        "num_turns": len(usage_events),
+        "usage": usage,
+    }
+
+
+def extract_planner_result(text: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Return the structured plan and an optional provider usage envelope."""
+    codex = _codex_jsonl_result(text)
+    if codex is not None:
+        return codex
+    try:
+        envelope = json.loads(text.strip())
+    except json.JSONDecodeError:
+        return extract_json(text), None
+    if not isinstance(envelope, dict):
+        return extract_json(text), None
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        return structured, envelope
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        return result, envelope
+    if isinstance(result, str):
+        return extract_json(result), envelope
+    return envelope, None
+
+
+@dataclass(frozen=True)
+class PreparedPlan:
+    """Immutable, read-only planner input captured at one repository/GitHub snapshot."""
+
+    issue_number: int
+    base_sha: str
+    issue_body_hash: str
+    decision_context_hash: str
+    policy: LanePolicy
+    prompt: str
 
 
 class Planner:
@@ -103,6 +207,37 @@ class Planner:
         self.config = config
         self.github = github
         self.validator = validator
+        self.telemetry = AuditLog(config.state_dir / "planner-telemetry.jsonl")
+
+    def _record_usage(
+        self,
+        issue_number: int,
+        envelope: dict[str, Any],
+        *,
+        started_at: str,
+        duration_ms: int,
+    ) -> None:
+        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+        provider = str(envelope.get("provider") or planner_provider(self.config.planner_command))
+        model = str(envelope.get("model") or planner_model(self.config.planner_command))
+        model_usage = (
+            envelope.get("modelUsage") if isinstance(envelope.get("modelUsage"), dict) else {}
+        )
+        if not model_usage and provider == "codex":
+            model_usage = {model: usage}
+        self.telemetry.write(
+            "planner.usage",
+            issue_number=issue_number,
+            provider=provider,
+            model=model,
+            session_id=str(envelope.get("session_id") or ""),
+            started_at=started_at,
+            duration_ms=int(envelope.get("duration_ms") or duration_ms),
+            duration_api_ms=int(envelope.get("duration_api_ms") or 0),
+            num_turns=int(envelope.get("num_turns") or 0),
+            usage=usage,
+            model_usage=model_usage,
+        )
 
     def repository_evidence(self, base_sha: str) -> str:
         repo = self.config.repo_path
@@ -139,9 +274,14 @@ class Planner:
         base_sha: str,
         policy_text: str,
         decision_comments: list[dict[str, str]],
+        *,
+        open_prs: list[dict[str, Any]] | None = None,
+        evidence: str | None = None,
     ) -> str:
-        open_prs = self.github.open_prs()
-        evidence = self.repository_evidence(base_sha)
+        if open_prs is None:
+            open_prs = self.github.open_prs()
+        if evidence is None:
+            evidence = self.repository_evidence(base_sha)
         return f"""You are specifying GitHub issue #{issue['number']} for deterministic multi-agent execution.
 
 The plan is executable input, not prose. Trust the live source tree, tests, git objects, and current GitHub state. Markdown documents are claims: use them to find intent, but verify every claim against code and configuration. Do not modify anything. Do not create branches or issues. Return exactly one JSON object and no commentary.
@@ -191,32 +331,95 @@ Required schema:
 Rules: one job per lane; one agent per job. Jobs in different lanes must not have overlapping write paths. Use phase0 only for forbidden-zone or contract changes, and make every downstream lane depend directly on it. Identify all impacted lanes from actual code. Do not invent lanes VI/VII unless the live authority defines them. Every verify command must exercise the real package. Never include merge, deletion, deployment, or secret-reading steps.
 """
 
-    def plan_issue(self, issue_number: int) -> tuple[dict[str, Any], str]:
-        issue = self.github.issue(issue_number)
-        decision_comments = self.github.decision_comments(issue_number)
-        decision_context_hash = content_hash(
-            {
-                "body": str(issue.get("body") or ""),
-                "comments": decision_comments,
-            }
-        )
+    def prepare_plans(self, issue_numbers: list[int]) -> list[PreparedPlan]:
+        """Capture shared repository evidence once before parallel model execution."""
+        if not issue_numbers:
+            return []
         base_sha = self.github.default_branch_sha()
         run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
         policy, policy_text = self.policy_at(base_sha)
-        output = run(
-            structured_planner_command(self.config.planner_command, issue_number, base_sha),
-            cwd=self.config.repo_path,
-            input_text=self.prompt(issue, base_sha, policy_text, decision_comments),
-            timeout=self.config.planner_timeout_seconds,
-        )
-        raw = extract_json(output)
-        return PlanValidator(policy).validate(
+        evidence = self.repository_evidence(base_sha)
+        open_prs = self.github.open_prs()
+        prepared: list[PreparedPlan] = []
+        for issue_number in issue_numbers:
+            issue = self.github.issue(issue_number)
+            decision_comments = self.github.decision_comments(issue_number)
+            decision_context_hash = content_hash(
+                {
+                    "body": str(issue.get("body") or ""),
+                    "comments": decision_comments,
+                }
+            )
+            prepared.append(
+                PreparedPlan(
+                    issue_number=issue_number,
+                    base_sha=base_sha,
+                    issue_body_hash=content_hash(str(issue.get("body") or "")),
+                    decision_context_hash=decision_context_hash,
+                    policy=policy,
+                    prompt=self.prompt(
+                        issue,
+                        base_sha,
+                        policy_text,
+                        decision_comments,
+                        open_prs=open_prs,
+                        evidence=evidence,
+                    ),
+                )
+            )
+        return prepared
+
+    def execute_plan(self, prepared: PreparedPlan) -> tuple[dict[str, Any], str]:
+        """Run only the isolated model command; safe to call in a bounded worker thread."""
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        started = time.monotonic()
+        provider = planner_provider(self.config.planner_command)
+        if provider == "codex":
+            with TemporaryDirectory(prefix=f"alfred-code-plan-{prepared.issue_number}-") as directory:
+                schema_path = Path(directory) / "plan.schema.json"
+                schema_path.write_text(
+                    json.dumps(plan_json_schema(prepared.issue_number, prepared.base_sha))
+                )
+                output = run(
+                    structured_planner_command(
+                        self.config.planner_command,
+                        prepared.issue_number,
+                        prepared.base_sha,
+                        schema_path=schema_path,
+                    ),
+                    cwd=self.config.repo_path,
+                    input_text=prepared.prompt,
+                    timeout=self.config.planner_timeout_seconds,
+                )
+        else:
+            output = run(
+                structured_planner_command(
+                    self.config.planner_command,
+                    prepared.issue_number,
+                    prepared.base_sha,
+                ),
+                cwd=self.config.repo_path,
+                input_text=prepared.prompt,
+                timeout=self.config.planner_timeout_seconds,
+            )
+        raw, envelope = extract_planner_result(output)
+        if envelope is not None:
+            self._record_usage(
+                prepared.issue_number,
+                envelope,
+                started_at=started_at,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        return PlanValidator(prepared.policy).validate(
             raw,
-            issue_number=issue_number,
-            base_sha=base_sha,
-            issue_body_hash=content_hash(str(issue.get("body") or "")),
-            decision_context_hash=decision_context_hash,
+            issue_number=prepared.issue_number,
+            base_sha=prepared.base_sha,
+            issue_body_hash=prepared.issue_body_hash,
+            decision_context_hash=prepared.decision_context_hash,
         )
+
+    def plan_issue(self, issue_number: int) -> tuple[dict[str, Any], str]:
+        return self.execute_plan(self.prepare_plans([issue_number])[0])
 
     def revalidate(self, plan: dict[str, Any], expected_hash: str) -> None:
         run(

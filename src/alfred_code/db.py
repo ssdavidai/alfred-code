@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .states import ISSUE_STATES, JOB_STATES
+from .states import ACTIVE_LEASE_STATES, ISSUE_STATES, JOB_STATES
 from .util import canonical_json, utcnow
 
 
@@ -547,6 +547,20 @@ class Database:
                 f"UPDATE jobs SET {assignments} WHERE job_id = ?",
                 (*updates.values(), job_id),
             )
+            if state is not None and state not in ACTIVE_LEASE_STATES:
+                lease = conn.execute(
+                    "SELECT lane FROM lane_leases WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                conn.execute("DELETE FROM lane_leases WHERE job_id = ?", (job_id,))
+                if lease is not None:
+                    self.event(
+                        "lane.released",
+                        {"lane": lease["lane"], "reason": f"job entered {state}"},
+                        issue_number=previous["issue_number"],
+                        job_id=job_id,
+                        connection=conn,
+                    )
             if state is not None and state != previous["state"]:
                 self.event(
                     "job.transition",
@@ -560,6 +574,16 @@ class Database:
     def acquire_lane(self, lane: str, job_id: str) -> bool:
         now = utcnow()
         with self.transaction() as conn:
+            job = conn.execute(
+                "SELECT lane FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"job {job_id} not found")
+            if job["lane"] != lane:
+                raise ValueError(
+                    f"job {job_id} belongs to lane {job['lane']}, not {lane}"
+                )
             owned = conn.execute("SELECT job_id FROM lane_leases WHERE lane = ?", (lane,)).fetchone()
             if owned and owned["job_id"] != job_id:
                 return False
@@ -572,6 +596,37 @@ class Database:
                 (lane, job_id, now, now),
             )
         return True
+
+    def prune_lane_leases(self) -> list[dict[str, Any]]:
+        """Remove durable ownership that no longer represents active lane work."""
+        placeholders = ",".join("?" for _ in ACTIVE_LEASE_STATES)
+        with self.transaction() as conn:
+            rows = list(
+                conn.execute(
+                    f"""
+                    SELECT l.lane, l.job_id, j.issue_number, j.state
+                    FROM lane_leases l
+                    LEFT JOIN jobs j ON j.job_id = l.job_id
+                    WHERE j.job_id IS NULL OR j.state NOT IN ({placeholders})
+                    ORDER BY l.lane
+                    """,
+                    tuple(sorted(ACTIVE_LEASE_STATES)),
+                )
+            )
+            for row in rows:
+                conn.execute("DELETE FROM lane_leases WHERE lane = ?", (row["lane"],))
+                self.event(
+                    "lane.lease_reconciled",
+                    {
+                        "lane": row["lane"],
+                        "previous_state": row["state"],
+                        "reason": "lease owner is not active",
+                    },
+                    issue_number=row["issue_number"],
+                    job_id=row["job_id"],
+                    connection=conn,
+                )
+        return [dict(row) for row in rows]
 
     def release_lane(self, job_id: str) -> None:
         with self.transaction() as conn:

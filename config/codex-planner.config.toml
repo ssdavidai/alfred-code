@@ -1,0 +1,43 @@
+default_permissions = "alfred_planner"
+approval_policy = "never"
+
+[permissions.alfred_planner]
+description = "Alfred planner: repository-read-only, credential-denied, and offline"
+
+[permissions.alfred_planner.filesystem]
+":minimal" = "read"
+":tmpdir" = "deny"
+":slash_tmp" = "deny"
+
+[permissions.alfred_planner.filesystem.":workspace_roots"]
+"." = "read"
+".git" = "read"
+".codex" = "read"
+".agents" = "read"
+"**/.env" = "deny"
+"**/.env.local" = "deny"
+"**/.env.*.local" = "deny"
+"**/.env.development" = "deny"
+"**/.env.production" = "deny"
+"**/.env.staging" = "deny"
+"**/.env.test" = "deny"
+"**/credentials.json" = "deny"
+"**/secrets.json" = "deny"
+"**/*.pem" = "deny"
+"**/*.key" = "deny"
+"**/id_rsa*" = "deny"
+"**/.npmrc" = "deny"
+"**/.pypirc" = "deny"
+
+[permissions.alfred_planner.network]
+enabled = false
+
+[shell_environment_policy]
+inherit = "core"
+ignore_default_excludes = false
+exclude = ["AWS_*", "AZURE_*", "GH_*", "GITHUB_*", "SUPERSET_*", "*_KEY", "*_TOKEN", "*_SECRET"]
+
+[shell_environment_policy.set]
+PYTHONDONTWRITEBYTECODE = "1"
+GIT_CONFIG_GLOBAL = "/dev/null"
+GIT_CONFIG_NOSYSTEM = "1"
