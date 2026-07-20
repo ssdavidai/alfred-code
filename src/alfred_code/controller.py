@@ -2800,8 +2800,9 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
                 plan_hash=current["plan_hash"] if current else "",
                 risk=current["plan"].get("risk", "") if current else "",
                 lanes=[job["lane"] for job in jobs] or ([j["lane"] for j in current["plan"]["jobs"]] if current else []),
-                runtime=", ".join(
-                    f"{job['lane']}:{job['state']}" for job in jobs
+                runtime=(
+                    ", ".join(f"{job['lane']}:{job['state']}" for job in jobs)
+                    or f"plan:{issue['controller_state']}"
                 ),
             )
         except AuthorityUnavailable as exc:

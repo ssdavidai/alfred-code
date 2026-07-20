@@ -866,6 +866,10 @@ class ControllerTests(unittest.TestCase):
             if item["issue_url"] == self.issue["url"]
         ]
         self.assertEqual(projected_states, ["planning", "awaiting_approval"])
+        self.assertEqual(
+            project.synced[self.issue["url"]]["runtime"],
+            "plan:awaiting_approval",
+        )
 
     def test_planning_pool_is_parallel_but_respects_its_configured_bound(self):
         bodies = {12: self.issue["body"]}
