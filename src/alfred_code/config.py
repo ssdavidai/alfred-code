@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -15,6 +16,29 @@ from .errors import ConfigurationError
 
 
 DEFAULT_CONFIG = Path("~/.config/alfred-code/controller.toml").expanduser()
+PLANNER_PROFILE_NAME = "alfred-planner"
+
+DEFAULT_PLANNER_COMMAND = (
+    "codex",
+    "exec",
+    "--profile",
+    PLANNER_PROFILE_NAME,
+    "--model",
+    "gpt-5.6-sol",
+    "-c",
+    'model_reasoning_effort="high"',
+    "-c",
+    'web_search="disabled"',
+    "-c",
+    "mcp_servers={}",
+    "-c",
+    "plugins={}",
+    "-c",
+    "memories={generate_memories=false,use_memories=false}",
+    "--ephemeral",
+    "--strict-config",
+    "--json",
+)
 
 
 @dataclass(frozen=True)
@@ -59,22 +83,7 @@ class ControllerConfig:
     apply: bool = False
     poll_seconds: int = 60
     max_parallel_planners: int = 3
-    planner_command: tuple[str, ...] = (
-        "claude",
-        "-p",
-        "--model",
-        "sonnet",
-        "--effort",
-        "high",
-        "--safe-mode",
-        "--permission-mode",
-        "plan",
-        "--tools",
-        "",
-        "--no-session-persistence",
-        "--no-chrome",
-        "--disable-slash-commands",
-    )
+    planner_command: tuple[str, ...] = DEFAULT_PLANNER_COMMAND
     planner_timeout_seconds: int = 900
     github: GitHubConfig = field(default_factory=GitHubConfig)
     superset: SupersetConfig = field(default_factory=SupersetConfig)
@@ -111,27 +120,10 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     slack_raw = _section(raw, "slack")
     repo_path = Path(raw.get("repo_path", "~/dev/alfred")).expanduser().resolve()
     state_dir = Path(raw.get("state_dir", "~/.alfred-code-state-v2")).expanduser().resolve()
-    planner = raw.get(
-        "planner_command",
-        [
-            "claude",
-            "-p",
-            "--model",
-            "sonnet",
-            "--effort",
-            "high",
-            "--safe-mode",
-            "--permission-mode",
-            "plan",
-            "--tools",
-            "",
-            "--no-session-persistence",
-            "--no-chrome",
-            "--disable-slash-commands",
-        ],
-    )
+    planner = raw.get("planner_command", list(DEFAULT_PLANNER_COMMAND))
     if not isinstance(planner, list) or not planner or not all(isinstance(x, str) for x in planner):
         raise ConfigurationError("planner_command must be a non-empty array of strings")
+    _validate_planner_command(planner)
     approvers = github_raw.get("approvers", ["ssdavidai"])
     if not isinstance(approvers, list) or not all(isinstance(x, str) for x in approvers):
         raise ConfigurationError("github.approvers must be an array of strings")
@@ -213,3 +205,118 @@ def load_config(path: Path | None = None) -> ControllerConfig:
 def env_secret(name: str) -> str | None:
     value = os.environ.get(name, "").strip()
     return value or None
+
+
+def _option_value(command: list[str], *options: str) -> str | None:
+    for index, argument in enumerate(command[:-1]):
+        if argument in options:
+            return command[index + 1]
+    return None
+
+
+def _validate_planner_command(command: list[str]) -> None:
+    """Fail closed unless the planner is the pinned, read-only Codex role."""
+    if Path(command[0]).name != "codex" or len(command) < 2 or command[1] != "exec":
+        raise ConfigurationError("planner_command must invoke `codex exec`")
+    model = _option_value(command, "--model", "-m")
+    if model != "gpt-5.6-sol":
+        raise ConfigurationError("planner_command model must be gpt-5.6-sol")
+    if _option_value(command, "--profile", "-p") != PLANNER_PROFILE_NAME:
+        raise ConfigurationError(
+            f"planner_command must use the {PLANNER_PROFILE_NAME} permission profile"
+        )
+    if any(argument in {"--sandbox", "-s"} for argument in command):
+        raise ConfigurationError(
+            "planner_command must use its scoped permission profile, not a broad sandbox mode"
+        )
+    required = {"--ephemeral", "--strict-config", "--json"}
+    missing = sorted(required.difference(command))
+    if missing:
+        raise ConfigurationError(
+            f"planner_command is missing required isolation arguments: {', '.join(missing)}"
+        )
+    overrides = [
+        command[index + 1]
+        for index, argument in enumerate(command[:-1])
+        if argument in {"-c", "--config"}
+    ]
+    if 'model_reasoning_effort="high"' not in overrides:
+        raise ConfigurationError("planner_command must pin model_reasoning_effort to high")
+    if 'web_search="disabled"' not in overrides:
+        raise ConfigurationError("planner_command must disable web search")
+    required_overrides = {
+        "mcp_servers={}",
+        "plugins={}",
+        "memories={generate_memories=false,use_memories=false}",
+    }
+    if missing_overrides := sorted(required_overrides.difference(overrides)):
+        raise ConfigurationError(
+            f"planner_command is missing isolation overrides: {', '.join(missing_overrides)}"
+        )
+    serialized = " ".join(command).lower()
+    forbidden = (
+        "dangerously-bypass",
+        "--yolo",
+        "--full-auto",
+        "danger-full-access",
+        "workspace-write",
+        "--ignore-rules",
+        "approval_policy",
+        "sandbox_mode",
+    )
+    if any(value in serialized for value in forbidden):
+        raise ConfigurationError("planner_command contains a forbidden permission override")
+
+
+def planner_profile_path(command: tuple[str, ...]) -> Path:
+    values = list(command)
+    profile = _option_value(values, "--profile", "-p")
+    if not profile:
+        raise ConfigurationError("planner_command has no permission profile")
+    return Path.home() / ".codex" / f"{profile}.config.toml"
+
+
+def validate_planner_profile(path: Path) -> dict[str, Any]:
+    try:
+        payload = path.read_bytes()
+        profile = tomllib.loads(payload.decode())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigurationError(f"cannot read Codex planner profile {path}: {exc}") from exc
+    name = profile.get("default_permissions")
+    if name != "alfred_planner" or profile.get("approval_policy") != "never":
+        raise ConfigurationError("Codex planner profile has unsafe authority settings")
+    policy = profile.get("permissions", {}).get(name, {})
+    filesystem = policy.get("filesystem", {})
+    workspace = filesystem.get(":workspace_roots", {})
+    if filesystem.get(":minimal") != "read" or workspace.get(".") != "read":
+        raise ConfigurationError("Codex planner profile cannot read its scoped workspace")
+    if policy.get("network", {}).get("enabled") is not False:
+        raise ConfigurationError("Codex planner profile must disable network access")
+    if any(value == "write" for value in _nested_values(filesystem)):
+        raise ConfigurationError("Codex planner profile must not grant writable filesystem paths")
+    for pattern in ("**/.env", "**/credentials.json", "**/secrets.json", "**/*.pem", "**/*.key"):
+        if workspace.get(pattern) != "deny":
+            raise ConfigurationError(
+                f"Codex planner profile must deny credential pattern {pattern}"
+            )
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "permissions": name,
+        "network": "disabled",
+        "workspace": "read-only",
+    }
+
+
+def _nested_values(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        values: list[Any] = []
+        for nested in value.values():
+            values.extend(_nested_values(nested))
+        return values
+    if isinstance(value, list):
+        values = []
+        for nested in value:
+            values.extend(_nested_values(nested))
+        return values
+    return [value]

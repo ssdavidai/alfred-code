@@ -1,5 +1,8 @@
 from pathlib import Path
+import tomllib
 import unittest
+
+from alfred_code.config import validate_planner_profile
 
 
 class InstallationTests(unittest.TestCase):
@@ -32,6 +35,28 @@ class InstallationTests(unittest.TestCase):
         self.assertIn('/opt/homebrew/opt/node@22/bin', npm_shell)
         installer = (root / "install-controller.sh").read_text()
         self.assertIn('ln -sf "$ROOT/bin/alfred-code-npm-shell"', installer)
+
+    def test_planner_profile_is_workspace_read_only_and_installed(self):
+        root = Path(__file__).resolve().parents[1]
+        profile_text = (root / "config/codex-planner.config.toml").read_text()
+        profile = tomllib.loads(profile_text)
+        policy = profile["permissions"]["alfred_planner"]
+        filesystem = policy["filesystem"]
+        workspace = filesystem[":workspace_roots"]
+
+        self.assertEqual(profile["default_permissions"], "alfred_planner")
+        self.assertEqual(profile["approval_policy"], "never")
+        self.assertEqual(filesystem[":minimal"], "read")
+        self.assertEqual(workspace["."], "read")
+        self.assertEqual(workspace["**/.env"], "deny")
+        self.assertFalse(policy["network"]["enabled"])
+        self.assertNotIn('= "write"', profile_text)
+        installer = (root / "install-controller.sh").read_text()
+        self.assertIn("config/codex-planner.config.toml", installer)
+        self.assertIn('install -m 600', installer)
+        validated = validate_planner_profile(root / "config/codex-planner.config.toml")
+        self.assertEqual(validated["workspace"], "read-only")
+        self.assertEqual(validated["network"], "disabled")
 
 
 if __name__ == "__main__":

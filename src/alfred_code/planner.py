@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from .audit import AuditLog
@@ -89,24 +90,89 @@ def plan_json_schema(issue_number: int, base_sha: str) -> dict[str, Any]:
 
 
 def structured_planner_command(
-    command: tuple[str, ...], issue_number: int, base_sha: str
+    command: tuple[str, ...],
+    issue_number: int,
+    base_sha: str,
+    *,
+    schema_path: Path | None = None,
 ) -> list[str]:
     argv = list(command)
-    if Path(argv[0]).name == "claude":
+    provider = planner_provider(command)
+    if provider == "claude":
         if "--output-format" not in argv:
             argv.extend(["--output-format", "json"])
-    if Path(argv[0]).name == "claude" and "--json-schema" not in argv:
+    if provider == "claude" and "--json-schema" not in argv:
         argv.extend(
             [
                 "--json-schema",
                 json.dumps(plan_json_schema(issue_number, base_sha), separators=(",", ":")),
             ]
         )
+    if provider == "codex":
+        if schema_path is None:
+            raise ValueError("Codex planner requires a JSON schema file")
+        if argv[-1:] == ["-"]:
+            argv.pop()
+        if "--output-schema" not in argv:
+            argv.extend(["--output-schema", str(schema_path)])
+        if "--json" not in argv:
+            argv.append("--json")
+        argv.append("-")
     return argv
 
 
+def planner_provider(command: tuple[str, ...]) -> str:
+    name = Path(command[0]).name
+    if name in {"claude", "codex"}:
+        return name
+    return "custom"
+
+
+def planner_model(command: tuple[str, ...]) -> str:
+    for index, argument in enumerate(command[:-1]):
+        if argument in {"--model", "-m"}:
+            return command[index + 1]
+    return "configured default"
+
+
+def _codex_jsonl_result(text: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("type"), str):
+            events.append(value)
+    if not events or not any(event.get("type") == "turn.completed" for event in events):
+        return None
+    messages = [
+        str(item.get("text") or "")
+        for event in events
+        if event.get("type") == "item.completed"
+        and isinstance((item := event.get("item")), dict)
+        and item.get("type") == "agent_message"
+    ]
+    if not messages:
+        raise PlanValidationError(["Codex planner completed without a final agent message"])
+    usage_events = [event for event in events if event.get("type") == "turn.completed"]
+    usage = usage_events[-1].get("usage") if usage_events else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    thread = next((event for event in events if event.get("type") == "thread.started"), {})
+    return extract_json(messages[-1]), {
+        "provider": "codex",
+        "session_id": str(thread.get("thread_id") or ""),
+        "num_turns": len(usage_events),
+        "usage": usage,
+    }
+
+
 def extract_planner_result(text: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Return the structured plan and an optional Claude JSON result envelope."""
+    """Return the structured plan and an optional provider usage envelope."""
+    codex = _codex_jsonl_result(text)
+    if codex is not None:
+        return codex
     try:
         envelope = json.loads(text.strip())
     except json.JSONDecodeError:
@@ -152,13 +218,18 @@ class Planner:
         duration_ms: int,
     ) -> None:
         usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+        provider = str(envelope.get("provider") or planner_provider(self.config.planner_command))
+        model = str(envelope.get("model") or planner_model(self.config.planner_command))
         model_usage = (
             envelope.get("modelUsage") if isinstance(envelope.get("modelUsage"), dict) else {}
         )
+        if not model_usage and provider == "codex":
+            model_usage = {model: usage}
         self.telemetry.write(
             "planner.usage",
             issue_number=issue_number,
-            provider="claude",
+            provider=provider,
+            model=model,
             session_id=str(envelope.get("session_id") or ""),
             started_at=started_at,
             duration_ms=int(envelope.get("duration_ms") or duration_ms),
@@ -302,16 +373,35 @@ Rules: one job per lane; one agent per job. Jobs in different lanes must not hav
         """Run only the isolated model command; safe to call in a bounded worker thread."""
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         started = time.monotonic()
-        output = run(
-            structured_planner_command(
-                self.config.planner_command,
-                prepared.issue_number,
-                prepared.base_sha,
-            ),
-            cwd=self.config.repo_path,
-            input_text=prepared.prompt,
-            timeout=self.config.planner_timeout_seconds,
-        )
+        provider = planner_provider(self.config.planner_command)
+        if provider == "codex":
+            with TemporaryDirectory(prefix=f"alfred-code-plan-{prepared.issue_number}-") as directory:
+                schema_path = Path(directory) / "plan.schema.json"
+                schema_path.write_text(
+                    json.dumps(plan_json_schema(prepared.issue_number, prepared.base_sha))
+                )
+                output = run(
+                    structured_planner_command(
+                        self.config.planner_command,
+                        prepared.issue_number,
+                        prepared.base_sha,
+                        schema_path=schema_path,
+                    ),
+                    cwd=self.config.repo_path,
+                    input_text=prepared.prompt,
+                    timeout=self.config.planner_timeout_seconds,
+                )
+        else:
+            output = run(
+                structured_planner_command(
+                    self.config.planner_command,
+                    prepared.issue_number,
+                    prepared.base_sha,
+                ),
+                cwd=self.config.repo_path,
+                input_text=prepared.prompt,
+                timeout=self.config.planner_timeout_seconds,
+            )
         raw, envelope = extract_planner_result(output)
         if envelope is not None:
             self._record_usage(

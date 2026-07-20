@@ -50,8 +50,10 @@ UUID_RE = re.compile(
 ISSUE_PATH_RE = re.compile(r"/(?:lane-[^/]+|phase0)/(\d+)-")
 REVIEW_PATH_RE = re.compile(r"/review/(\d+)-")
 PLANNER_ISSUE_RE = re.compile(r'\\?"const\\?"\s*:\s*(\d+)')
+PLANNER_SCHEMA_ISSUE_RE = re.compile(r"alfred-code-plan-(\d+)-")
 PLANNER_MODEL_RE = re.compile(r"(?:^|\s)--model\s+(\S+)")
 PLANNER_EFFORT_RE = re.compile(r"(?:^|\s)--effort\s+(\S+)")
+CODEX_EFFORT_RE = re.compile(r'model_reasoning_effort\s*=\s*\\?["\']?([a-z]+)', re.I)
 
 
 def _json(value: str | None, fallback: Any) -> Any:
@@ -123,21 +125,39 @@ def _controller_runtime() -> dict[str, Any]:
             row
             for row in rows
             if row["ppid"] == controller["pid"]
-            and "--permission-mode plan" in row["command"]
+            and (
+                "--permission-mode plan" in row["command"]
+                or (
+                    re.search(r"(?:^|/)codex\s+exec(?:\s|$)", row["command"])
+                    and "--profile alfred-planner" in row["command"]
+                    and "--output-schema" in row["command"]
+                )
+            )
         ]
         for child in children:
+            is_codex = bool(re.search(r"(?:^|/)codex\s+exec(?:\s|$)", child["command"]))
             match = PLANNER_ISSUE_RE.search(child["command"])
+            if match is None:
+                match = PLANNER_SCHEMA_ISSUE_RE.search(child["command"])
             model_match = PLANNER_MODEL_RE.search(child["command"])
-            effort_match = PLANNER_EFFORT_RE.search(child["command"])
+            effort_match = (
+                CODEX_EFFORT_RE.search(child["command"])
+                if is_codex
+                else PLANNER_EFFORT_RE.search(child["command"])
+            )
             planners.append(
                 {
                     "pid": child["pid"],
                     "elapsed": child["elapsed"],
                     "issue": int(match.group(1)) if match else None,
-                    "provider": "claude",
+                    "provider": "codex" if is_codex else "claude",
                     "model": model_match.group(1) if model_match else "configured default",
                     "effort": effort_match.group(1) if effort_match else None,
-                    "safe_mode": True,
+                    "safe_mode": (
+                        "--profile alfred-planner" in child["command"]
+                        if is_codex
+                        else "--permission-mode plan" in child["command"]
+                    ),
                 }
             )
         planners.sort(key=lambda item: (item["issue"] is None, item["issue"] or 0))
@@ -409,6 +429,8 @@ class TelemetryScanner:
                     continue
                 raw_models = record.get("model_usage") or {}
                 usage = record.get("usage") or {}
+                provider = str(record.get("provider") or "claude")
+                reported_model = str(record.get("model") or f"{provider.title()} (not reported)")
                 started_at = str(record.get("started_at") or record.get("at") or "") or None
                 duration_ms = int(record.get("duration_ms") or 0)
                 ended_at = None
@@ -422,7 +444,7 @@ class TelemetryScanner:
                 model_rows = (
                     [(str(model), values) for model, values in raw_models.items()]
                     if raw_models
-                    else [("Claude (not reported)", usage)]
+                    else [(reported_model, usage)]
                 )
                 for model, values in model_rows:
                     input_tokens = int(
@@ -430,7 +452,10 @@ class TelemetryScanner:
                     )
                     cached = int(
                         values.get(
-                            "cacheReadInputTokens", values.get("cache_read_input_tokens", 0)
+                            "cacheReadInputTokens",
+                            values.get(
+                                "cache_read_input_tokens", values.get("cached_input_tokens", 0)
+                            ),
                         )
                         or 0
                     )
@@ -444,10 +469,22 @@ class TelemetryScanner:
                     output = int(
                         values.get("outputTokens", values.get("output_tokens", 0)) or 0
                     )
+                    reasoning = int(
+                        values.get(
+                            "reasoningOutputTokens",
+                            values.get("reasoning_output_tokens", 0),
+                        )
+                        or 0
+                    )
+                    total = (
+                        int(values.get("total_tokens") or input_tokens + output)
+                        if provider == "codex"
+                        else input_tokens + cached + cache_write + output
+                    )
                     usages.append(
                         SessionUsage(
                             session_id=session_id,
-                            provider="claude",
+                            provider=provider,
                             model=model,
                             issue_number=issue_number,
                             job_id=None,
@@ -460,7 +497,8 @@ class TelemetryScanner:
                             cached_input_tokens=cached,
                             cache_write_input_tokens=cache_write,
                             output_tokens=output,
-                            total_tokens=input_tokens + cached + cache_write + output,
+                            reasoning_tokens=reasoning,
+                            total_tokens=total,
                         )
                     )
         return usages

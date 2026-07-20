@@ -6,8 +6,9 @@ TARGET_BIN="$HOME/.claude/bin"
 CONFIG="$HOME/.config/alfred-code/controller.toml"
 STATE="$HOME/.alfred-code-state-v2"
 PLIST="$HOME/Library/LaunchAgents/com.ssdavidai.alfred-code-controller-v2.plist"
+CODEX_PLANNER_PROFILE="$HOME/.codex/alfred-planner.config.toml"
 
-mkdir -p "$TARGET_BIN" "$(dirname "$CONFIG")" "$STATE" "$(dirname "$PLIST")"
+mkdir -p "$TARGET_BIN" "$(dirname "$CONFIG")" "$STATE" "$(dirname "$PLIST")" "$(dirname "$CODEX_PLANNER_PROFILE")"
 chmod +x "$ROOT/bin/alfred-code"
 chmod +x "$ROOT/bin/alfred-code-daemon"
 chmod +x "$ROOT/bin/alfred-code-agent"
@@ -18,6 +19,7 @@ ln -sf "$ROOT/bin/alfred-code-daemon" "$TARGET_BIN/alfred-code-daemon"
 ln -sf "$ROOT/bin/alfred-code-agent" "$TARGET_BIN/alfred-code-agent"
 ln -sf "$ROOT/bin/alfred-code-agent-guard" "$TARGET_BIN/alfred-code-agent-guard"
 ln -sf "$ROOT/bin/alfred-code-npm-shell" "$TARGET_BIN/alfred-code-npm-shell"
+install -m 600 "$ROOT/config/codex-planner.config.toml" "$CODEX_PLANNER_PROFILE"
 "$TARGET_BIN/alfred-code" --config "$CONFIG" init
 if find "$HOME/.superset/host" -mindepth 2 -maxdepth 2 -name host.db -print -quit 2>/dev/null | grep -q .; then
   "$TARGET_BIN/alfred-code" --config "$CONFIG" agents-provision

@@ -183,6 +183,51 @@ def test_planner_telemetry_is_attributed_to_issue_and_model(tmp_path: Path) -> N
     assert sessions[0].total_tokens == 155
 
 
+def test_codex_planner_telemetry_preserves_provider_and_cumulative_totals(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "control-plane.sqlite3")
+    database.close()
+    telemetry = tmp_path / "planner-telemetry.jsonl"
+    telemetry.write_text(
+        json.dumps(
+            {
+                "at": "2026-07-20T09:03:00Z",
+                "kind": "planner.usage",
+                "issue_number": 333,
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "session_id": "planner-session",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 20,
+                    "reasoning_output_tokens": 5,
+                },
+                "model_usage": {
+                    "gpt-5.6-sol": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 80,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    scanner = TelemetryScanner(tmp_path / "control-plane.sqlite3")
+
+    sessions = scanner._planner_sessions()
+
+    assert len(sessions) == 1
+    assert sessions[0].provider == "codex"
+    assert sessions[0].model == "gpt-5.6-sol"
+    assert sessions[0].cached_input_tokens == 80
+    assert sessions[0].reasoning_tokens == 5
+    assert sessions[0].total_tokens == 120
+
+
 def test_dashboard_refuses_non_loopback_binding() -> None:
     with pytest.raises(ValueError, match="loopback"):
         serve_dashboard(ControllerConfig(), host="0.0.0.0", port=0)
@@ -203,13 +248,13 @@ def test_runtime_reports_every_parallel_safe_planner(monkeypatch: pytest.MonkeyP
                 "pid": 101,
                 "ppid": 100,
                 "elapsed": "00:10",
-                "command": 'claude --model sonnet --effort high --permission-mode plan --json-schema {"properties":{"issue":{"const":325}}}',
+                "command": 'codex exec --profile alfred-planner --model gpt-5.6-sol -c model_reasoning_effort="high" --output-schema /tmp/alfred-code-plan-325-a/plan.schema.json --json -',
             },
             {
                 "pid": 102,
                 "ppid": 100,
                 "elapsed": "00:08",
-                "command": 'claude --model sonnet --effort high --permission-mode plan --json-schema {"properties":{"issue":{"const":326}}}',
+                "command": 'codex exec --profile alfred-planner --model gpt-5.6-sol -c model_reasoning_effort="high" --output-schema /tmp/alfred-code-plan-326-b/plan.schema.json --json -',
             },
         ],
     )
@@ -218,6 +263,7 @@ def test_runtime_reports_every_parallel_safe_planner(monkeypatch: pytest.MonkeyP
 
     assert [planner["issue"] for planner in runtime["planners"]] == [325, 326]
     assert runtime["planner"]["issue"] == 325
-    assert runtime["planner"]["model"] == "sonnet"
+    assert runtime["planner"]["provider"] == "codex"
+    assert runtime["planner"]["model"] == "gpt-5.6-sol"
     assert runtime["planner"]["effort"] == "high"
     assert all(planner["safe_mode"] for planner in runtime["planners"])

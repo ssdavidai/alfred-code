@@ -14,7 +14,14 @@ from typing import Any
 
 from .audit import AuditLog
 from .agent_security import SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID
-from .config import DEFAULT_CONFIG, ControllerConfig, load_config
+from .config import (
+    DEFAULT_CONFIG,
+    DEFAULT_PLANNER_COMMAND,
+    ControllerConfig,
+    load_config,
+    planner_profile_path,
+    validate_planner_profile,
+)
 from .controller import Controller
 from .db import Database
 from .errors import AlfredCodeError, AuthorityUnavailable
@@ -36,7 +43,7 @@ state_dir = "~/.alfred-code-state-v2"
 apply = false
 poll_seconds = 60
 max_parallel_planners = 3
-planner_command = ["claude", "-p", "--model", "sonnet", "--effort", "high", "--safe-mode", "--permission-mode", "plan", "--tools", "", "--no-session-persistence", "--no-chrome", "--disable-slash-commands"]
+planner_command = {json.dumps(list(DEFAULT_PLANNER_COMMAND))}
 planner_timeout_seconds = 900
 
 [github]
@@ -136,14 +143,17 @@ def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
         return {"path": str(config.database_path), "schema": version}
 
     check("database", database_check)
-    check(
-        "planner",
-        lambda: {
+    def planner_check() -> dict[str, Any]:
+        binary = shutil.which(config.planner_command[0])
+        if not binary:
+            raise FileNotFoundError(config.planner_command[0])
+        return {
             "command": list(config.planner_command),
-            "binary": shutil.which(config.planner_command[0])
-            or (_ for _ in ()).throw(FileNotFoundError(config.planner_command[0])),
-        },
-    )
+            "binary": binary,
+            "profile": validate_planner_profile(planner_profile_path(config.planner_command)),
+        }
+
+    check("planner", planner_check)
     check("github", lambda: GitHubClient(config.github).doctor())
     check("superset", lambda: SupersetClient(config.superset).doctor())
     check("superset_scoped_agents", inspect_agent_configs)
