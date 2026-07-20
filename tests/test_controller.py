@@ -1021,6 +1021,15 @@ class ControllerTests(unittest.TestCase):
                 }
             )
         )
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            last_error=(
+                "packages/ctrl/node_modules is a self-referential symlink, "
+                "so npm run build cannot resolve esbuild"
+            ),
+        )
+        self.db.release_lane("api-12")
 
         self.controller.run_once()
 

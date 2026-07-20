@@ -779,6 +779,7 @@ class Controller:
             or self._is_directory_scope_false_quarantine(job)
             or self._is_retry_marker_false_quarantine(job)
             or self._is_obsolete_finalization_failure(job)
+            or self._is_obsolete_policy_blocked_job(job)
         ):
             return
         if job["workspace_id"]:
@@ -1955,24 +1956,7 @@ class Controller:
             return False
         if str(result.get("status") or "") == "blocked":
             reason = str(result.get("reason") or "")
-            known_policy_blocker = any(
-                token in reason.lower()
-                for token in (
-                    "operation not permitted",
-                    "xcrun",
-                    "commandlinetools",
-                    "node/npm",
-                    "node not found",
-                    "node_modules",
-                    "cannot resolve esbuild",
-                    "cannot resolve tsx",
-                    "self-referential symlink",
-                    "python3 and /usr/bin/git",
-                    "outside the readable sandbox",
-                    "err_module_not_found",
-                )
-            )
-            if not known_policy_blocker:
+            if not self._is_policy_blocker_reason(reason):
                 return False
         if not self.database.acquire_lane(job["lane"], job["job_id"]):
             return True
@@ -2067,6 +2051,34 @@ class Controller:
         ) or (
             error.startswith("controller finalization failed: command failed (1): git commit ")
             and "VERIFY failed:" in error
+        )
+
+    @staticmethod
+    def _is_policy_blocker_reason(reason: str) -> bool:
+        return any(
+            token in reason.lower()
+            for token in (
+                "operation not permitted",
+                "xcrun",
+                "commandlinetools",
+                "node/npm",
+                "node not found",
+                "node_modules",
+                "cannot resolve esbuild",
+                "cannot resolve tsx",
+                "self-referential symlink",
+                "python3 and /usr/bin/git",
+                "outside the readable sandbox",
+                "err_module_not_found",
+            )
+        )
+
+    @classmethod
+    def _is_obsolete_policy_blocked_job(cls, job: dict[str, Any]) -> bool:
+        return bool(
+            job.get("state") == "blocked"
+            and job.get("workspace_id")
+            and cls._is_policy_blocker_reason(str(job.get("last_error") or ""))
         )
 
     @staticmethod
