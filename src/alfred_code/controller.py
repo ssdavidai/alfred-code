@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -243,27 +244,50 @@ class Controller:
             for number in ready:
                 self._process_issue_into(summary, issue_summaries, number)
 
-            for future in as_completed(futures):
-                number = futures[future]
-                try:
-                    plan, plan_hash = future.result()
-                except Exception as exc:
-                    self._record_planning_failure(summary, number, exc)
-                    issue_summaries[number] = self._issue_summary(number)
-                    continue
-                try:
-                    self._publish_generated_plan(number, plan, plan_hash)
-                    self._record("planning.completed", issue=number, plan_hash=plan_hash)
-                except Exception as exc:
-                    self._record_issue_error(summary, number, exc)
-                    issue_summaries[number] = self._issue_summary(number)
-                    continue
-                self._process_issue_into(
-                    summary,
-                    issue_summaries,
-                    number,
-                    plan_state_prepared=True,
+            pending = set(futures)
+            reconcile_interval = self._planning_reconcile_interval()
+            next_reconcile = time.monotonic() + reconcile_interval
+            while pending:
+                timeout = max(0.0, next_reconcile - time.monotonic())
+                completed, pending = wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=FIRST_COMPLETED,
                 )
+                for future in completed:
+                    number = futures[future]
+                    try:
+                        plan, plan_hash = future.result()
+                    except Exception as exc:
+                        self._record_planning_failure(summary, number, exc)
+                        issue_summaries[number] = self._issue_summary(number)
+                        continue
+                    try:
+                        self._publish_generated_plan(number, plan, plan_hash)
+                        self._record("planning.completed", issue=number, plan_hash=plan_hash)
+                    except Exception as exc:
+                        self._record_issue_error(summary, number, exc)
+                        issue_summaries[number] = self._issue_summary(number)
+                        continue
+                    ready.append(number)
+                    self._process_issue_into(
+                        summary,
+                        issue_summaries,
+                        number,
+                        plan_state_prepared=True,
+                    )
+
+                now = time.monotonic()
+                if pending and now >= next_reconcile:
+                    active = list(dict.fromkeys(ready))
+                    self._record(
+                        "planning.reconcile_tick",
+                        pending=sorted(futures[future] for future in pending),
+                        active=active,
+                    )
+                    for number in active:
+                        self._process_issue_into(summary, issue_summaries, number)
+                    next_reconcile = time.monotonic() + reconcile_interval
 
         summary["issues"] = [
             issue_summaries[number]
@@ -278,6 +302,10 @@ class Controller:
             error_count=len(summary["errors"]),
         )
         return summary
+
+    def _planning_reconcile_interval(self) -> float:
+        """Keep delivery moving while a bounded planner batch is still running."""
+        return float(self.config.poll_seconds)
 
     def _process_issue_into(
         self,

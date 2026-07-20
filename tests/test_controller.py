@@ -211,6 +211,18 @@ class ConcurrentPlanner:
             raise AssertionError("corrupt test plan")
 
 
+class BlockingPlanner(ConcurrentPlanner):
+    def __init__(self, sha, bodies):
+        super().__init__(sha, bodies, expected_parallel=1)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def execute_plan(self, prepared):
+        self.started.set()
+        self.release.wait(timeout=2)
+        return super().execute_plan(prepared)
+
+
 class FakeSuperset:
     def __init__(self):
         self.workspaces_by_name = {}
@@ -672,6 +684,55 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(sorted(planner.calls), [12, 13, 14, 15, 16])
         self.assertEqual([item["number"] for item in result["issues"]], [12, 13, 14, 15, 16])
         self.assertTrue(all(item["state"] == "awaiting_approval" for item in result["issues"]))
+
+    def test_active_jobs_reconcile_while_planning_backlog_is_still_running(self):
+        self.controller.run_once()
+        body = "Build feature 13"
+        self.github.extra_issues[13] = {
+            "id": "I_13",
+            "number": 13,
+            "title": "Feature 13",
+            "body": body,
+            "state": "OPEN",
+            "url": "https://example/issues/13",
+            "labels": [{"name": "alfred-code"}],
+        }
+        planner = BlockingPlanner(self.sha, {13: body})
+        self.controller.planner = planner
+        self.controller._planning_reconcile_interval = lambda: 0.02
+
+        initial_reconcile_done = threading.Event()
+        process_issue_into = self.controller._process_issue_into
+
+        def observe_reconcile(*args, **kwargs):
+            process_issue_into(*args, **kwargs)
+            if args[2] == 12:
+                initial_reconcile_done.set()
+
+        self.controller._process_issue_into = observe_reconcile
+        reconciled_before_planner_exit = threading.Event()
+
+        def approve_during_planning():
+            if not planner.started.wait(timeout=1) or not initial_reconcile_done.wait(timeout=1):
+                planner.release.set()
+                return
+            self.approve()
+            deadline = time.monotonic() + 1
+            while self.superset.worker_creates == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if self.superset.worker_creates == 1:
+                reconciled_before_planner_exit.set()
+            planner.release.set()
+
+        thread = threading.Thread(target=approve_during_planning)
+        thread.start()
+        self.controller.run_once()
+        thread.join(timeout=2)
+
+        self.assertTrue(planner.started.is_set())
+        self.assertEqual(self.superset.worker_creates, 1)
+        self.assertTrue(reconciled_before_planner_exit.is_set())
+        self.assertFalse(thread.is_alive())
 
     def test_approval_launches_once_and_restart_adopts_workspace(self):
         self.controller.run_once()
