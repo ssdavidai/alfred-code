@@ -9,6 +9,9 @@ description = "Deterministic GitHub control plane and Superset execution runner 
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
 [project.scripts]
 alfred-code = "alfred_code.cli:main"
 
