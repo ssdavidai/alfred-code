@@ -22,7 +22,7 @@ from alfred_code.controller import Controller
 from alfred_code.db import Database
 from alfred_code.github import PullRequestObservation
 from alfred_code.notify import DurableNotifier
-from alfred_code.superset import Workspace
+from alfred_code.superset import Workspace, worker_workspace_name
 from alfred_code.util import content_hash
 
 
@@ -55,6 +55,8 @@ class FakeGitHub:
         self.reopened_issues = []
         self.updated_pr_bodies = []
         self.invalidated_prs = []
+        self.auto_replans = []
+        self.closed_prs = []
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -92,14 +94,26 @@ class FakeGitHub:
         self.plans.append(plan_hash)
         return "https://example/plan"
 
+    def post_auto_replan(self, issue_number, plan_hash, blockers, completed):
+        self.auto_replans.append(
+            (issue_number, plan_hash, copy.deepcopy(blockers), copy.deepcopy(completed))
+        )
+        return "https://example/replan"
+
     def find_approval(self, issue_number, plan_hash):
         return copy.deepcopy(self.approval)
 
     def find_decision(self, issue_number, plan_hash):
         if self.rejection is not None:
-            return {"decision": "reject", **copy.deepcopy(self.rejection)}
+            rejection = copy.deepcopy(self.rejection)
+            if rejection.pop("plan_hash", plan_hash) != plan_hash:
+                return None
+            return {"decision": "reject", **rejection}
         if self.approval is not None:
-            return {"decision": "approve", **copy.deepcopy(self.approval)}
+            approval = copy.deepcopy(self.approval)
+            if approval.pop("plan_hash", plan_hash) != plan_hash:
+                return None
+            return {"decision": "approve", **approval}
         return None
 
     def find_feedback(self, issue_number, after):
@@ -134,6 +148,12 @@ class FakeGitHub:
         if match:
             self.verdicts[(number, match.group(1))] = match.group(2)
         return "https://example/review-comment"
+
+    def close_pr(self, number, comment):
+        self.closed_prs.append((number, comment))
+        for branch, pr in list(self.prs.items()):
+            if pr and pr.number == number:
+                self.prs[branch] = replace(pr, state="CLOSED")
 
 
 class FakePlanner:
@@ -241,7 +261,9 @@ class FakeSuperset:
 
     def create_worker(self, repo_path, issue_number, job, prompt):
         self.worker_creates += 1
-        name = f"alfred-code-{issue_number}-{job['lane'].lower()}"
+        name = worker_workspace_name(
+            "alfred-code", issue_number, job["lane"], job["job_id"]
+        )
         workspace = Workspace(f"w-{job['job_id']}", name, job["branch"], f"superset://{name}")
         self.workspaces_by_name[name] = workspace
         self.details[workspace.id] = {"id": workspace.id, "agents": [{"status": "RUNNING"}]}
@@ -410,6 +432,7 @@ class ControllerTests(unittest.TestCase):
             "comment_id": "1",
             "url": "https://example/approval",
             "created_at": "2026-01-01T00:00:00Z",
+            "plan_hash": self.github.plans[-1] if self.github.plans else self.plan_hash,
         }
 
     def add_dependent_job(self):
@@ -596,6 +619,186 @@ class ControllerTests(unittest.TestCase):
         self.assertNotEqual(result["issues"][0]["plan_hash"], first)
         self.assertEqual(self.planner.calls, 2)
 
+    def test_safe_scope_blocker_replans_with_new_identities_and_fresh_approval(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.approve()
+        self.controller.run_once()
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            last_error=(
+                "file.txt is not in the authoritative .lane allowed list; "
+                "requires the controller to add it to this job's write scope"
+            ),
+        )
+
+        result = self.controller.run_once()
+
+        replacement = self.db.current_plan(12)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(replacement["plan_hash"], first)
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertEqual(replacement["plan"]["jobs"][0]["id"], "api-12-r2")
+        self.assertEqual(replacement["plan"]["jobs"][0]["branch"], "lane-1/12-api-r2")
+        self.assertEqual(self.db.get_job("api-12")["state"], "superseded")
+        self.assertFalse(self.db.is_approved(first))
+        self.assertFalse(self.db.is_approved(replacement["plan_hash"]))
+        self.assertEqual(self.superset.worker_creates, 1)
+        self.assertEqual(len(self.github.auto_replans), 1)
+        self.assertEqual(self.github.auto_replans[0][2][0]["kind"], "lane_scope")
+
+        self.controller.run_once()
+        self.assertEqual(self.superset.worker_creates, 1)
+        self.assertEqual(self.db.list_current_jobs(12), [])
+
+        self.approve()
+        self.controller.run_once()
+        current_job = self.db.list_current_jobs(12)[0]
+        self.assertEqual(current_job["job_id"], "api-12-r2")
+        self.assertEqual(current_job["state"], "running")
+        self.assertEqual(self.superset.worker_creates, 2)
+        self.assertEqual(
+            self.superset.workspaces_by_name["alfred-code-12-i-r2"].branch,
+            "lane-1/12-api-r2",
+        )
+
+    def test_ci_failure_never_auto_replans(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.approve()
+        self.controller.run_once()
+        head = "b" * 40
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            pr_number=41,
+            pr_url="https://example/pr/41",
+            head_sha=head,
+            last_error="GitHub CI is red",
+        )
+        self.github.prs["lane-1/12-api"] = PullRequestObservation(
+            41,
+            "https://example/pr/41",
+            "OPEN",
+            head,
+            "RED",
+            "BLOCKED",
+            "MERGEABLE",
+            False,
+            "lane-1/12-api",
+            "Controller job: `api-12` · lane `I`\n\n## Smoke evidence\nreal",
+        )
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "blocked")
+        self.assertEqual(self.db.current_plan(12)["plan_hash"], first)
+        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(self.github.auto_replans, [])
+        self.assertEqual(self.github.closed_prs, [])
+
+    def test_conflicting_controller_pr_is_closed_as_superseded_before_replan(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.approve()
+        self.controller.run_once()
+        head = "c" * 40
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            pr_number=42,
+            pr_url="https://example/pr/42",
+            head_sha=head,
+            last_error="PR conflicts with its base",
+        )
+        self.github.prs["lane-1/12-api"] = PullRequestObservation(
+            42,
+            "https://example/pr/42",
+            "OPEN",
+            head,
+            "GREEN",
+            "DIRTY",
+            "CONFLICTING",
+            False,
+            "lane-1/12-api",
+            "Controller job: `api-12` · lane `I`\n\n## Smoke evidence\nreal",
+        )
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertNotEqual(self.db.current_plan(12)["plan_hash"], first)
+        self.assertEqual(self.db.get_job("api-12")["state"], "superseded")
+        self.assertEqual([number for number, _ in self.github.closed_prs], [42])
+        self.assertIn("branch and commits are retained", self.github.closed_prs[0][1])
+
+    def test_foreign_conflicting_pr_is_never_closed_or_auto_replanned(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.approve()
+        self.controller.run_once()
+        head = "d" * 40
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            pr_number=43,
+            pr_url="https://example/pr/43",
+            head_sha=head,
+            last_error="PR conflicts with its base",
+        )
+        self.github.prs["lane-1/12-api"] = PullRequestObservation(
+            43,
+            "https://example/pr/43",
+            "OPEN",
+            head,
+            "GREEN",
+            "DIRTY",
+            "CONFLICTING",
+            False,
+            "lane-1/12-api",
+            "An unrelated pull request",
+        )
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.current_plan(12)["plan_hash"], first)
+        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(self.github.closed_prs, [])
+        self.assertEqual(self.github.auto_replans, [])
+
+    def test_auto_replan_attempt_cap_escalates_without_replanning(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.db.record_approval(12, first, "owner", "1", None, "now")
+        self.db.materialize_jobs(12, first, self.plan)
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            last_error="No contract change is approved; contract requires X but acceptance requires Y",
+        )
+        self.controller.config = replace(self.config, auto_replan_max_attempts=0)
+
+        self.controller.run_once()
+
+        self.assertEqual(self.db.current_plan(12)["plan_hash"], first)
+        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(self.github.auto_replans, [])
+        self.assertTrue(
+            any("requires operator guidance" in message for message, _ in self.channel.messages)
+        )
+
+    def test_mixed_safe_and_unknown_blockers_do_not_replan(self):
+        safe = {
+            "job_id": "api-12",
+            "lane": "I",
+            "state": "blocked",
+            "last_error": "not in the authoritative .lane allowed list",
+        }
+        unsafe = {
+            "job_id": "web-12",
+            "lane": "II",
+            "state": "blocked",
+            "last_error": "verification failed: regression detected",
+        }
+
+        self.assertIsNone(self.controller._auto_replan_blockers([safe, unsafe]))
+
     def test_dry_run_only_observes(self):
         self.controller.config = replace(self.config, apply=False)
         self.controller.run_once()
@@ -663,6 +866,10 @@ class ControllerTests(unittest.TestCase):
             if item["issue_url"] == self.issue["url"]
         ]
         self.assertEqual(projected_states, ["planning", "awaiting_approval"])
+        self.assertEqual(
+            project.synced[self.issue["url"]]["runtime"],
+            "plan:awaiting_approval",
+        )
 
     def test_planning_pool_is_parallel_but_respects_its_configured_bound(self):
         bodies = {12: self.issue["body"]}

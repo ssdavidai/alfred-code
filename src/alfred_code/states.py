@@ -21,12 +21,13 @@ JOB_STATES = {
     "repairing",
     "ready_merge",
     "merged",
+    "superseded",
     "closed",
     "blocked",
     "quarantined",
 }
 
-TERMINAL_JOB_STATES = {"merged", "closed", "quarantined"}
+TERMINAL_JOB_STATES = {"merged", "superseded", "closed", "quarantined"}
 ACTIVE_LEASE_STATES = {
     "launching",
     "running",

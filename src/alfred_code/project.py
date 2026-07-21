@@ -198,7 +198,9 @@ class ProjectBoard:
             "--field-id",
             str(field["id"]),
         ]
-        if field.get("type") == "ProjectV2SingleSelectField" or field.get("dataType") == "SINGLE_SELECT":
+        if not value:
+            args.append("--clear")
+        elif field.get("type") == "ProjectV2SingleSelectField" or field.get("dataType") == "SINGLE_SELECT":
             option = next(
                 (option for option in field.get("options", []) if str(option.get("name")) == value),
                 None,
@@ -252,9 +254,10 @@ class ProjectBoard:
             "Runtime": runtime,
         }
         for name, value in values.items():
-            if value and name in fields:
-                key = name.lower()
-                if str(item.get(key) or "") == value:
-                    continue
-                self._edit(str(project["id"]), str(item["id"]), fields[name], value)
-                item[key] = value
+            if name not in fields:
+                continue
+            key = name.lower()
+            if str(item.get(key) or "") == value:
+                continue
+            self._edit(str(project["id"]), str(item["id"]), fields[name], value)
+            item[key] = value

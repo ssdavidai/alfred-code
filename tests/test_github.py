@@ -238,6 +238,59 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(client.post_plan(5, plan, digest), "existing")
         self.assertEqual(len(client.posts), 1)
 
+    def test_auto_replan_evidence_is_deduplicated_and_requires_fresh_approval(self):
+        client = FakeGitHub()
+        digest = "e" * 64
+        blockers = [
+            {
+                "job_id": "api-5",
+                "lane": "I",
+                "kind": "base_conflict",
+                "reason": "PR conflicts with its base",
+            }
+        ]
+        completed = [{"job_id": "contracts-5", "lane": "phase0", "pr_number": 20}]
+
+        client.post_auto_replan(5, digest, blockers, completed)
+
+        self.assertEqual(len(client.posts), 1)
+        body = client.posts[0][1]
+        self.assertIn("automatic re-plan evidence", body)
+        self.assertIn("new exact `/approve-plan <full-new-hash>`", body)
+        self.assertIn("PR #20", body)
+        marker = body.splitlines()[0]
+        client.comments = [{"body": marker, "html_url": "existing"}]
+        self.assertEqual(
+            client.post_auto_replan(5, digest, blockers, completed), "existing"
+        )
+        self.assertEqual(len(client.posts), 1)
+
+    def test_closing_superseded_pr_invalidates_pr_caches(self):
+        client = GitHubClient(
+            GitHubConfig(repo="owner/repo", owner="owner", approvers=("owner",))
+        )
+        calls = []
+        client._run = lambda arguments, timeout=120: calls.append(arguments) or ""
+        client._pull_requests["lane-1/7-api"] = None
+        client._pr_comments[8] = [{"id": 2}]
+
+        client.close_pr(8, "Superseded safely")
+
+        self.assertEqual(
+            calls[-1],
+            [
+                "pr",
+                "close",
+                "8",
+                "--repo",
+                "owner/repo",
+                "--comment",
+                "Superseded safely",
+            ],
+        )
+        self.assertEqual(client._pull_requests, {})
+        self.assertNotIn(8, client._pr_comments)
+
     def test_ci_requires_checks_and_all_success_like_conclusions(self):
         self.assertEqual(GitHubClient._ci_state([]), "PENDING")
         self.assertEqual(GitHubClient._ci_state([{"conclusion": "SUCCESS"}]), "GREEN")

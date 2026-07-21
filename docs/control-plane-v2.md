@@ -6,7 +6,7 @@ This is the executable specification for GitHub issues #5 through #11 in `ssdavi
 
 GitHub is the product-management and decision surface. With `github.auto_intake = true`, every open issue is intake; label-gated intake remains available when it is false. The controller immediately projects an enrolled issue as `Specifying`, inspects the live repository and GitHub state, generates a lane-aware plan pinned to the current default-branch SHA, validates it deterministically, and comments it on the issue. The operator approves exactly that plan with `/approve-plan <full-plan-sha256>`, rejects it with `/reject-plan <full-plan-sha256>`, or leaves specification feedback as a normal comment. Superset creates and owns the isolated workspaces and starts the configured worker/reviewer runtime. GitHub PRs and checks are the delivery authority. Slack is optional notification output only.
 
-The controller never merges. It never closes an issue or PR. It never deletes a branch. It never force-pushes or resets a branch. Workspace deletion is separately configured, is off by default, and is eligible only after GitHub reports the associated PR as merged.
+The controller never merges. It closes an issue only after every current-plan job is merged. It may close an open PR only when an automatic re-plan has proved the PR belongs to the exact superseded controller job; that reversible retirement keeps the branch, commits, worktree, and audit history intact. It never deletes a branch, force-pushes, or resets a branch. Workspace deletion is separately configured, is off by default, and is eligible only after GitHub reports the associated PR as merged.
 
 ## Authority map
 
@@ -44,6 +44,8 @@ queued
   -> reviewing          -> ready_merge
   -> ready_merge        -> merged
 
+blocked planning conflict -> superseded -> fresh planning and approval
+
 Any active state -> blocked when live evidence fails
 Open PR + closed issue -> quarantined
 Closed unmerged PR -> quarantined
@@ -53,6 +55,8 @@ No PR + closed issue -> closed
 The scheduler first looks for a PR by the canonical branch. This lets it adopt real progress after a restart instead of relaunching. If there is no PR, it verifies dependencies, atomically acquires the lane lease in SQLite, writes a `launching` intent, creates a branch from the approved base commit without moving any existing ref, and asks Superset to create the workspace and start the worker in one command.
 
 Workspace names are deterministic. A crash after Superset accepts a create can be reconciled by name. A conflicting pre-existing name or branch blocks rather than being overwritten. The same approach is used for review workspaces, which include PR number and head-SHA prefix.
+
+When every current job is quiescent and every blocker is a recognized lane-authority mismatch, contract-plan contradiction, or PR base conflict, the controller records re-plan intent, publishes the observed blockers, and retires the execution graph. Any open PR must match the job's exact controller marker, number, branch, and head before it can be closed as superseded. Merged jobs remain merged; other current jobs become `superseded`, their lane leases are released, and their workspaces are retained. The replacement plan receives revision-suffixed job, branch, and workspace identities, so it cannot adopt stale work. The old approval is revoked and the replacement waits for an exact fresh approval. Red CI, failed verification, review failures, security quarantine, ambiguous errors, active agents, and foreign PRs fail closed. `auto_replan_max_attempts` bounds the loop and defaults to two.
 
 Workspace creation is not agent liveness. The scoped launcher must publish an atomic `.alfred-code-launch.json` handshake from a supported Python runtime, then replace it with a completed, exited, or failed status when the provider returns. A result marker is not final while the provider is still running. The controller blocks promptly on a real exit or a missing handshake and preserves the workspace. A distinct progress timeout applies only after a live launch, so lifecycle state cannot remain `running` merely because Superset still has a workspace record.
 

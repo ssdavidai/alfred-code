@@ -7,10 +7,11 @@ from typing import Any
 
 from .config import GitHubConfig
 from .errors import AuthorityUnavailable, CommandError
-from .util import run, run_json, utcnow
+from .util import content_hash, run, run_json, utcnow
 
 
 PLAN_MARKER = "<!-- alfred-code-plan:{plan_hash} -->"
+AUTO_REPLAN_MARKER = "<!-- alfred-code-auto-replan:{plan_hash}:{evidence_hash} -->"
 REVIEW_RE = re.compile(r"<!-- alfred-code-review:([0-9a-f]{40,64}):(pass|fail) -->")
 
 
@@ -157,6 +158,58 @@ class GitHubClient:
         self._issue_comments.pop(number, None)
         return result
 
+    def post_auto_replan(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        blockers: list[dict[str, Any]],
+        completed: list[dict[str, Any]],
+    ) -> str | None:
+        evidence_hash = content_hash({"blockers": blockers, "completed": completed})[:16]
+        marker = AUTO_REPLAN_MARKER.format(
+            plan_hash=plan_hash,
+            evidence_hash=evidence_hash,
+        )
+        for comment in self.issue_comments(issue_number):
+            if marker in str(comment.get("body") or ""):
+                return comment.get("html_url")
+        lines = [
+            marker,
+            "## Alfred Code automatic re-plan evidence",
+            "",
+            f"The approved plan `{plan_hash[:12]}` cannot finish as specified. The controller recognized only bounded planning conflicts, so it will preserve merged work and request a replacement plan for the remaining work.",
+            "",
+            "| Job | Lane | Classification | Observed blocker |",
+            "|---|---|---|---|",
+        ]
+        for blocker in blockers:
+            reason = str(blocker.get("reason") or "").replace("\n", " ").replace("|", "\\|")
+            lines.append(
+                f"| `{blocker['job_id']}` | `{blocker['lane']}` | `{blocker['kind']}` | {reason[:1000]} |"
+            )
+        if completed:
+            lines.extend(
+                [
+                    "",
+                    "Already merged work remains authoritative and must not be repeated:",
+                    "",
+                    *[
+                        f"- `{job['job_id']}` in lane `{job['lane']}`"
+                        + (f" via PR #{job['pr_number']}" if job.get("pr_number") else "")
+                        for job in completed
+                    ],
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Any open PR retired by this re-plan is closed as superseded, but its branch, commits, and Superset workspace are retained for audit and recovery.",
+                "",
+                "The replacement plan will have new job, branch, and plan identities. The previous approval is revoked; a new exact `/approve-plan <full-new-hash>` comment is required before any replacement agent can launch.",
+            ]
+        )
+        return self.post_issue_comment(issue_number, "\n".join(lines))
+
     def close_issue(self, number: int) -> None:
         self._run(
             [
@@ -211,6 +264,21 @@ class GitHubClient:
         self._pr_comments.pop(number, None)
         self._issue_comments.pop(number, None)
         return result
+
+    def close_pr(self, number: int, comment: str) -> None:
+        self._run(
+            [
+                "pr",
+                "close",
+                str(number),
+                "--repo",
+                self.config.repo,
+                "--comment",
+                comment,
+            ]
+        )
+        self._pull_requests.clear()
+        self._pr_comments.pop(number, None)
 
     def ensure_label(self, name: str, color: str, description: str) -> None:
         try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,18 @@ from .agent_security import SCOPED_AGENT_IDS, SECURITY_POLICY
 from .config import SupersetConfig
 from .errors import AuthorityUnavailable, CommandError
 from .util import canonical_json, run_json
+
+
+def worker_workspace_name(
+    prefix: str,
+    issue_number: int,
+    lane: str,
+    job_id: str,
+) -> str:
+    """Keep first-run names stable while giving every replacement plan a new workspace."""
+    revision = re.search(r"-r([2-9][0-9]*)$", job_id)
+    suffix = f"-r{revision.group(1)}" if revision else ""
+    return f"{prefix}-{issue_number}-{lane.lower()}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -129,7 +142,12 @@ class SupersetClient:
         prompt: str,
     ) -> tuple[Workspace, str | None]:
         self._assert_scoped_agent(self.config.worker_agent)
-        name = f"{self.config.workspace_prefix}-{issue_number}-{job['lane'].lower()}"
+        name = worker_workspace_name(
+            self.config.workspace_prefix,
+            issue_number,
+            str(job["lane"]),
+            str(job["job_id"]),
+        )
         existing = self.workspace_for_branch(job["branch"])
         if existing:
             if existing.name != name:

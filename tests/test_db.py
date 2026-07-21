@@ -101,6 +101,45 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.database.is_approved("a" * 64))
         self.assertEqual(self.database.current_plan(7)["plan_hash"], "b" * 64)
 
+    def test_auto_replan_supersedes_unmerged_jobs_and_preserves_merged_history(self):
+        digest = "p" * 64
+        plan = dict(self.plan)
+        plan["jobs"] = [
+            self.plan["jobs"][0],
+            {
+                **self.plan["jobs"][0],
+                "id": "web-7",
+                "lane": "II",
+                "branch": "lane-2/7-web",
+                "paths": ["web/a.py"],
+                "depends_on": ["job-7"],
+            },
+        ]
+        self.database.save_plan(7, digest, plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        self.database.materialize_jobs(7, digest, plan)
+        self.database.update_job("job-7", state="merged", pr_number=10)
+        self.database.update_job("web-7", state="blocked", last_error="contract conflict")
+        self.assertTrue(self.database.acquire_lane("II", "web-7"))
+
+        changed = self.database.supersede_plan_for_replan(
+            7,
+            digest,
+            reason="replacement required",
+            blockers=[{"job_id": "web-7", "kind": "contract_plan"}],
+        )
+
+        self.assertTrue(changed)
+        self.assertIsNone(self.database.current_plan(7))
+        self.assertFalse(self.database.is_approved(digest))
+        self.assertEqual(self.database.get_issue(7)["controller_state"], "planning")
+        self.assertEqual(self.database.get_job("job-7")["state"], "merged")
+        self.assertEqual(self.database.get_job("web-7")["state"], "superseded")
+        self.assertEqual(self.database.get_job("web-7")["last_error"], "contract conflict")
+        self.assertEqual(self.database.list_current_jobs(7), [])
+        self.assertIsNone(self.database.lease_owner("II"))
+        self.assertEqual(self.database.event_count(7, "plan.auto_replan_requested"), 1)
+
     def test_rejection_is_durable_and_does_not_materialize_jobs(self):
         digest = "r" * 64
         self.database.save_plan(7, digest, self.plan)

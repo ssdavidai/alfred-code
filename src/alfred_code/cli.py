@@ -43,6 +43,7 @@ state_dir = "~/.alfred-code-state-v2"
 apply = false
 poll_seconds = 60
 max_parallel_planners = 3
+auto_replan_max_attempts = 2
 planner_command = {json.dumps(list(DEFAULT_PLANNER_COMMAND))}
 planner_timeout_seconds = 900
 
@@ -108,7 +109,10 @@ def build(config: ControllerConfig) -> tuple[Controller, Database]:
 def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
     report: dict[str, Any] = {
         "apply": config.apply,
-        "scheduler": {"max_parallel_planners": config.max_parallel_planners},
+        "scheduler": {
+            "max_parallel_planners": config.max_parallel_planners,
+            "auto_replan_max_attempts": config.auto_replan_max_attempts,
+        },
         "checks": {},
     }
     healthy = True

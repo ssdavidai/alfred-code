@@ -83,6 +83,7 @@ class ControllerConfig:
     apply: bool = False
     poll_seconds: int = 60
     max_parallel_planners: int = 3
+    auto_replan_max_attempts: int = 2
     planner_command: tuple[str, ...] = DEFAULT_PLANNER_COMMAND
     planner_timeout_seconds: int = 900
     github: GitHubConfig = field(default_factory=GitHubConfig)
@@ -137,6 +138,7 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         apply=bool(raw.get("apply", False)),
         poll_seconds=int(raw.get("poll_seconds", 60)),
         max_parallel_planners=int(raw.get("max_parallel_planners", 3)),
+        auto_replan_max_attempts=int(raw.get("auto_replan_max_attempts", 2)),
         planner_command=tuple(planner),
         planner_timeout_seconds=int(raw.get("planner_timeout_seconds", 900)),
         github=GitHubConfig(
@@ -179,6 +181,8 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         raise ConfigurationError("poll_seconds must be at least 10")
     if not 1 <= config.max_parallel_planners <= 8:
         raise ConfigurationError("max_parallel_planners must be between 1 and 8")
+    if not 0 <= config.auto_replan_max_attempts <= 5:
+        raise ConfigurationError("auto_replan_max_attempts must be between 0 and 5")
     if config.superset.worker_launch_timeout_seconds < 30:
         raise ConfigurationError("superset.worker_launch_timeout_seconds must be at least 30")
     if config.superset.worker_progress_timeout_seconds < 60:
