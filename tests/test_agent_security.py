@@ -281,6 +281,68 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertTrue((package_root / ".venv").is_symlink())
         self.assertTrue((environments[0] / ".alfred-code-ready").is_file())
 
+    def test_pyproject_dependencies_and_test_extras_are_provisioned_without_installing_source(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "pyproject.toml").write_text(
+            """[project]
+name = "alfred-learn"
+dependencies = ["structlog>=24", "python-frontmatter>=1.1"]
+
+[project.optional-dependencies]
+test = ["pytest-asyncio>=0.23"]
+surveyor = ["numpy>=1.26"]
+all = ["alfred-learn[surveyor]"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+"""
+        )
+        cache_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_temp.cleanup)
+        commands = []
+
+        def provision(command, **kwargs):
+            commands.append(command)
+            if command[1] == "venv":
+                python = Path(command[-1]) / "bin/python"
+                python.parent.mkdir(parents=True)
+                python.write_text("#!/bin/sh\n")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch("alfred_code.agent_security.subprocess.run", side_effect=provision):
+            environments = prepare_python_dependency_overlays(
+                self.manifest,
+                cache_root=Path(cache_temp.name),
+                uv_binary="/trusted/uv",
+            )
+
+        install = commands[1]
+        self.assertIn("structlog>=24", install)
+        self.assertIn("python-frontmatter>=1.1", install)
+        self.assertIn("numpy>=1.26", install)
+        self.assertIn("pytest-asyncio==1.4.0", install)
+        self.assertNotIn("alfred-learn[surveyor]", install)
+        self.assertNotIn(str(package_root), install)
+        self.assertTrue((package_root / ".venv").is_symlink())
+        self.assertEqual(len(environments), 1)
+
+    def test_pyproject_dependency_options_are_rejected_before_trusted_provisioning(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True, exist_ok=True)
+        (package_root / "pyproject.toml").write_text(
+            '[project]\nname = "unsafe"\ndependencies = ["--target=/tmp/out"]\n'
+        )
+        cache_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_temp.cleanup)
+
+        with self.assertRaisesRegex(AgentSecurityError, "unsafe Python requirement"):
+            prepare_python_dependency_overlays(
+                self.manifest,
+                cache_root=Path(cache_temp.name),
+                uv_binary="/trusted/uv",
+            )
+
     def test_codex_uses_unattended_exec_for_the_exact_worktree(self):
         with (
             patch("alfred_code.agent_security._provider_binary", return_value="/bin/codex"),

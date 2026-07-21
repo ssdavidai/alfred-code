@@ -442,6 +442,8 @@ class Controller:
         value = " ".join(reason.lower().split())
         if value == "pr conflicts with its base":
             return "base_conflict"
+        if "scope limit exceeded:" in value and " cap for lane " in value:
+            return "scope_limit"
         if (
             "not in the authoritative .lane allowed list" in value
             or "not in .lane allowed list" in value
@@ -450,6 +452,15 @@ class Controller:
             return "lane_scope"
         if (
             "no contract change is approved" in value
+            or "missing cross-lane contract" in value
+            or (
+                "contract is absent" in value
+                and "across lanes" in value
+            )
+            or (
+                "contract is absent" in value
+                and "inventing an endpoint" in value
+            )
             or (
                 "contract" in value
                 and "requires" in value
@@ -457,6 +468,11 @@ class Controller:
             )
         ):
             return "contract_plan"
+        if (
+            "full pytest cannot collect" in value
+            and "declared dependencies are absent" in value
+        ):
+            return "dependency_environment"
         return None
 
     def _auto_replan_blockers(

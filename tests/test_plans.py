@@ -159,8 +159,51 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(PlanValidationError) as raised:
             self.validator.validate(value, issue_number=42, base_sha=self.base)
         text = str(raised.exception)
-        self.assertIn("appears more than once", text)
         self.assertIn("dependency cycle", text)
+
+    def test_same_lane_scope_can_be_decomposed_into_a_strict_sequence(self):
+        value = self.valid()
+        value["jobs"][1].update(
+            {
+                "lane": "I",
+                "branch": "lane-1/42-web",
+                "paths": ["api/routes.py"],
+                "depends_on": ["api-42"],
+            }
+        )
+
+        plan, _ = self.validator.validate(value, issue_number=42, base_sha=self.base)
+
+        self.assertEqual([job["lane"] for job in plan["jobs"]], ["I", "I"])
+        self.assertEqual(plan["jobs"][1]["depends_on"], ["api-42"])
+
+    def test_same_lane_jobs_without_a_dependency_chain_are_rejected(self):
+        value = self.valid()
+        value["jobs"][1].update(
+            {
+                "lane": "I",
+                "branch": "lane-1/42-web",
+                "paths": ["api/other.py"],
+                "depends_on": [],
+            }
+        )
+
+        with self.assertRaisesRegex(PlanValidationError, "without a dependency chain"):
+            self.validator.validate(value, issue_number=42, base_sha=self.base)
+
+    def test_job_branches_must_be_unique(self):
+        value = self.valid()
+        value["jobs"][1].update(
+            {
+                "lane": "I",
+                "branch": "lane-1/42-api",
+                "paths": ["api/other.py"],
+                "depends_on": ["api-42"],
+            }
+        )
+
+        with self.assertRaisesRegex(PlanValidationError, "duplicate job branch"):
+            self.validator.validate(value, issue_number=42, base_sha=self.base)
 
 
 if __name__ == "__main__":

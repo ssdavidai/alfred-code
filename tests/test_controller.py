@@ -799,6 +799,35 @@ class ControllerTests(unittest.TestCase):
 
         self.assertIsNone(self.controller._auto_replan_blockers([safe, unsafe]))
 
+    def test_scope_contract_and_declared_dependency_blockers_replan_together(self):
+        blockers = [
+            {
+                "job_id": "ctrl-316",
+                "lane": "I",
+                "state": "blocked",
+                "last_error": "controller finalization failed: Scope limit exceeded: 1238 LOC changed > 200 cap for lane I.",
+            },
+            {
+                "job_id": "learn-316",
+                "lane": "II",
+                "state": "blocked",
+                "last_error": "The requested scheduled janitor contract is absent; implementing it would require inventing an endpoint across lanes.",
+            },
+            {
+                "job_id": "vault-316",
+                "lane": "IV",
+                "state": "blocked",
+                "last_error": "Required full pytest cannot collect because declared dependencies are absent (numpy, structlog, and python-frontmatter).",
+            },
+        ]
+
+        observed = self.controller._auto_replan_blockers(blockers)
+
+        self.assertEqual(
+            [item["kind"] for item in observed],
+            ["scope_limit", "contract_plan", "dependency_environment"],
+        )
+
     def test_dry_run_only_observes(self):
         self.controller.config = replace(self.config, apply=False)
         self.controller.run_once()

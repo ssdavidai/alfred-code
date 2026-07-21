@@ -10,7 +10,7 @@ from .states import ACTIVE_LEASE_STATES, ISSUE_STATES, JOB_STATES
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
@@ -84,8 +84,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     repair_token TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(issue_number, plan_hash, lane)
+    updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_issue_idx ON jobs(issue_number, created_at);
 CREATE INDEX IF NOT EXISTS jobs_state_idx ON jobs(state, updated_at);
@@ -152,36 +151,138 @@ class Database:
 
     def migrate(self) -> None:
         self.connection.executescript(SCHEMA)
-        with self.transaction():
-            row = self.connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
-            if row is None:
-                self.connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif row["version"] in {1, 2, 3}:
-                columns = {
-                    item["name"] for item in self.connection.execute("PRAGMA table_info(jobs)")
-                }
-                for name in ("review_workspace_id", "review_agent_id", "review_requested_at"):
-                    if name not in columns:
-                        self.connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
-                repair_columns = {
-                    "repair_attempts": "INTEGER NOT NULL DEFAULT 0",
-                    "repair_sha": "TEXT",
-                    "repair_agent_id": "TEXT",
-                    "repair_requested_at": "TEXT",
-                    "repair_token": "TEXT",
-                }
-                for name, declaration in repair_columns.items():
-                    if name not in columns:
-                        self.connection.execute(
-                            f"ALTER TABLE jobs ADD COLUMN {name} {declaration}"
-                        )
-                if "base_sha" not in columns:
-                    self.connection.execute("ALTER TABLE jobs ADD COLUMN base_sha TEXT")
-                self.connection.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
-            elif row["version"] != SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
+        row = self.connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+        if row is None:
+            with self.transaction():
+                self.connection.execute(
+                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
+            return
+        if row["version"] not in {1, 2, 3, 4, SCHEMA_VERSION}:
+            raise RuntimeError(
+                f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
+            )
+        if row["version"] == SCHEMA_VERSION:
+            return
+
+        with self.transaction():
+            columns = {
+                item["name"] for item in self.connection.execute("PRAGMA table_info(jobs)")
+            }
+            for name in ("review_workspace_id", "review_agent_id", "review_requested_at"):
+                if name not in columns:
+                    self.connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
+            repair_columns = {
+                "repair_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "repair_sha": "TEXT",
+                "repair_agent_id": "TEXT",
+                "repair_requested_at": "TEXT",
+                "repair_token": "TEXT",
+            }
+            for name, declaration in repair_columns.items():
+                if name not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {name} {declaration}"
+                    )
+            if "base_sha" not in columns:
+                self.connection.execute("ALTER TABLE jobs ADD COLUMN base_sha TEXT")
+
+        if self._jobs_has_lane_uniqueness():
+            self._remove_jobs_lane_uniqueness()
+        with self.transaction():
+            self.connection.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
+
+    def _jobs_has_lane_uniqueness(self) -> bool:
+        expected = ["issue_number", "plan_hash", "lane"]
+        for row in self.connection.execute("PRAGMA index_list(jobs)"):
+            if not row["unique"]:
+                continue
+            columns = [
+                item["name"]
+                for item in self.connection.execute(
+                    f"PRAGMA index_info({json.dumps(row['name'])})"
+                )
+            ]
+            if columns == expected:
+                return True
+        return False
+
+    def _remove_jobs_lane_uniqueness(self) -> None:
+        """Rebuild v4 jobs without discarding job, repair, or lease history."""
+        leases = [
+            tuple(row)
+            for row in self.connection.execute(
+                "SELECT lane, job_id, acquired_at, heartbeat_at FROM lane_leases"
+            )
+        ]
+        columns = [row["name"] for row in self.connection.execute("PRAGMA table_info(jobs)")]
+        column_list = ", ".join(columns)
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.transaction() as conn:
+                conn.execute("DROP TABLE lane_leases")
+                conn.execute("ALTER TABLE jobs RENAME TO jobs_v4")
+                conn.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT PRIMARY KEY,
+                        issue_number INTEGER NOT NULL REFERENCES issues(number),
+                        plan_hash TEXT NOT NULL REFERENCES plans(plan_hash),
+                        lane TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        branch TEXT NOT NULL,
+                        base_sha TEXT,
+                        paths_json TEXT NOT NULL,
+                        verify_command TEXT NOT NULL,
+                        contracts_json TEXT NOT NULL,
+                        depends_on_json TEXT NOT NULL,
+                        workspace_id TEXT,
+                        workspace_url TEXT,
+                        agent_id TEXT,
+                        pr_number INTEGER,
+                        pr_url TEXT,
+                        head_sha TEXT,
+                        review_sha TEXT,
+                        review_workspace_id TEXT,
+                        review_agent_id TEXT,
+                        review_requested_at TEXT,
+                        repair_attempts INTEGER NOT NULL DEFAULT 0,
+                        repair_sha TEXT,
+                        repair_agent_id TEXT,
+                        repair_requested_at TEXT,
+                        repair_token TEXT,
+                        last_error TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    f"INSERT INTO jobs ({column_list}) SELECT {column_list} FROM jobs_v4"
+                )
+                conn.execute("DROP TABLE jobs_v4")
+                conn.execute("CREATE INDEX jobs_issue_idx ON jobs(issue_number, created_at)")
+                conn.execute("CREATE INDEX jobs_state_idx ON jobs(state, updated_at)")
+                conn.execute(
+                    """
+                    CREATE TABLE lane_leases (
+                        lane TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id),
+                        acquired_at TEXT NOT NULL,
+                        heartbeat_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO lane_leases(lane, job_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)",
+                    leases,
+                )
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+        failures = list(self.connection.execute("PRAGMA foreign_key_check"))
+        if failures:
+            raise RuntimeError("database migration produced invalid foreign-key references")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
