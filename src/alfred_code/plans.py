@@ -110,7 +110,7 @@ class PlanValidator:
 
         normalized_jobs: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        seen_lanes: set[str] = set()
+        seen_branches: set[str] = set()
         for index, job in enumerate(jobs):
             label = f"jobs[{index}]"
             if not isinstance(job, dict):
@@ -134,14 +134,14 @@ class PlanValidator:
             seen_ids.add(job_id)
             if lane not in self.policy.lanes:
                 problems.append(f"{label}.lane {lane!r} is not defined by {self.policy.source}")
-            elif lane in seen_lanes:
-                problems.append(f"lane {lane} appears more than once; one agent per lane is mandatory")
-            seen_lanes.add(lane)
             if not title:
                 problems.append(f"{label}.title is required")
             expected_prefix = LANE_BRANCH.get(lane)
             if expected_prefix and not re.fullmatch(rf"{re.escape(expected_prefix)}/{issue_number}-[a-z0-9][a-z0-9-]*", branch):
                 problems.append(f"{label}.branch must match {expected_prefix}/{issue_number}-<slug>")
+            elif branch in seen_branches:
+                problems.append(f"duplicate job branch {branch}")
+            seen_branches.add(branch)
             if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path.strip() for path in paths):
                 problems.append(f"{label}.paths must be a non-empty array of repository-relative paths or globs")
                 paths = []
@@ -196,6 +196,8 @@ class PlanValidator:
         # on that job and canonically add it to every downstream lane. The rest
         # of the graph is still validated below for cycles and unknown jobs.
         phase0_ids = {job["id"] for job in normalized_jobs if job["lane"] == "phase0"}
+        if len(phase0_ids) > 1:
+            problems.append("phase0 appears more than once; contract changes require one root job")
         for job in normalized_jobs:
             if job["lane"] == "phase0":
                 job["depends_on"] = []
@@ -232,11 +234,34 @@ class PlanValidator:
         for job_id in graph:
             visit(job_id)
 
+        def transitively_depends_on(job_id: str, dependency_id: str) -> bool:
+            pending = list(graph.get(job_id, []))
+            inspected: set[str] = set()
+            while pending:
+                candidate = pending.pop()
+                if candidate == dependency_id:
+                    return True
+                if candidate in inspected:
+                    continue
+                inspected.add(candidate)
+                pending.extend(graph.get(candidate, []))
+            return False
+
         for left_index, left in enumerate(normalized_jobs):
             for right in normalized_jobs[left_index + 1 :]:
+                same_lane = left["lane"] == right["lane"]
+                sequential = transitively_depends_on(
+                    left["id"], right["id"]
+                ) or transitively_depends_on(right["id"], left["id"])
+                if same_lane and not sequential:
+                    problems.append(
+                        f"jobs {left['id']} and {right['id']} share lane {left['lane']} without a dependency chain"
+                    )
                 for left_path in left["paths"]:
                     for right_path in right["paths"]:
-                        if patterns_may_overlap(left_path, right_path):
+                        if patterns_may_overlap(left_path, right_path) and not (
+                            same_lane and sequential
+                        ):
                             problems.append(
                                 f"jobs {left['id']} and {right['id']} may both write {left_path!r}/{right_path!r}"
                             )

@@ -202,6 +202,67 @@ class DatabaseTests(unittest.TestCase):
             }.issubset(columns)
         )
 
+    def test_schema_four_removes_lane_uniqueness_and_preserves_history_and_leases(self):
+        path = Path(self.temp.name) / "schema-four.sqlite3"
+        legacy = Database(path)
+        legacy.upsert_issue(self.issue)
+        digest = "m" * 64
+        legacy.save_plan(7, digest, self.plan)
+        legacy.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        legacy.materialize_jobs(7, digest, self.plan)
+        legacy.acquire_lane("I", "job-7")
+        legacy.connection.execute("UPDATE schema_meta SET version = 4")
+        legacy.connection.execute(
+            "CREATE UNIQUE INDEX jobs_one_lane_v4 ON jobs(issue_number, plan_hash, lane)"
+        )
+        legacy.close()
+
+        migrated = Database(path)
+        self.addCleanup(migrated.close)
+
+        self.assertEqual(migrated.get_job("job-7")["state"], "queued")
+        self.assertEqual(migrated.lease_owner("I"), "job-7")
+        self.assertEqual(
+            migrated.connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+        unique_columns = []
+        for index in migrated.connection.execute("PRAGMA index_list(jobs)"):
+            if index["unique"]:
+                unique_columns.append(
+                    [
+                        row["name"]
+                        for row in migrated.connection.execute(
+                            f"PRAGMA index_info({index['name']})"
+                        )
+                    ]
+                )
+        self.assertNotIn(["issue_number", "plan_hash", "lane"], unique_columns)
+
+        issue = dict(self.issue, id="I_8", number=8, url="https://example/issues/8")
+        migrated.upsert_issue(issue)
+        sequential = dict(self.plan, issue=8)
+        sequential["jobs"] = [
+            dict(
+                self.plan["jobs"][0],
+                id="first-8",
+                branch="lane-1/8-first",
+            ),
+            dict(
+                self.plan["jobs"][0],
+                id="second-8",
+                branch="lane-1/8-second",
+                depends_on=["first-8"],
+            ),
+        ]
+        second_digest = "n" * 64
+        migrated.save_plan(8, second_digest, sequential)
+        migrated.record_approval(8, second_digest, "ssdavidai", "100", None, "now")
+
+        jobs = migrated.materialize_jobs(8, second_digest, sequential)
+
+        self.assertEqual([job["lane"] for job in jobs], ["I", "I"])
+
     def test_job_launch_base_is_immutable_once_recorded(self):
         digest = "p" * 64
         dependent = dict(self.plan)

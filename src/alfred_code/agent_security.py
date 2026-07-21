@@ -21,7 +21,7 @@ from typing import Any
 
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 23
+LAUNCH_REVISION = 24
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
@@ -340,7 +340,7 @@ def _verification_roots(manifest: LaneManifest) -> tuple[str, ...]:
                 break
             if (package_root / "package.json").is_file() or (
                 package_root / "requirements.txt"
-            ).is_file():
+            ).is_file() or (package_root / "pyproject.toml").is_file():
                 roots.add(package_root.relative_to(manifest.workspace).as_posix())
                 break
     return tuple(sorted(roots))
@@ -508,25 +508,69 @@ def _dependency_command(command: list[str], *, timeout: int = 1200) -> None:
         raise AgentSecurityError(f"scoped Python dependency provisioning failed: {detail}")
 
 
+def _python_project_requirements(pyproject: Path) -> tuple[tuple[str, ...], bool]:
+    try:
+        value = tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise AgentSecurityError(f"cannot read Python dependency authority {pyproject}: {exc}") from exc
+    project = value.get("project") if isinstance(value, dict) else None
+    if not isinstance(project, dict):
+        return (), False
+    name = re.sub(r"[-_.]+", "-", str(project.get("name") or "").lower())
+    requirements: list[str] = []
+    groups = [project.get("dependencies", [])]
+    optional = project.get("optional-dependencies", {})
+    if isinstance(optional, dict):
+        groups.extend(optional.values())
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for raw in group:
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            requirement = raw.strip()
+            if requirement.startswith("-") or "\n" in requirement or "\r" in requirement:
+                raise AgentSecurityError(
+                    f"unsafe Python requirement in dependency authority {pyproject}"
+                )
+            requirement_name = re.split(r"[\s<>=!~@\[]", requirement, maxsplit=1)[0]
+            requirement_name = re.sub(r"[-_.]+", "-", requirement_name.lower())
+            # Meta-extras such as `package[all]` refer back to this same source
+            # project. Every concrete optional group is already collected above,
+            # so resolving the self-reference from PyPI would be both incorrect
+            # and less trustworthy than the checked-out dependency authority.
+            if name and requirement_name == name:
+                continue
+            requirements.append(requirement)
+    tool = value.get("tool")
+    pytest = tool.get("pytest") if isinstance(tool, dict) else None
+    pytest_options = pytest.get("ini_options", {}) if isinstance(pytest, dict) else {}
+    asyncio_enabled = isinstance(pytest_options, dict) and "asyncio_mode" in pytest_options
+    return tuple(dict.fromkeys(requirements)), asyncio_enabled
+
+
 def prepare_python_dependency_overlays(
     manifest: LaneManifest,
     *,
     cache_root: Path | None = None,
     uv_binary: str | None = None,
 ) -> tuple[Path, ...]:
-    """Provision requirements-hashed test environments outside the worktree."""
+    """Provision manifest-hashed test environments outside the worktree."""
     cache = cache_root or Path.home() / ".cache/alfred-code-python"
     uv = uv_binary or shutil.which("uv")
-    if not uv:
-        return ()
     environments: list[Path] = []
     for root in _verification_roots(manifest):
         if root == ".":
             continue
         package_root = manifest.workspace / root
         requirements = package_root / "requirements.txt"
-        if not requirements.is_file():
+        pyproject = package_root / "pyproject.toml"
+        if not requirements.is_file() and not pyproject.is_file():
             continue
+        if not uv:
+            raise AgentSecurityError(
+                f"uv is required to provision declared Python dependencies for {root}"
+            )
         local_environment = package_root / ".venv"
         if os.path.lexists(local_environment):
             if local_environment.is_symlink() and local_environment.resolve().is_dir():
@@ -535,9 +579,18 @@ def prepare_python_dependency_overlays(
         pytest_config = package_root / "pytest.ini"
         pytest_config_text = pytest_config.read_text() if pytest_config.is_file() else ""
         asyncio_enabled = "asyncio_mode" in pytest_config_text
+        project_requirements: tuple[str, ...] = ()
+        if pyproject.is_file():
+            project_requirements, project_asyncio = _python_project_requirements(pyproject)
+            asyncio_enabled = asyncio_enabled or project_asyncio
         digest = hashlib.sha256()
         digest.update(b"python=3.12\0")
-        digest.update(requirements.read_bytes())
+        if requirements.is_file():
+            digest.update(b"requirements.txt\0")
+            digest.update(requirements.read_bytes())
+        if pyproject.is_file():
+            digest.update(b"pyproject.toml\0")
+            digest.update(pyproject.read_bytes())
         digest.update(PYTEST_REQUIREMENT.encode())
         digest.update(pytest_config_text.encode())
         if asyncio_enabled:
@@ -561,10 +614,11 @@ def prepare_python_dependency_overlays(
                     "install",
                     "--python",
                     str(python),
-                    "-r",
-                    str(requirements),
-                    PYTEST_REQUIREMENT,
                 ]
+                if requirements.is_file():
+                    install.extend(["-r", str(requirements)])
+                install.extend(project_requirements)
+                install.append(PYTEST_REQUIREMENT)
                 if asyncio_enabled:
                     install.append(PYTEST_ASYNCIO_REQUIREMENT)
                 _dependency_command(install)
