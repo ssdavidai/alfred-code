@@ -17,6 +17,7 @@ from .errors import ConfigurationError
 
 DEFAULT_CONFIG = Path("~/.config/alfred-code/controller.toml").expanduser()
 PLANNER_PROFILE_NAME = "alfred-planner"
+TRUSTED_GITHUB_OPERATOR = "ssdavidai"
 
 DEFAULT_PLANNER_COMMAND = (
     "codex",
@@ -49,8 +50,8 @@ class GitHubConfig:
     intake_label: str = "alfred-code"
     approval_command: str = "/approve-plan"
     rejection_command: str = "/reject-plan"
-    approvers: tuple[str, ...] = ("ssdavidai",)
-    reviewers: tuple[str, ...] = ("ssdavidai",)
+    approvers: tuple[str, ...] = (TRUSTED_GITHUB_OPERATOR,)
+    reviewers: tuple[str, ...] = (TRUSTED_GITHUB_OPERATOR,)
     project_number: int | None = None
     project_title: str = "Alfred Product Control"
 
@@ -106,6 +107,18 @@ def _section(source: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def _trusted_github_actors(value: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(actor, str) for actor in value):
+        raise ConfigurationError(f"github.{field} must be an array of strings")
+    normalized = [actor.strip().casefold() for actor in value]
+    if normalized != [TRUSTED_GITHUB_OPERATOR]:
+        raise ConfigurationError(
+            f"github.{field} must contain only the trusted GitHub operator "
+            f"{TRUSTED_GITHUB_OPERATOR!r}"
+        )
+    return (TRUSTED_GITHUB_OPERATOR,)
+
+
 def load_config(path: Path | None = None) -> ControllerConfig:
     path = (path or DEFAULT_CONFIG).expanduser()
     raw: dict[str, Any] = {}
@@ -125,12 +138,14 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     if not isinstance(planner, list) or not planner or not all(isinstance(x, str) for x in planner):
         raise ConfigurationError("planner_command must be a non-empty array of strings")
     _validate_planner_command(planner)
-    approvers = github_raw.get("approvers", ["ssdavidai"])
-    if not isinstance(approvers, list) or not all(isinstance(x, str) for x in approvers):
-        raise ConfigurationError("github.approvers must be an array of strings")
-    reviewers = github_raw.get("reviewers", ["ssdavidai"])
-    if not isinstance(reviewers, list) or not all(isinstance(x, str) for x in reviewers):
-        raise ConfigurationError("github.reviewers must be an array of strings")
+    approvers = _trusted_github_actors(
+        github_raw.get("approvers", [TRUSTED_GITHUB_OPERATOR]),
+        "approvers",
+    )
+    reviewers = _trusted_github_actors(
+        github_raw.get("reviewers", [TRUSTED_GITHUB_OPERATOR]),
+        "reviewers",
+    )
 
     config = ControllerConfig(
         repo_path=repo_path,

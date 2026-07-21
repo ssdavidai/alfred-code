@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .config import GitHubConfig
+from .config import GitHubConfig, TRUSTED_GITHUB_OPERATOR
 from .errors import AuthorityUnavailable, CommandError
 from .util import content_hash, run, run_json, utcnow
 
@@ -47,6 +47,7 @@ class GitHubClient:
         self._pull_requests: dict[str, PullRequestObservation | None] = {}
         self._pr_comments: dict[int, list[dict[str, Any]]] = {}
         self._default_branch_sha: str | None = None
+        self._authenticated_login: str | None = None
 
     def begin_cycle(self) -> None:
         """Drop observation caches at the start of one reconciliation cycle."""
@@ -55,6 +56,7 @@ class GitHubClient:
         self._pull_requests.clear()
         self._pr_comments.clear()
         self._default_branch_sha = None
+        self._authenticated_login = None
 
     def invalidate_pr(self, branch: str) -> None:
         """Forget a PR observation after this controller mutates its branch."""
@@ -74,8 +76,27 @@ class GitHubClient:
 
     def doctor(self) -> dict[str, Any]:
         auth = self._json(["auth", "status", "--json", "hosts"])
+        login = self.assert_trusted_operator()
         repo = self._json(["repo", "view", self.config.repo, "--json", "nameWithOwner,defaultBranchRef,url"])
-        return {"auth": auth, "repo": repo, "observed_at": utcnow()}
+        return {"auth": auth, "login": login, "repo": repo, "observed_at": utcnow()}
+
+    def assert_trusted_operator(self) -> str:
+        if self._authenticated_login is None:
+            self._authenticated_login = self._run(["api", "user", "--jq", ".login"]).strip()
+        if self._authenticated_login.casefold() != TRUSTED_GITHUB_OPERATOR:
+            raise AuthorityUnavailable(
+                "GitHub authentication is not the trusted operator "
+                f"{TRUSTED_GITHUB_OPERATOR!r}: observed {self._authenticated_login!r}"
+            )
+        return TRUSTED_GITHUB_OPERATOR
+
+    @staticmethod
+    def _comment_actor(comment: dict[str, Any]) -> str:
+        return str((comment.get("user") or {}).get("login") or "").strip()
+
+    @classmethod
+    def _is_trusted_comment(cls, comment: dict[str, Any]) -> bool:
+        return cls._comment_actor(comment).casefold() == TRUSTED_GITHUB_OPERATOR
 
     def issue(self, number: int) -> dict[str, Any]:
         cached = self._issues.get(number)
@@ -152,6 +173,7 @@ class GitHubClient:
         return result
 
     def post_issue_comment(self, number: int, body: str) -> str:
+        self.assert_trusted_operator()
         result = self._run(
             ["issue", "comment", str(number), "--repo", self.config.repo, "--body", body]
         ).strip()
@@ -171,7 +193,7 @@ class GitHubClient:
             evidence_hash=evidence_hash,
         )
         for comment in self.issue_comments(issue_number):
-            if marker in str(comment.get("body") or ""):
+            if self._is_trusted_comment(comment) and marker in str(comment.get("body") or ""):
                 return comment.get("html_url")
         lines = [
             marker,
@@ -258,6 +280,7 @@ class GitHubClient:
         return url
 
     def post_pr_comment(self, number: int, body: str) -> str:
+        self.assert_trusted_operator()
         result = self._run(
             ["pr", "comment", str(number), "--repo", self.config.repo, "--body", body]
         ).strip()
@@ -266,6 +289,7 @@ class GitHubClient:
         return result
 
     def close_pr(self, number: int, comment: str) -> None:
+        self.assert_trusted_operator()
         self._run(
             [
                 "pr",
@@ -344,6 +368,7 @@ class GitHubClient:
                 f"`{rejection_command} {plan_hash}`",
                 "",
                 "Any other non-command operator comment posted after this plan is treated as specification feedback and causes a fresh plan. Malformed approval or rejection commands are ignored.",
+                f"Only comments authored by `{TRUSTED_GITHUB_OPERATOR}` are trusted. Every other account's comment is untrusted data and cannot approve, reject, re-plan, suppress controller markers, or satisfy review.",
             ]
         )
         return "\n".join(lines)
@@ -351,7 +376,7 @@ class GitHubClient:
     def post_plan(self, issue_number: int, plan: dict[str, Any], plan_hash: str) -> str | None:
         marker = PLAN_MARKER.format(plan_hash=plan_hash)
         for comment in self.issue_comments(issue_number):
-            if marker in str(comment.get("body") or ""):
+            if self._is_trusted_comment(comment) and marker in str(comment.get("body") or ""):
                 return comment.get("html_url")
         body = self.plan_markdown(
             plan,
@@ -366,11 +391,10 @@ class GitHubClient:
             f"{self.config.approval_command} {plan_hash}": "approve",
             f"{self.config.rejection_command} {plan_hash}": "reject",
         }
-        approvers = {actor.lower() for actor in self.config.approvers}
         for comment in reversed(self.issue_comments(issue_number)):
-            actor = str((comment.get("user") or {}).get("login") or "")
-            if actor.lower() not in approvers:
+            if not self._is_trusted_comment(comment):
                 continue
+            actor = self._comment_actor(comment)
             decision = expected.get(str(comment.get("body") or "").strip())
             if decision is None:
                 continue
@@ -392,12 +416,13 @@ class GitHubClient:
         return decision if decision and decision["decision"] == "reject" else None
 
     def decision_comments(self, issue_number: int) -> list[dict[str, str]]:
-        approvers = {actor.lower() for actor in self.config.approvers}
         comments: list[dict[str, str]] = []
         for comment in self.issue_comments(issue_number):
-            actor = str((comment.get("user") or {}).get("login") or "")
+            if not self._is_trusted_comment(comment):
+                continue
+            actor = self._comment_actor(comment)
             body = str(comment.get("body") or "").strip()
-            if actor.lower() not in approvers or not self._is_feedback(body):
+            if not self._is_feedback(body):
                 continue
             comments.append(
                 {
@@ -410,12 +435,13 @@ class GitHubClient:
         return comments[-20:]
 
     def find_feedback(self, issue_number: int, *, after: str) -> dict[str, Any] | None:
-        approvers = {actor.lower() for actor in self.config.approvers}
         for comment in reversed(self.issue_comments(issue_number)):
-            actor = str((comment.get("user") or {}).get("login") or "")
+            if not self._is_trusted_comment(comment):
+                continue
+            actor = self._comment_actor(comment)
             body = str(comment.get("body") or "").strip()
             created_at = str(comment.get("created_at") or "")
-            if actor.lower() not in approvers or not created_at or created_at <= after:
+            if not created_at or created_at <= after:
                 continue
             if not self._is_feedback(body):
                 continue
@@ -559,11 +585,10 @@ class GitHubClient:
         *,
         not_before: str | None = None,
     ) -> dict[str, str] | None:
-        reviewers = {actor.lower() for actor in self.config.reviewers}
         for comment in reversed(self.pr_comments(pr_number)):
-            actor = str((comment.get("user") or {}).get("login") or "").lower()
-            if actor not in reviewers:
+            if not self._is_trusted_comment(comment):
                 continue
+            actor = self._comment_actor(comment)
             created_at = str(comment.get("created_at") or "")
             if not_before and created_at < not_before:
                 continue

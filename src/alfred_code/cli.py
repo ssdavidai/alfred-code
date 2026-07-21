@@ -52,6 +52,7 @@ repo = "ssdavidai/alfred"
 owner = "ssdavidai"
 intake_label = "alfred-code"
 approval_command = "/approve-plan"
+# Immutable authorization boundary: startup fails if either list differs.
 approvers = ["ssdavidai"]
 reviewers = ["ssdavidai"]
 project_title = "Alfred Product Control"
