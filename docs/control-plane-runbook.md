@@ -4,7 +4,7 @@
 
 Run `./install-controller.sh`. It symlinks the v2 CLI and daemon wrapper, creates a mode-0600 configuration with `apply = false`, initializes the SQLite database, and renders a launchd plist. It deliberately does not load launchd.
 
-Run `alfred-code agents-provision`, then `alfred-code doctor`. Provisioning creates the two Alfred-only scoped Superset presets and replaces any YOLO arguments on the built-in Claude and Codex fallbacks with sandboxed settings. A healthy result proves the target repository, live lane policy, database, GitHub repository access, Superset runtime, scoped preset definitions, launcher, guard, and Codex permission-profile compatibility are all reachable. GitHub Projects requires the additional `project` token scope. Superset may use its persisted OAuth login or a `superset-api-key` in the Keychain broker.
+Run `alfred-code agents-provision`, then `alfred-code doctor`. Provisioning creates the two Alfred-only scoped Superset presets and replaces any YOLO arguments on the built-in Claude and Codex fallbacks with sandboxed settings. A healthy result proves the target repository, live lane policy, database, GitHub repository access authenticated as the immutable trusted operator `ssdavidai`, Superset runtime, scoped preset definitions, launcher, guard, and Codex permission-profile compatibility are all reachable. GitHub Projects requires the additional `project` token scope. Superset may use its persisted OAuth login or a `superset-api-key` in the Keychain broker.
 
 Run `alfred-code project-setup` after GitHub has project scope. Put the returned number into `github.project_number` in the controller TOML, then run `doctor` again.
 
@@ -20,7 +20,7 @@ Only after diagnostics and a read-only cycle are clean should `apply = true` be 
 
 ## Normal operation
 
-Create an issue. With automatic intake enabled, no label or board movement is required. The controller comments a plan. Read the lane decomposition, affected contracts, verification, base SHA, and risk. Approve or reject by copying the corresponding exact full-hash command from the comment; do not abbreviate it. Leave any other comment when the specification needs revision—the controller incorporates that operator feedback and publishes a fresh hash-bound plan.
+Create an issue. With automatic intake enabled, no label or board movement is required. The controller comments a plan. Read the lane decomposition, affected contracts, verification, base SHA, and risk. While logged in as `ssdavidai`, approve or reject by copying the corresponding exact full-hash command from the comment; do not abbreviate it. Leave any other comment from that same account when the specification needs revision—the controller incorporates that trusted operator feedback and publishes a fresh hash-bound plan. Comments from every other account are untrusted data and cannot control the system.
 
 Watch the GitHub Project for the portfolio view. Open the linked Superset workspace when you want to see an agent's terminal. Use the PR for code, CI, smoke evidence, and the final merge decision. Use Slack as an inbox only.
 

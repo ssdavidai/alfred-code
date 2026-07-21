@@ -55,3 +55,36 @@ def test_auto_replan_bound_is_validated(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="between 0 and 5"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("approvers", "[]"),
+        ("approvers", '["intruder"]'),
+        ("approvers", '["ssdavidai", "intruder"]'),
+        ("reviewers", "[]"),
+        ("reviewers", '["intruder"]'),
+        ("reviewers", '["ssdavidai", "intruder"]'),
+    ],
+)
+def test_github_comment_authority_cannot_be_reconfigured(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    path = tmp_path / "controller.toml"
+    path.write_text(f"[github]\n{field} = {value}\n")
+
+    with pytest.raises(ConfigurationError, match="only the trusted GitHub operator"):
+        load_config(path)
+
+
+def test_github_comment_authority_is_canonicalized_to_ssdavidai(tmp_path: Path) -> None:
+    path = tmp_path / "controller.toml"
+    path.write_text(
+        '[github]\napprovers = ["SSDavidAI"]\nreviewers = ["ssdavidai"]\n'
+    )
+
+    config = load_config(path)
+
+    assert config.github.approvers == ("ssdavidai",)
+    assert config.github.reviewers == ("ssdavidai",)
