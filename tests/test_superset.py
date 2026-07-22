@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from alfred_code.config import SupersetConfig
-from alfred_code.superset import SupersetClient
+from alfred_code.superset import SupersetClient, worker_workspace_name
 
 
 class FakeSuperset(SupersetClient):
@@ -28,6 +28,24 @@ class FakeSuperset(SupersetClient):
 
 
 class SupersetTests(unittest.TestCase):
+    def test_worker_workspace_names_are_stable_and_unique_per_sequential_job(self):
+        model = worker_workspace_name(
+            "alfred-code", 316, "I", "ctrl-run-model-316-r3-r3"
+        )
+        request = worker_workspace_name(
+            "alfred-code", 316, "I", "ctrl-run-request-316-r3-r3"
+        )
+
+        self.assertEqual(
+            model,
+            worker_workspace_name(
+                "alfred-code", 316, "I", "ctrl-run-model-316-r3-r3"
+            ),
+        )
+        self.assertNotEqual(model, request)
+        self.assertIn("ctrl-run-model-316-r3-r3", model)
+        self.assertIn("ctrl-run-request-316-r3-r3", request)
+
     def test_worker_creation_is_atomic_and_writes_lane_metadata(self):
         client = FakeSuperset()
         job = {
