@@ -16,7 +16,7 @@ from .states import (
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 SCHEMA = """
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS issues (
     current_plan_hash TEXT,
     product_stage TEXT NOT NULL DEFAULT 'backlog',
     project_rank INTEGER,
+    carryover_replan INTEGER NOT NULL DEFAULT 0 CHECK (carryover_replan IN (0, 1)),
     observed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -194,7 +195,7 @@ class Database:
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             return
-        if row["version"] not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
+        if row["version"] not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
             raise RuntimeError(
                 f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
             )
@@ -242,6 +243,11 @@ class Database:
                 )
             if "project_rank" not in issue_columns:
                 self.connection.execute("ALTER TABLE issues ADD COLUMN project_rank INTEGER")
+            if "carryover_replan" not in issue_columns:
+                self.connection.execute(
+                    "ALTER TABLE issues ADD COLUMN carryover_replan "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (carryover_replan IN (0, 1))"
+                )
 
         if self._jobs_has_lane_uniqueness():
             self._remove_jobs_lane_uniqueness()
@@ -448,17 +454,24 @@ class Database:
             raise ValueError(f"unknown product stage: {stage}")
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT product_stage, project_rank FROM issues WHERE number = ?",
+                "SELECT product_stage, project_rank, carryover_replan "
+                "FROM issues WHERE number = ?",
                 (number,),
             ).fetchone()
             if row is None:
                 raise KeyError(f"issue #{number} not found")
             next_rank = row["project_rank"] if rank is None else int(rank)
-            if row["product_stage"] == stage and row["project_rank"] == next_rank:
+            next_carryover = int(row["carryover_replan"]) if stage == "inbox" else 0
+            if (
+                row["product_stage"] == stage
+                and row["project_rank"] == next_rank
+                and int(row["carryover_replan"]) == next_carryover
+            ):
                 return
             conn.execute(
-                "UPDATE issues SET product_stage=?, project_rank=?, updated_at=? WHERE number=?",
-                (stage, next_rank, utcnow(), number),
+                "UPDATE issues SET product_stage=?, project_rank=?, carryover_replan=?, "
+                "updated_at=? WHERE number=?",
+                (stage, next_rank, next_carryover, utcnow(), number),
             )
             self.event(
                 "product.transition",
@@ -624,7 +637,7 @@ class Database:
                     )
                 conn.execute(
                     """
-                    UPDATE issues SET product_stage='active', project_rank=?,
+                    UPDATE issues SET product_stage='active', project_rank=?, carryover_replan=0,
                                       controller_state=CASE
                                           WHEN controller_state IN ('observed','blocked') THEN 'planning'
                                           ELSE controller_state
@@ -724,7 +737,7 @@ class Database:
                 )
             conn.execute(
                 """
-                UPDATE issues SET product_stage='active', project_rank=?,
+                UPDATE issues SET product_stage='active', project_rank=?, carryover_replan=0,
                                   controller_state=CASE
                                       WHEN controller_state IN ('observed','blocked') THEN 'planning'
                                       ELSE controller_state
@@ -828,9 +841,47 @@ class Database:
                 stage = "done" if item["status"] == "done" else (
                     "needs_split" if item["status"] == "needs_split" else "inbox"
                 )
+                carryover_replan = int(item["status"] == "blocked")
+                if carryover_replan:
+                    current = conn.execute(
+                        "SELECT current_plan_hash FROM issues WHERE number=?",
+                        (item["issue_number"],),
+                    ).fetchone()
+                    plan_hash = str(current["current_plan_hash"] or "") if current else ""
+                    blockers: list[dict[str, Any]] = []
+                    if plan_hash:
+                        blockers = self._retire_plan_graph(
+                            conn,
+                            int(item["issue_number"]),
+                            plan_hash,
+                            reason=f"blocked carryover from Sprint {sprint['number']}",
+                            now=now,
+                        )
+                    conn.execute(
+                        "UPDATE issues SET current_plan_hash=NULL, controller_state='planning' "
+                        "WHERE number=?",
+                        (item["issue_number"],),
+                    )
+                    self.event(
+                        "sprint.carryover_replan_requested",
+                        {
+                            "sprint": sprint["number"],
+                            "plan_hash": plan_hash or None,
+                            "blockers": blockers,
+                        },
+                        issue_number=item["issue_number"],
+                        connection=conn,
+                    )
                 conn.execute(
-                    "UPDATE issues SET product_stage=?, project_rank=?, updated_at=? WHERE number=?",
-                    (stage, item["rank"], now, item["issue_number"]),
+                    "UPDATE issues SET product_stage=?, project_rank=?, carryover_replan=?, "
+                    "updated_at=? WHERE number=?",
+                    (
+                        stage,
+                        item["rank"],
+                        carryover_replan,
+                        now,
+                        item["issue_number"],
+                    ),
                 )
             self.event(
                 "sprint.closed",
@@ -889,7 +940,8 @@ class Database:
                 return False
             conn.execute("UPDATE plans SET status='needs_split' WHERE plan_hash=?", (plan_hash,))
             conn.execute(
-                "UPDATE issues SET controller_state='blocked', product_stage='needs_split', updated_at=? WHERE number=?",
+                "UPDATE issues SET controller_state='blocked', product_stage='needs_split', "
+                "carryover_replan=0, updated_at=? WHERE number=?",
                 (now, issue_number),
             )
             conn.execute(
@@ -948,6 +1000,27 @@ class Database:
             issue_number=issue_number,
         )
 
+    def prepare_sprint_carryover(
+        self,
+        issue_number: int,
+        sprint_number: int,
+        plan_hash: str | None,
+        pull_requests: list[int],
+    ) -> None:
+        """Persist carryover cleanup intent before changing controller-owned PRs."""
+        latest = self.latest_event(issue_number, "sprint.carryover_prepared")
+        if latest and latest["detail"].get("sprint") == sprint_number:
+            return
+        self.event(
+            "sprint.carryover_prepared",
+            {
+                "sprint": sprint_number,
+                "plan_hash": plan_hash,
+                "pull_requests": sorted(pull_requests),
+            },
+            issue_number=issue_number,
+        )
+
     def supersede_plan_for_replan(
         self,
         issue_number: int,
@@ -965,46 +1038,13 @@ class Database:
             ).fetchone()
             if current is None or current["current_plan_hash"] != plan_hash:
                 return False
-            jobs = list(
-                conn.execute(
-                    "SELECT * FROM jobs WHERE issue_number = ? AND plan_hash = ? ORDER BY created_at, job_id",
-                    (issue_number, plan_hash),
-                )
+            self._retire_plan_graph(
+                conn,
+                issue_number,
+                plan_hash,
+                reason=reason,
+                now=now,
             )
-            for job in jobs:
-                if job["state"] == "merged":
-                    continue
-                lease = conn.execute(
-                    "SELECT lane FROM lane_leases WHERE job_id = ?",
-                    (job["job_id"],),
-                ).fetchone()
-                conn.execute("DELETE FROM lane_leases WHERE job_id = ?", (job["job_id"],))
-                if lease is not None:
-                    self.event(
-                        "lane.released",
-                        {"lane": lease["lane"], "reason": "job entered superseded"},
-                        issue_number=issue_number,
-                        job_id=job["job_id"],
-                        connection=conn,
-                    )
-                last_error = job["last_error"] or reason
-                conn.execute(
-                    "UPDATE jobs SET state='superseded', last_error=?, updated_at=? WHERE job_id=?",
-                    (last_error, now, job["job_id"]),
-                )
-                if job["state"] != "superseded":
-                    self.event(
-                        "job.transition",
-                        {"from": job["state"], "to": "superseded"},
-                        issue_number=issue_number,
-                        job_id=job["job_id"],
-                        connection=conn,
-                    )
-            conn.execute(
-                "UPDATE plans SET status='superseded', superseded_at=? WHERE plan_hash=?",
-                (now, plan_hash),
-            )
-            conn.execute("UPDATE approvals SET revoked_at=? WHERE plan_hash=?", (now, plan_hash))
             conn.execute(
                 "UPDATE issues SET current_plan_hash=NULL, controller_state='planning', updated_at=? WHERE number=?",
                 (now, issue_number),
@@ -1020,6 +1060,74 @@ class Database:
                 connection=conn,
             )
         return True
+
+    def _retire_plan_graph(
+        self,
+        conn: sqlite3.Connection,
+        issue_number: int,
+        plan_hash: str,
+        *,
+        reason: str,
+        now: str,
+    ) -> list[dict[str, Any]]:
+        """Retire one execution graph while retaining merged work and blocker evidence."""
+        jobs = list(
+            conn.execute(
+                "SELECT * FROM jobs WHERE issue_number=? AND plan_hash=? "
+                "ORDER BY created_at, job_id",
+                (issue_number, plan_hash),
+            )
+        )
+        blockers: list[dict[str, Any]] = []
+        for job in jobs:
+            if job["state"] == "merged":
+                continue
+            blockers.append(
+                {
+                    "job_id": job["job_id"],
+                    "lane": job["lane"],
+                    "state": job["state"],
+                    "pr_number": job["pr_number"],
+                    "reason": job["last_error"] or reason,
+                }
+            )
+            lease = conn.execute(
+                "SELECT lane FROM lane_leases WHERE job_id=?", (job["job_id"],)
+            ).fetchone()
+            conn.execute("DELETE FROM lane_leases WHERE job_id=?", (job["job_id"],))
+            if lease is not None:
+                self.event(
+                    "lane.released",
+                    {"lane": lease["lane"], "reason": "job entered superseded"},
+                    issue_number=issue_number,
+                    job_id=job["job_id"],
+                    connection=conn,
+                )
+            conn.execute(
+                "UPDATE jobs SET state='superseded', last_error=?, updated_at=? WHERE job_id=?",
+                (job["last_error"] or reason, now, job["job_id"]),
+            )
+            if job["state"] != "superseded":
+                self.event(
+                    "job.transition",
+                    {"from": job["state"], "to": "superseded"},
+                    issue_number=issue_number,
+                    job_id=job["job_id"],
+                    connection=conn,
+                )
+        conn.execute(
+            "UPDATE plans SET status='superseded', superseded_at=? WHERE plan_hash=?",
+            (now, plan_hash),
+        )
+        conn.execute("UPDATE approvals SET revoked_at=? WHERE plan_hash=?", (now, plan_hash))
+        return blockers
+
+    def clear_carryover_replan(self, issue_number: int) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE issues SET carryover_replan=0, updated_at=? WHERE number=?",
+                (utcnow(), issue_number),
+            )
 
     def current_plan(self, issue_number: int) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -1064,7 +1172,8 @@ class Database:
             )
             conn.execute("UPDATE plans SET status = 'approved' WHERE plan_hash = ?", (plan_hash,))
             conn.execute(
-                "UPDATE issues SET controller_state = 'approved', updated_at = ? WHERE number = ?",
+                "UPDATE issues SET controller_state='approved', carryover_replan=0, "
+                "updated_at=? WHERE number=?",
                 (now, issue_number),
             )
             self.event(
@@ -1098,7 +1207,8 @@ class Database:
                 return False
             conn.execute("UPDATE plans SET status = 'rejected' WHERE plan_hash = ?", (plan_hash,))
             conn.execute(
-                "UPDATE issues SET controller_state = 'blocked', updated_at = ? WHERE number = ?",
+                "UPDATE issues SET controller_state='blocked', carryover_replan=0, "
+                "updated_at=? WHERE number=?",
                 (utcnow(), issue_number),
             )
             self.event(

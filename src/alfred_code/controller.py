@@ -239,7 +239,10 @@ class Controller:
                 "observed", "closed", "completed"
             }
             if self._sprint_workflow_enabled():
-                selected = local.get("product_stage") in {"active", "legacy_active"}
+                selected = local.get("product_stage") in {"active", "legacy_active"} or (
+                    local.get("product_stage") == "inbox"
+                    and bool(local.get("carryover_replan"))
+                )
             else:
                 selected = enrolled or active
             if selected or (
@@ -430,6 +433,7 @@ class Controller:
         exc: Exception,
     ) -> None:
         self.database.set_issue_state(issue_number, "blocked", {"reason": str(exc)})
+        self.database.clear_carryover_replan(issue_number)
         self.notifier.send(
             f"issue:{issue_number}:planning-failed:{type(exc).__name__}",
             f"Alfred #{issue_number} could not be specified: {exc}",
@@ -799,6 +803,7 @@ class Controller:
                 plan, plan_hash = self.planner.plan_issue(issue_number)
             except (AlfredCodeError, OSError) as exc:
                 self.database.set_issue_state(issue_number, "blocked", {"reason": str(exc)})
+                self.database.clear_carryover_replan(issue_number)
                 self.notifier.send(
                     f"issue:{issue_number}:planning-failed:{type(exc).__name__}",
                     f"Alfred #{issue_number} could not be specified: {exc}",
@@ -861,6 +866,14 @@ class Controller:
                 f"Alfred #{issue_number} plan {plan_hash[:12]} was approved by @{decision['actor']} and is queued.",
                 {"issue": issue_number, "plan_hash": plan_hash},
             )
+
+        issue = self.database.get_issue(issue_number) or issue
+        if (
+            self._sprint_workflow_enabled()
+            and issue.get("product_stage") not in {"active", "legacy_active"}
+        ):
+            self._sync_project(issue_number)
+            return self._issue_summary(issue_number)
 
         jobs = self.database.list_current_jobs(issue_number)
         if not jobs:
@@ -2925,6 +2938,54 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
             return "active"
         return "blocked"
 
+    def _close_blocked_carryover_prs(
+        self,
+        sprint: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> None:
+        """Close only controller-owned failed PRs before retiring their plan graph."""
+        pending: list[tuple[int, dict[str, Any], PullRequestObservation]] = []
+        plan_hashes: dict[int, str | None] = {}
+        for item in items:
+            if item["status"] != "blocked":
+                continue
+            issue_number = int(item["issue_number"])
+            current = self.database.current_plan(issue_number)
+            plan_hashes[issue_number] = str(current["plan_hash"]) if current else None
+            for job in self.database.list_current_jobs(issue_number):
+                if job["state"] == "merged":
+                    continue
+                pr = self.github.pr_for_branch(str(job["branch"]))
+                if pr is None or pr.merged or pr.closed_unmerged:
+                    continue
+                self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+                if not self._controller_owns_pr(job, pr):
+                    raise AuthorityUnavailable(
+                        f"refusing Sprint {sprint['number']} carryover for issue "
+                        f"#{issue_number}: open PR #{pr.number} is not owned by "
+                        f"controller job {job['job_id']}"
+                    )
+                pending.append((issue_number, job, pr))
+
+        # Validate all PR ownership before the first external write. Persist the
+        # exact intended effects so a crash can safely resume the idempotent close.
+        for issue_number, plan_hash in plan_hashes.items():
+            self.database.prepare_sprint_carryover(
+                issue_number,
+                int(sprint["number"]),
+                plan_hash,
+                [pr.number for number, _job, pr in pending if number == issue_number],
+            )
+        for _issue_number, job, pr in pending:
+            self.github.close_pr(
+                pr.number,
+                f"Sprint {sprint['number']} ended with controller job "
+                f"`{job['job_id']}` blocked. This PR is superseded for Inbox "
+                "replanning; its branch, commits, review evidence, and blocker "
+                "remain available. A replacement plan cannot execute until the "
+                "issue is explicitly selected into a future sprint.",
+            )
+
     def _reconcile_active_sprint(self) -> dict[str, Any] | None:
         sprint = self.database.active_sprint()
         if sprint is None:
@@ -2936,6 +2997,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         items = self.database.sprint_items(int(sprint["id"]))
         if not items or any(item["status"] == "active" for item in items):
             return {**sprint, "items": items}
+        self._close_blocked_carryover_prs(sprint, items)
         closed, closed_items = self.database.close_active_sprint()
         returned = [item for item in closed_items if item["status"] != "done"]
         if self.project and self.config.github.project_number and returned:

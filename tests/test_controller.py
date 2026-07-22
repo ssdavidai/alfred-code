@@ -20,6 +20,7 @@ from alfred_code.agent_security import (
 from alfred_code.config import ControllerConfig, GitHubConfig, SlackConfig, SupersetConfig
 from alfred_code.controller import Controller
 from alfred_code.db import Database
+from alfred_code.errors import AuthorityUnavailable
 from alfred_code.github import PullRequestObservation
 from alfred_code.notify import DurableNotifier
 from alfred_code.superset import Workspace, worker_workspace_name
@@ -975,6 +976,191 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.get_issue(12)["product_stage"], "needs_split")
         self.assertEqual(self.superset.worker_creates, 0)
         self.assertEqual(result["sprint"]["state"], "closed")
+
+    def test_blocked_sprint_item_replans_in_inbox_but_cannot_build_until_reselected(self):
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+        self.db.upsert_issue(self.issue)
+        self.db.set_product_stage(12, "sprint_queue")
+        first_sprint = self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        head = "b" * 40
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            pr_number=55,
+            pr_url="https://example/pr/55",
+            head_sha=head,
+            last_error="independent review found a contract mismatch",
+        )
+        self.db.set_issue_state(12, "blocked")
+        self.github.prs[job["branch"]] = PullRequestObservation(
+            55,
+            "https://example/pr/55",
+            "OPEN",
+            head,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            job["branch"],
+            "Controller job: `api-12` · lane `I`",
+        )
+
+        closed = self.controller._reconcile_active_sprint()
+
+        self.assertEqual(closed["state"], "closed")
+        self.assertEqual(self.db.sprint_items(first_sprint["id"])[0]["status"], "blocked")
+        self.assertEqual(self.github.closed_prs[0][0], 55)
+        self.assertIn("Inbox replanning", self.github.closed_prs[0][1])
+        carried = self.db.get_issue(12)
+        self.assertEqual(carried["product_stage"], "inbox")
+        self.assertEqual(carried["carryover_replan"], 1)
+        self.assertIsNone(self.db.current_plan(12))
+        self.assertEqual(self.db.get_job("api-12")["state"], "superseded")
+        prepared = self.db.latest_event(12, "sprint.carryover_prepared")
+        self.assertEqual(prepared["detail"]["pull_requests"], [55])
+
+        replanned = self.controller.run_once()
+
+        self.assertEqual(self.planner.calls, 2)
+        self.assertEqual(replanned["issues"][0]["state"], "awaiting_approval")
+        self.assertEqual(replanned["issues"][0]["product_stage"], "inbox")
+        self.assertEqual(self.db.get_issue(12)["carryover_replan"], 1)
+        self.assertEqual(self.db.list_current_jobs(12), [])
+        self.assertEqual(self.superset.worker_creates, 1)
+
+        self.approve()
+        approved = self.controller.run_once()
+
+        self.assertEqual(approved["issues"][0]["state"], "approved")
+        self.assertEqual(approved["issues"][0]["product_stage"], "inbox")
+        self.assertEqual(self.db.get_issue(12)["carryover_replan"], 0)
+        self.assertEqual(self.db.list_current_jobs(12), [])
+        self.assertEqual(self.superset.worker_creates, 1)
+        self.assertEqual(self.controller.run_once()["issues"], [])
+
+        project.items = [
+            {
+                "issue_number": 12,
+                "issue_url": self.issue["url"],
+                "stage": "Sprint queue",
+                "rank": 0,
+            }
+        ]
+        self.controller.run_once()
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "sprint_queue")
+        self.assertEqual(self.db.list_current_jobs(12), [])
+        self.db.start_sprint(
+            title="Sprint 1",
+            duration_days=14,
+            starts_at="2026-08-05T08:00:00Z",
+            ends_at="2026-08-19T08:00:00Z",
+            iteration_id="iteration-1",
+            issue_numbers=[12],
+        )
+
+        launched = self.controller.run_once()
+
+        self.assertEqual(launched["issues"][0]["state"], "building")
+        self.assertEqual(self.db.list_current_jobs(12)[0]["job_id"], "api-12-r2")
+        self.assertEqual(self.superset.worker_creates, 2)
+
+    def test_unowned_open_pr_prevents_blocked_sprint_carryover(self):
+        self.controller.project = FakeProject()
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+        self.db.upsert_issue(self.issue)
+        self.db.set_product_stage(12, "sprint_queue")
+        self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        head = "c" * 40
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            pr_number=56,
+            pr_url="https://example/pr/56",
+            head_sha=head,
+            last_error="unrecognized terminal blocker",
+        )
+        self.db.set_issue_state(12, "blocked")
+        self.github.prs[job["branch"]] = PullRequestObservation(
+            56,
+            "https://example/pr/56",
+            "OPEN",
+            head,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            job["branch"],
+            "A human-authored PR without the controller ownership marker.",
+        )
+
+        with self.assertRaisesRegex(AuthorityUnavailable, "is not owned"):
+            self.controller._reconcile_active_sprint()
+
+        self.assertIsNotNone(self.db.active_sprint())
+        self.assertEqual(self.github.closed_prs, [])
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "active")
+        self.assertEqual(self.db.get_issue(12)["carryover_replan"], 0)
+        self.assertEqual(self.db.current_plan(12)["plan_hash"], self.plan_hash)
+        self.assertEqual(self.db.get_job("api-12")["state"], "blocked")
+        self.assertIsNone(self.db.latest_event(12, "sprint.carryover_prepared"))
+
+    def test_failed_inbox_carryover_plan_does_not_retry_forever(self):
+        self.controller.project = FakeProject()
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+        self.db.upsert_issue(self.issue)
+        self.db.connection.execute(
+            "UPDATE issues SET product_stage='inbox', controller_state='planning', "
+            "carryover_replan=1 WHERE number=12"
+        )
+
+        def fail_plan(_prepared):
+            self.planner.calls += 1
+            raise RuntimeError("planner unavailable")
+
+        self.planner.execute_plan = fail_plan
+
+        failed = self.controller.run_once()
+        quiet = self.controller.run_once()
+
+        self.assertEqual(failed["errors"][0]["error"], "planner unavailable")
+        self.assertEqual(self.db.get_issue(12)["controller_state"], "blocked")
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "inbox")
+        self.assertEqual(self.db.get_issue(12)["carryover_replan"], 0)
+        self.assertEqual(quiet["issues"], [])
+        self.assertEqual(self.planner.calls, 1)
 
     def test_approved_issue_waits_for_cross_issue_dependency_before_materializing_jobs(self):
         dependency = {
