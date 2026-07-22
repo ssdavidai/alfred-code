@@ -107,6 +107,12 @@
     .stat-label { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
     .stat-value { margin-top: 9px; font-size: 25px; font-weight: 560; letter-spacing: -.045em; }
     .stat-note { margin-top: 4px; color: var(--dim); font-size: 11px; }
+    .sprint-panel { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 0 0 19px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+    .sprint-copy strong { display: block; font-size: 14px; font-weight: 560; }
+    .sprint-copy span { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
+    .primary { border: 1px solid #467055; border-radius: 8px; padding: 8px 12px; background: var(--green-soft); color: #b6ebc7; cursor: pointer; font-size: 12px; }
+    .primary:hover { border-color: var(--green); }
+    .primary:disabled { cursor: wait; opacity: .55; }
 
     .board-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
     .search-wrap { position: relative; width: min(340px, 100%); }
@@ -125,7 +131,7 @@
 
     .board {
       display: grid;
-      grid-template-columns: repeat(8, minmax(255px, 1fr));
+      grid-template-columns: repeat(11, minmax(255px, 1fr));
       gap: 10px;
       align-items: start;
       overflow-x: auto;
@@ -270,7 +276,7 @@
         <div class="mark">A/</div>
         <div class="brand-copy">
           <h1>Alfred Operations</h1>
-          <p>Read-only control-plane telemetry</p>
+          <p>Delivery control plane and exact telemetry</p>
         </div>
       </div>
       <div class="live-row">
@@ -290,6 +296,7 @@
       </div>
 
       <section id="stats" class="stats" aria-label="Key metrics"></section>
+      <section id="sprintControl" class="sprint-panel" aria-label="Sprint control"></section>
 
       <section id="boardView">
         <div class="board-toolbar">
@@ -326,6 +333,11 @@
               <h2>Telemetry coverage</h2>
               <p class="panel-sub">What is measured versus intentionally unknown</p>
               <div id="telemetryNotice" class="notice"></div>
+            </section>
+            <section class="panel">
+              <h2>Sprint economics</h2>
+              <p class="panel-sub">Committed, delivered, carryover, and processed tokens per point</p>
+              <div id="sprintEconomics" class="notice"></div>
             </section>
             <section class="panel">
               <h2>Lane leases</h2>
@@ -459,13 +471,62 @@
         meta.append(badge);
       });
       if (!issue.jobs.length && issue.plan) meta.append(node('span', 'badge plan', `${issue.plan.job_count} planned lane${issue.plan.job_count === 1 ? '' : 's'}`));
+      if (issue.story_points) meta.append(node('span', 'badge plan', `${issue.story_points} points`));
       if (issue.invalidated_count) meta.append(node('span', 'badge', `${issue.invalidated_count} replan${issue.invalidated_count === 1 ? '' : 's'}`));
       button.append(meta);
       const tokenLine = node('div', 'token-line');
       const model = issue.models.length ? issue.models.join(', ') : (issue.plan ? 'Planner telemetry unavailable' : 'No measured session');
-      tokenLine.append(node('span', '', model), node('strong', '', `${compact(issue.tokens.output_tokens)} out`));
+      tokenLine.append(
+        node('span', '', model),
+        node('strong', '', issue.tokens_per_point === null
+          ? `${compact(issue.tokens.output_tokens)} out`
+          : `${compact(Math.round(issue.tokens_per_point))} tok/pt`)
+      );
       button.append(tokenLine);
       return button;
+    }
+
+    function renderSprint() {
+      const sprint = state.snapshot.analytics.active_sprint;
+      const container = $('sprintControl');
+      container.replaceChildren();
+      const copy = node('div', 'sprint-copy');
+      if (sprint) {
+        copy.append(
+          node('strong', '', `${sprint.title}${sprint.overdue ? ' · overdue' : ''}`),
+          node('span', '', `${sprint.completed_points} completed · ${sprint.committed_points} committed · ${sprint.added_points} added · ${sprint.items.length} cards`)
+        );
+        container.append(copy, node('div', 'badge ready', sprint.state));
+        return;
+      }
+      const queued = state.snapshot.issues.filter((issue) => issue.column === 'sprint_queue').length;
+      copy.append(
+        node('strong', '', 'No active sprint'),
+        node('span', '', `${queued} card${queued === 1 ? '' : 's'} in Sprint queue`)
+      );
+      const button = node('button', 'primary', queued ? 'Start sprint' : 'Sprint queue is empty');
+      button.type = 'button';
+      button.disabled = !queued;
+      if (queued) button.addEventListener('click', startSprint);
+      container.append(copy, button);
+    }
+
+    async function startSprint() {
+      const button = $('sprintControl').querySelector('button');
+      if (button) button.disabled = true;
+      try {
+        const response = await fetch('/api/sprints/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({token: state.snapshot.runtime.action_token})
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Sprint start failed: ${response.status}`);
+        await refresh();
+      } catch (error) {
+        window.alert(error.message);
+        if (button) button.disabled = false;
+      }
     }
 
     function renderBoard() {
@@ -571,6 +632,10 @@
       renderLeases();
       renderStateBars();
       $('telemetryNotice').textContent = state.snapshot.analytics.telemetry_note;
+      const sprint = state.snapshot.analytics.active_sprint || state.snapshot.analytics.sprints[0];
+      $('sprintEconomics').textContent = sprint
+        ? `${sprint.title}: ${sprint.completed_points} delivered points, ${compact(sprint.tokens.total_tokens)} processed tokens, ${sprint.tokens_per_completed_point === null ? 'tokens/point pending first completion' : `${compact(Math.round(sprint.tokens_per_completed_point))} tokens per delivered point`}, ${sprint.carryover_points} carryover points.`
+        : 'No sprint history yet. Sprint 0 will establish the first capacity baseline.';
     }
 
     function renderActivity() {
@@ -626,7 +691,10 @@
         detailCell('Events', issue.event_count),
         detailCell('Plan', issue.plan ? issue.plan.short_hash : 'None'),
         detailCell('Risk', issue.plan?.risk || '—'),
-        detailCell('Replans', issue.invalidated_count)
+        detailCell('Replans', issue.invalidated_count),
+        detailCell('Story points', issue.story_points || '—'),
+        detailCell('Sprint', issue.sprint?.sprint_title || '—'),
+        detailCell('Tokens / point', issue.tokens_per_point === null ? '—' : compact(Math.round(issue.tokens_per_point)))
       );
       overview.append(grid);
       body.append(overview);
@@ -688,6 +756,7 @@
       if (!state.snapshot) return;
       renderRuntime();
       renderStats();
+      renderSprint();
       renderBoard();
       renderAnalytics();
       renderActivity();

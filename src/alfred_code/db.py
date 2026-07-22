@@ -6,11 +6,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .states import ACTIVE_LEASE_STATES, ISSUE_STATES, JOB_STATES
+from .states import (
+    ACTIVE_LEASE_STATES,
+    ISSUE_STATES,
+    JOB_STATES,
+    PRODUCT_STAGES,
+    SPRINT_ITEM_STATES,
+)
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 SCHEMA = """
@@ -29,6 +35,8 @@ CREATE TABLE IF NOT EXISTS issues (
     url TEXT,
     labels_json TEXT NOT NULL DEFAULT '[]',
     current_plan_hash TEXT,
+    product_stage TEXT NOT NULL DEFAULT 'backlog',
+    project_rank INTEGER,
     observed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -96,6 +104,34 @@ CREATE TABLE IF NOT EXISTS lane_leases (
     heartbeat_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sprints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    number INTEGER NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    duration_days INTEGER NOT NULL,
+    iteration_id TEXT,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    closed_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sprints_state_idx ON sprints(state, number);
+
+CREATE TABLE IF NOT EXISTS sprint_items (
+    sprint_id INTEGER NOT NULL REFERENCES sprints(id),
+    issue_number INTEGER NOT NULL REFERENCES issues(number),
+    rank INTEGER NOT NULL,
+    commitment TEXT NOT NULL,
+    status TEXT NOT NULL,
+    story_points INTEGER,
+    points_evidence TEXT,
+    added_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY(sprint_id, issue_number)
+);
+CREATE INDEX IF NOT EXISTS sprint_items_issue_idx ON sprint_items(issue_number, sprint_id);
+
 CREATE TABLE IF NOT EXISTS observations (
     authority TEXT NOT NULL,
     object_key TEXT NOT NULL,
@@ -158,7 +194,7 @@ class Database:
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             return
-        if row["version"] not in {1, 2, 3, 4, SCHEMA_VERSION}:
+        if row["version"] not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
             raise RuntimeError(
                 f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
             )
@@ -186,6 +222,26 @@ class Database:
                     )
             if "base_sha" not in columns:
                 self.connection.execute("ALTER TABLE jobs ADD COLUMN base_sha TEXT")
+
+            issue_columns = {
+                item["name"] for item in self.connection.execute("PRAGMA table_info(issues)")
+            }
+            if "product_stage" not in issue_columns:
+                self.connection.execute(
+                    "ALTER TABLE issues ADD COLUMN product_stage TEXT NOT NULL DEFAULT 'backlog'"
+                )
+                self.connection.execute(
+                    """
+                    UPDATE issues SET product_stage = CASE
+                        WHEN controller_state IN ('completed', 'closed') THEN 'done'
+                        WHEN controller_state = 'observed' THEN 'backlog'
+                        WHEN controller_state IN ('building', 'ready_merge') THEN 'legacy_active'
+                        ELSE 'inbox'
+                    END
+                    """
+                )
+            if "project_rank" not in issue_columns:
+                self.connection.execute("ALTER TABLE issues ADD COLUMN project_rank INTEGER")
 
         if self._jobs_has_lane_uniqueness():
             self._remove_jobs_lane_uniqueness()
@@ -380,6 +436,415 @@ class Database:
                 connection=conn,
             )
 
+    def set_product_stage(
+        self,
+        number: int,
+        stage: str,
+        *,
+        rank: int | None = None,
+        reason: str = "",
+    ) -> None:
+        if stage not in PRODUCT_STAGES:
+            raise ValueError(f"unknown product stage: {stage}")
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT product_stage, project_rank FROM issues WHERE number = ?",
+                (number,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"issue #{number} not found")
+            next_rank = row["project_rank"] if rank is None else int(rank)
+            if row["product_stage"] == stage and row["project_rank"] == next_rank:
+                return
+            conn.execute(
+                "UPDATE issues SET product_stage=?, project_rank=?, updated_at=? WHERE number=?",
+                (stage, next_rank, utcnow(), number),
+            )
+            self.event(
+                "product.transition",
+                {
+                    "from": row["product_stage"],
+                    "to": stage,
+                    "rank": next_rank,
+                    **({"reason": reason} if reason else {}),
+                },
+                issue_number=number,
+                connection=conn,
+            )
+
+    def active_sprint(self) -> dict[str, Any] | None:
+        return self._dict(
+            self.connection.execute(
+                "SELECT * FROM sprints WHERE state='active' ORDER BY number DESC LIMIT 1"
+            ).fetchone()
+        )
+
+    def list_sprints(self) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.connection.execute("SELECT * FROM sprints ORDER BY number DESC")
+        ]
+
+    def sprint_items(self, sprint_id: int) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """
+                SELECT si.*, i.title, i.url, i.controller_state, i.product_stage,
+                       i.github_state, i.current_plan_hash
+                FROM sprint_items si JOIN issues i ON i.number=si.issue_number
+                WHERE si.sprint_id=? ORDER BY si.rank, si.issue_number
+                """,
+                (sprint_id,),
+            )
+        ]
+
+    def current_sprint_item(self, issue_number: int) -> dict[str, Any] | None:
+        return self._dict(
+            self.connection.execute(
+                """
+                SELECT si.*, s.number AS sprint_number, s.title AS sprint_title,
+                       s.state AS sprint_state, s.iteration_id, s.starts_at, s.ends_at
+                FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
+                WHERE si.issue_number=? AND s.state='active'
+                ORDER BY s.number DESC LIMIT 1
+                """,
+                (issue_number,),
+            ).fetchone()
+        )
+
+    def latest_sprint_item(self, issue_number: int) -> dict[str, Any] | None:
+        return self._dict(
+            self.connection.execute(
+                """
+                SELECT si.*, s.number AS sprint_number, s.title AS sprint_title,
+                       s.state AS sprint_state, s.iteration_id, s.starts_at, s.ends_at,
+                       s.closed_at
+                FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
+                WHERE si.issue_number=? ORDER BY s.number DESC LIMIT 1
+                """,
+                (issue_number,),
+            ).fetchone()
+        )
+
+    def next_sprint_number(self) -> int:
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(number), -1) + 1 AS number FROM sprints"
+        ).fetchone()
+        return int(row["number"] if row else 0)
+
+    def start_sprint(
+        self,
+        *,
+        title: str,
+        duration_days: int,
+        starts_at: str,
+        ends_at: str,
+        iteration_id: str | None,
+        issue_numbers: list[int],
+    ) -> dict[str, Any]:
+        if not issue_numbers:
+            raise ValueError("cannot start an empty sprint")
+        if len(issue_numbers) != len(set(issue_numbers)):
+            raise ValueError("sprint issue list contains duplicates")
+        now = utcnow()
+        with self.transaction() as conn:
+            active = conn.execute("SELECT number FROM sprints WHERE state='active'").fetchone()
+            if active is not None:
+                raise RuntimeError(f"Sprint {active['number']} is already active")
+            number = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(number), -1) + 1 AS number FROM sprints"
+                ).fetchone()["number"]
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO sprints(number,title,state,duration_days,iteration_id,
+                                    starts_at,ends_at,created_at)
+                VALUES (?,?,'active',?,?,?,?,?)
+                """,
+                (number, title, duration_days, iteration_id, starts_at, ends_at, now),
+            )
+            sprint_id = int(cursor.lastrowid)
+            for rank, issue_number in enumerate(issue_numbers):
+                issue = conn.execute(
+                    "SELECT controller_state FROM issues WHERE number=?", (issue_number,)
+                ).fetchone()
+                if issue is None:
+                    raise KeyError(f"issue #{issue_number} not found")
+                current = conn.execute(
+                    """
+                    SELECT p.plan_hash, p.plan_json, p.status FROM plans p JOIN issues i
+                    ON i.current_plan_hash=p.plan_hash WHERE i.number=?
+                    """,
+                    (issue_number,),
+                ).fetchone()
+                plan = json.loads(current["plan_json"]) if current else {}
+                conn.execute(
+                    """
+                    INSERT INTO sprint_items(sprint_id,issue_number,rank,commitment,status,
+                                             story_points,points_evidence,added_at)
+                    VALUES (?,?,?,'committed','active',?,?,?)
+                    """,
+                    (
+                        sprint_id,
+                        issue_number,
+                        rank,
+                        plan.get("story_points"),
+                        plan.get("points_evidence"),
+                        now,
+                    ),
+                )
+                job_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM jobs WHERE issue_number=?",
+                        (issue_number,),
+                    ).fetchone()["count"]
+                )
+                retire_unestimated = bool(
+                    current and plan.get("story_points") is None and job_count == 0
+                )
+                if current and (
+                    current["status"] in {"rejected", "needs_split"} or retire_unestimated
+                ):
+                    conn.execute(
+                        "UPDATE plans SET status='superseded', superseded_at=? WHERE plan_hash=?",
+                        (now, current["plan_hash"]),
+                    )
+                    conn.execute(
+                        "UPDATE approvals SET revoked_at=? WHERE plan_hash=?",
+                        (now, current["plan_hash"]),
+                    )
+                    conn.execute(
+                        "UPDATE issues SET current_plan_hash=NULL WHERE number=?", (issue_number,)
+                    )
+                    conn.execute(
+                        "UPDATE issues SET controller_state='planning' WHERE number=?",
+                        (issue_number,),
+                    )
+                conn.execute(
+                    """
+                    UPDATE issues SET product_stage='active', project_rank=?,
+                                      controller_state=CASE
+                                          WHEN controller_state IN ('observed','blocked') THEN 'planning'
+                                          ELSE controller_state
+                                      END,
+                                      updated_at=? WHERE number=?
+                    """,
+                    (rank, now, issue_number),
+                )
+                self.event(
+                    "sprint.item_added",
+                    {"sprint": number, "rank": rank, "commitment": "committed"},
+                    issue_number=issue_number,
+                    connection=conn,
+                )
+            self.event(
+                "sprint.started",
+                {
+                    "sprint": number,
+                    "title": title,
+                    "duration_days": duration_days,
+                    "issues": issue_numbers,
+                },
+                connection=conn,
+            )
+        return self.active_sprint() or {}
+
+    def add_to_active_sprint(self, issue_number: int) -> dict[str, Any]:
+        now = utcnow()
+        with self.transaction() as conn:
+            sprint = conn.execute(
+                "SELECT * FROM sprints WHERE state='active' ORDER BY number DESC LIMIT 1"
+            ).fetchone()
+            if sprint is None:
+                raise RuntimeError("there is no active sprint")
+            existing = conn.execute(
+                "SELECT * FROM sprint_items WHERE sprint_id=? AND issue_number=?",
+                (sprint["id"], issue_number),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            issue = conn.execute("SELECT * FROM issues WHERE number=?", (issue_number,)).fetchone()
+            if issue is None:
+                raise KeyError(f"issue #{issue_number} not found")
+            rank = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(rank), -1) + 1 AS rank FROM sprint_items WHERE sprint_id=?",
+                    (sprint["id"],),
+                ).fetchone()["rank"]
+            )
+            current = conn.execute(
+                """
+                SELECT p.plan_hash, p.plan_json, p.status FROM plans p JOIN issues i
+                ON i.current_plan_hash=p.plan_hash WHERE i.number=?
+                """,
+                (issue_number,),
+            ).fetchone()
+            plan = json.loads(current["plan_json"]) if current else {}
+            conn.execute(
+                """
+                INSERT INTO sprint_items(sprint_id,issue_number,rank,commitment,status,
+                                         story_points,points_evidence,added_at)
+                VALUES (?,?,?,'added','active',?,?,?)
+                """,
+                (
+                    sprint["id"],
+                    issue_number,
+                    rank,
+                    plan.get("story_points"),
+                    plan.get("points_evidence"),
+                    now,
+                ),
+            )
+            job_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM jobs WHERE issue_number=?",
+                    (issue_number,),
+                ).fetchone()["count"]
+            )
+            retire_unestimated = bool(
+                current and plan.get("story_points") is None and job_count == 0
+            )
+            if current and (
+                current["status"] in {"rejected", "needs_split"} or retire_unestimated
+            ):
+                conn.execute(
+                    "UPDATE plans SET status='superseded', superseded_at=? WHERE plan_hash=?",
+                    (now, current["plan_hash"]),
+                )
+                conn.execute(
+                    "UPDATE approvals SET revoked_at=? WHERE plan_hash=?",
+                    (now, current["plan_hash"]),
+                )
+                conn.execute("UPDATE issues SET current_plan_hash=NULL WHERE number=?", (issue_number,))
+                conn.execute(
+                    "UPDATE issues SET controller_state='planning' WHERE number=?",
+                    (issue_number,),
+                )
+            conn.execute(
+                """
+                UPDATE issues SET product_stage='active', project_rank=?,
+                                  controller_state=CASE
+                                      WHEN controller_state IN ('observed','blocked') THEN 'planning'
+                                      ELSE controller_state
+                                  END,
+                                  updated_at=? WHERE number=?
+                """,
+                (rank, now, issue_number),
+            )
+            self.event(
+                "sprint.item_added",
+                {"sprint": sprint["number"], "rank": rank, "commitment": "added"},
+                issue_number=issue_number,
+                connection=conn,
+            )
+        return self.current_sprint_item(issue_number) or {}
+
+    def set_sprint_iteration(self, sprint_id: int, iteration_id: str) -> None:
+        self.connection.execute(
+            "UPDATE sprints SET iteration_id=? WHERE id=?", (iteration_id, sprint_id)
+        )
+
+    def record_story_points(
+        self,
+        issue_number: int,
+        points: int,
+        evidence: str,
+    ) -> None:
+        with self.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT si.* FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
+                WHERE si.issue_number=? AND s.state='active'
+                """,
+                (issue_number,),
+            ).fetchone()
+            if row is None:
+                return
+            if row["story_points"] == points and row["points_evidence"] == evidence:
+                return
+            conn.execute(
+                "UPDATE sprint_items SET story_points=?, points_evidence=? WHERE sprint_id=? AND issue_number=?",
+                (points, evidence, row["sprint_id"], issue_number),
+            )
+            self.event(
+                "sprint.points_recorded",
+                {"points": points, "evidence": evidence},
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def set_sprint_item_status(self, issue_number: int, status: str) -> None:
+        if status not in SPRINT_ITEM_STATES:
+            raise ValueError(f"unknown sprint item status: {status}")
+        with self.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT si.* FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
+                WHERE si.issue_number=? AND s.state='active'
+                """,
+                (issue_number,),
+            ).fetchone()
+            if row is None or row["status"] == status:
+                return
+            conn.execute(
+                "UPDATE sprint_items SET status=?, completed_at=? WHERE sprint_id=? AND issue_number=?",
+                (
+                    status,
+                    utcnow() if status != "active" else None,
+                    row["sprint_id"],
+                    issue_number,
+                ),
+            )
+            self.event(
+                "sprint.item_status",
+                {"from": row["status"], "to": status},
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def close_active_sprint(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        now = utcnow()
+        with self.transaction() as conn:
+            sprint = conn.execute(
+                "SELECT * FROM sprints WHERE state='active' ORDER BY number DESC LIMIT 1"
+            ).fetchone()
+            if sprint is None:
+                raise RuntimeError("there is no active sprint")
+            items = list(
+                conn.execute(
+                    "SELECT * FROM sprint_items WHERE sprint_id=? ORDER BY rank, issue_number",
+                    (sprint["id"],),
+                )
+            )
+            if not items or any(item["status"] == "active" for item in items):
+                raise RuntimeError("active sprint still contains non-terminal work")
+            conn.execute(
+                "UPDATE sprints SET state='closed', closed_at=? WHERE id=?",
+                (now, sprint["id"]),
+            )
+            for item in items:
+                stage = "done" if item["status"] == "done" else (
+                    "needs_split" if item["status"] == "needs_split" else "inbox"
+                )
+                conn.execute(
+                    "UPDATE issues SET product_stage=?, project_rank=?, updated_at=? WHERE number=?",
+                    (stage, item["rank"], now, item["issue_number"]),
+                )
+            self.event(
+                "sprint.closed",
+                {
+                    "sprint": sprint["number"],
+                    "done": [item["issue_number"] for item in items if item["status"] == "done"],
+                    "returned": [item["issue_number"] for item in items if item["status"] != "done"],
+                },
+                connection=conn,
+            )
+        closed = dict(sprint)
+        closed.update({"state": "closed", "closed_at": now})
+        return closed, [dict(item) for item in items]
+
     def save_plan(self, issue_number: int, plan_hash: str, plan: dict[str, Any]) -> None:
         now = utcnow()
         with self.transaction() as conn:
@@ -413,6 +878,34 @@ class Database:
                 issue_number=issue_number,
                 connection=conn,
             )
+
+    def mark_plan_needs_split(self, issue_number: int, plan_hash: str) -> bool:
+        now = utcnow()
+        with self.transaction() as conn:
+            current = conn.execute(
+                "SELECT current_plan_hash FROM issues WHERE number=?", (issue_number,)
+            ).fetchone()
+            if current is None or current["current_plan_hash"] != plan_hash:
+                return False
+            conn.execute("UPDATE plans SET status='needs_split' WHERE plan_hash=?", (plan_hash,))
+            conn.execute(
+                "UPDATE issues SET controller_state='blocked', product_stage='needs_split', updated_at=? WHERE number=?",
+                (now, issue_number),
+            )
+            conn.execute(
+                """
+                UPDATE sprint_items SET status='needs_split', completed_at=?
+                WHERE issue_number=? AND sprint_id=(SELECT id FROM sprints WHERE state='active')
+                """,
+                (now, issue_number),
+            )
+            self.event(
+                "plan.needs_split",
+                {"plan_hash": plan_hash, "story_points": 21},
+                issue_number=issue_number,
+                connection=conn,
+            )
+        return True
 
     def invalidate_plan(self, issue_number: int, reason: str) -> None:
         now = utcnow()

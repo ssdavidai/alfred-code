@@ -205,6 +205,38 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "duplicate job branch"):
             self.validator.validate(value, issue_number=42, base_sha=self.base)
 
+    def test_fibonacci_estimate_and_cross_issue_dependencies_are_normalized(self):
+        value = self.valid()
+        value.update(
+            {
+                "story_points": 8,
+                "points_evidence": "Two lanes, contract coordination, and both test suites.",
+                "issue_dependencies": [17, "18", 17],
+            }
+        )
+
+        plan, _ = self.validator.validate(value, issue_number=42, base_sha=self.base)
+
+        self.assertEqual(plan["story_points"], 8)
+        self.assertEqual(plan["issue_dependencies"], [17, 18])
+        self.assertIn("Two lanes", plan["points_evidence"])
+
+    def test_non_fibonacci_or_self_dependency_estimates_are_rejected(self):
+        value = self.valid()
+        value.update(
+            {
+                "story_points": 4,
+                "points_evidence": "Guess",
+                "issue_dependencies": [42],
+            }
+        )
+
+        with self.assertRaises(PlanValidationError) as raised:
+            self.validator.validate(value, issue_number=42, base_sha=self.base)
+
+        self.assertIn("story_points must be one of", str(raised.exception))
+        self.assertIn("self-referential", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

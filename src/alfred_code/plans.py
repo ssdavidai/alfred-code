@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import PlanValidationError
+from .states import FIBONACCI_POINTS
 from .util import content_hash, unique
 
 
@@ -103,6 +104,36 @@ class PlanValidator:
             problems.append(f"plan issue {raw.get('issue')!r} does not match #{issue_number}")
         if raw.get("base_sha") != base_sha:
             problems.append("plan base_sha does not match the freshly observed default branch SHA")
+        estimate_present = any(
+            key in raw for key in ("story_points", "points_evidence", "issue_dependencies")
+        )
+        story_points: int | None = None
+        points_evidence = ""
+        issue_dependencies: list[int] = []
+        if estimate_present:
+            try:
+                story_points = int(raw.get("story_points"))
+            except (TypeError, ValueError):
+                story_points = None
+            if story_points not in FIBONACCI_POINTS:
+                problems.append("story_points must be one of 1, 2, 3, 5, 8, 13, or 21")
+            points_evidence = str(raw.get("points_evidence") or "").strip()
+            if not points_evidence:
+                problems.append("points_evidence is required")
+            dependencies = raw.get("issue_dependencies")
+            if not isinstance(dependencies, list):
+                problems.append("issue_dependencies must be an array of issue numbers")
+            else:
+                for value in dependencies:
+                    try:
+                        dependency = int(value)
+                    except (TypeError, ValueError):
+                        problems.append("issue_dependencies must contain positive issue numbers")
+                        continue
+                    if dependency <= 0 or dependency == issue_number:
+                        problems.append("issue_dependencies cannot be non-positive or self-referential")
+                    elif dependency not in issue_dependencies:
+                        issue_dependencies.append(dependency)
         jobs = raw.get("jobs")
         if not isinstance(jobs, list) or not jobs:
             problems.append("jobs must be a non-empty array")
@@ -283,6 +314,14 @@ class PlanValidator:
             "risk": str(raw.get("risk") or "medium").strip().lower(),
             "jobs": normalized_jobs,
         }
+        if estimate_present:
+            normalized.update(
+                {
+                    "story_points": story_points,
+                    "points_evidence": points_evidence,
+                    "issue_dependencies": issue_dependencies,
+                }
+            )
         if decision_context_hash is not None:
             normalized["decision_context_hash"] = decision_context_hash
         return normalized, content_hash(normalized)

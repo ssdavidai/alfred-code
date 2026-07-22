@@ -64,6 +64,50 @@ class ProjectBoardTests(unittest.TestCase):
         self.assertEqual(board._items[3][issue_url]["plan hash"], "")
         self.assertEqual(board._items[3][issue_url]["runtime"], "")
 
+    def test_delivery_items_preserve_github_manual_position(self):
+        board = RecordingProjectBoard()
+        board._ordered_items[3] = [
+            {
+                "id": "second-item",
+                "control stage": "Inbox",
+                "content": {"number": 9, "url": "https://example/issues/9"},
+            },
+            {
+                "id": "first-item",
+                "control stage": "Sprint queue",
+                "story points": 5,
+                "content": {"number": 7, "url": "https://example/issues/7"},
+            },
+        ]
+
+        items = board.delivery_items(3)
+
+        self.assertEqual([item["issue_number"] for item in items], [9, 7])
+        self.assertEqual([item["rank"] for item in items], [0, 1])
+        self.assertEqual(items[1]["stage"], "Sprint queue")
+
+    def test_story_points_and_iteration_use_typed_project_edits(self):
+        board = RecordingProjectBoard()
+        issue_url = "https://example/issues/7"
+        board._projects[3] = {"id": "project-id", "number": 3}
+        board._fields[3] = {
+            "Story points": {"id": "points", "name": "Story points", "type": "ProjectV2Field"},
+            "Sprint": {"id": "sprint", "name": "Sprint", "type": "ProjectV2IterationField"},
+        }
+        board._items[3] = {issue_url: {"id": "item-id"}}
+
+        board.sync_issue(
+            project_number=3,
+            issue_url=issue_url,
+            controller_state="planning",
+            story_points=8,
+            iteration_id="iteration-0",
+        )
+
+        edits = [call for call in board.calls if call[1] == "item-edit"]
+        self.assertTrue(any(("--number", "8") == call[call.index("--number"):call.index("--number") + 2] for call in edits))
+        self.assertTrue(any("--iteration-id" in call and "iteration-0" in call for call in edits))
+
 
 if __name__ == "__main__":
     unittest.main()

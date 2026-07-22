@@ -33,6 +33,7 @@ from .plans import LanePolicy, PlanValidator
 from .project import ProjectBoard
 from .superset import SupersetClient
 from .superset_agents import inspect_agent_configs, provision_agent_configs
+from .sprints import SprintManager
 from .util import atomic_write, run
 from .worktrees import audit_worktrees
 
@@ -44,6 +45,7 @@ apply = false
 poll_seconds = 60
 max_parallel_planners = 3
 auto_replan_max_attempts = 2
+sprint_duration_days = 14
 planner_command = {json.dumps(list(DEFAULT_PLANNER_COMMAND))}
 planner_timeout_seconds = 900
 
@@ -113,6 +115,7 @@ def doctor(config: ControllerConfig) -> tuple[dict[str, Any], bool]:
         "scheduler": {
             "max_parallel_planners": config.max_parallel_planners,
             "auto_replan_max_attempts": config.auto_replan_max_attempts,
+            "sprint_duration_days": config.sprint_duration_days,
         },
         "checks": {},
     }
@@ -224,6 +227,12 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument("--legacy-dir", type=Path, default=Path("~/.alfred-code-state").expanduser())
 
     sub.add_parser("project-setup", help="Create or adopt the GitHub PM project and fields")
+    sprint_start = sub.add_parser(
+        "sprint-start", help="Start the ordered cards currently in the GitHub Sprint queue"
+    )
+    sprint_start.add_argument("--title", help="Sprint title; defaults to Sprint N")
+    sprint_start.add_argument("--duration-days", type=int, help="Override configured duration")
+    sub.add_parser("sprint-status", help="Show active and historical sprint state")
     sub.add_parser("worktrees-audit", help="Read-only audit of every target-repository worktree")
     sub.add_parser("agents-provision", help="Provision and verify Alfred-only scoped Superset agent presets")
     return root
@@ -310,6 +319,38 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+        if args.command in {"sprint-start", "sprint-status"}:
+            database = Database(config.database_path)
+            try:
+                if args.command == "sprint-start":
+                    project = ProjectBoard(config.github)
+                    result = SprintManager(
+                        config,
+                        database,
+                        project,
+                        GitHubClient(config.github),
+                    ).start(
+                        title=args.title,
+                        duration_days=args.duration_days,
+                    )
+                    emit({"sprint": result, "next": "controller will specify queued cards"})
+                else:
+                    sprints = database.list_sprints()
+                    emit(
+                        {
+                            "active": database.active_sprint(),
+                            "sprints": [
+                                {
+                                    **sprint,
+                                    "items": database.sprint_items(int(sprint["id"])),
+                                }
+                                for sprint in sprints
+                            ],
+                        }
+                    )
+            finally:
+                database.close()
+            return 0
         if args.command == "worktrees-audit":
             emit(audit_worktrees(config.repo_path, GitHubClient(config.github)))
             return 0
@@ -337,6 +378,13 @@ def main(argv: list[str] | None = None) -> int:
                     "jobs": database.list_jobs(),
                     "leases": [dict(row) for row in database.connection.execute("SELECT * FROM lane_leases")],
                     "events": database.events(100),
+                    "sprints": [
+                        {
+                            **sprint,
+                            "items": database.sprint_items(int(sprint["id"])),
+                        }
+                        for sprint in database.list_sprints()
+                    ],
                 }
             )
         elif args.command == "plan":
