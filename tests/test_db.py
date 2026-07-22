@@ -309,6 +309,60 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual([item["story_points"] for item in items], [5, 3])
         self.assertEqual(self.database.get_issue(7)["product_stage"], "done")
         self.assertEqual(self.database.get_issue(8)["product_stage"], "inbox")
+        self.assertEqual(self.database.get_issue(8)["carryover_replan"], 1)
+        self.assertEqual(self.database.get_issue(8)["controller_state"], "planning")
+
+    def test_blocked_sprint_carryover_retires_failed_graph_for_inbox_replan(self):
+        self.database.set_product_stage(7, "sprint_queue")
+        sprint = self.database.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[7],
+        )
+        digest = "c" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        self.database.materialize_jobs(7, digest, self.plan)
+        self.database.update_job("job-7", state="blocked", last_error="review failed")
+        self.assertTrue(self.database.acquire_lane("I", "job-7"))
+        self.database.set_sprint_item_status(7, "blocked")
+
+        self.database.close_active_sprint()
+
+        issue = self.database.get_issue(7)
+        self.assertEqual(issue["product_stage"], "inbox")
+        self.assertEqual(issue["controller_state"], "planning")
+        self.assertEqual(issue["carryover_replan"], 1)
+        self.assertIsNone(self.database.current_plan(7))
+        self.assertFalse(self.database.is_approved(digest))
+        self.assertEqual(self.database.get_job("job-7")["state"], "superseded")
+        self.assertEqual(self.database.get_job("job-7")["last_error"], "review failed")
+        self.assertIsNone(self.database.lease_owner("I"))
+        self.assertEqual(
+            self.database.event_count(7, "sprint.carryover_replan_requested"),
+            1,
+        )
+        self.assertEqual(self.database.sprint_items(sprint["id"])[0]["status"], "blocked")
+
+    def test_schema_six_adds_disabled_carryover_replan_flag(self):
+        path = Path(self.temp.name) / "schema-six.sqlite3"
+        legacy = Database(path)
+        legacy.upsert_issue(self.issue)
+        legacy.connection.execute("ALTER TABLE issues DROP COLUMN carryover_replan")
+        legacy.connection.execute("UPDATE schema_meta SET version=6")
+        legacy.close()
+
+        migrated = Database(path)
+        self.addCleanup(migrated.close)
+
+        self.assertEqual(migrated.get_issue(7)["carryover_replan"], 0)
+        self.assertEqual(
+            migrated.connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+            SCHEMA_VERSION,
+        )
 
     def test_schema_five_migrates_delivery_state_without_enrolling_old_backlog(self):
         path = Path(self.temp.name) / "schema-five.sqlite3"
