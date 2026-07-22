@@ -8,6 +8,7 @@ import pytest
 
 from alfred_code import dashboard
 from alfred_code.config import ControllerConfig
+from alfred_code.config import GitHubConfig
 from alfred_code.dashboard import DashboardData, TelemetryScanner, serve_dashboard
 from alfred_code.db import Database
 
@@ -36,7 +37,11 @@ def test_snapshot_maps_durable_state_without_writing(tmp_path: Path) -> None:
     assert snapshot["runtime"]["read_only"] is True
     assert snapshot["issues"][0]["number"] == 42
     assert snapshot["issues"][0]["column"] == "specifying"
-    assert snapshot["columns"][1] == {"id": "specifying", "label": "Specifying", "count": 1}
+    assert next(column for column in snapshot["columns"] if column["id"] == "specifying") == {
+        "id": "specifying",
+        "label": "Specifying",
+        "count": 1,
+    }
     assert "Planner instrumentation is active" in snapshot["analytics"]["telemetry_note"]
     assert config.database_path.read_bytes() == before
 
@@ -231,6 +236,65 @@ def test_codex_planner_telemetry_preserves_provider_and_cumulative_totals(
 def test_dashboard_refuses_non_loopback_binding() -> None:
     with pytest.raises(ValueError, match="loopback"):
         serve_dashboard(ControllerConfig(), host="0.0.0.0", port=0)
+
+
+def test_sprint_velocity_uses_completed_points_and_time_bounded_tokens(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.upsert_issue(
+        {
+            "number": 42,
+            "title": "Measured sprint item",
+            "body": "Ship it",
+            "state": "OPEN",
+            "url": "https://example.test/issues/42",
+            "labels": [],
+        }
+    )
+    sprint = database.start_sprint(
+        title="Sprint 0 — Calibration",
+        duration_days=14,
+        starts_at="2026-07-20T00:00:00Z",
+        ends_at="2026-08-03T00:00:00Z",
+        iteration_id="iteration-0",
+        issue_numbers=[42],
+    )
+    database.record_story_points(42, 5, "bounded implementation")
+    database.set_sprint_item_status(42, "done")
+    database.close()
+    data = DashboardData(config)
+    data.telemetry.sessions = lambda: [  # type: ignore[method-assign]
+        {
+            "session_id": "one",
+            "provider": "codex",
+            "model": "gpt-test",
+            "issue_number": 42,
+            "job_id": "job-42",
+            "role": "worker",
+            "workspace": "test",
+            "started_at": "2026-07-21T00:00:00Z",
+            "ended_at": "2026-07-21T00:01:00Z",
+            "status": "completed",
+            "input_tokens": 70,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 30,
+            "reasoning_tokens": 10,
+            "total_tokens": 100,
+        }
+    ]
+
+    snapshot = data.snapshot()
+    measured = snapshot["analytics"]["active_sprint"]
+
+    assert measured["id"] == sprint["id"]
+    assert measured["completed_points"] == 5
+    assert measured["tokens"]["total_tokens"] == 100
+    assert measured["tokens_per_completed_point"] == 20
 
 
 def test_runtime_reports_every_parallel_safe_planner(monkeypatch: pytest.MonkeyPatch) -> None:

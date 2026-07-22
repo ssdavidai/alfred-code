@@ -46,13 +46,29 @@ def plan_json_schema(issue_number: int, base_sha: str) -> dict[str, Any]:
     string_array = {"type": "array", "items": {"type": "string"}}
     return {
         "type": "object",
-        "required": ["issue", "base_sha", "summary", "risk", "jobs"],
+        "required": [
+            "issue",
+            "base_sha",
+            "summary",
+            "risk",
+            "story_points",
+            "points_evidence",
+            "issue_dependencies",
+            "jobs",
+        ],
         "additionalProperties": False,
         "properties": {
             "issue": {"type": "integer", "const": issue_number},
             "base_sha": {"type": "string", "const": base_sha},
             "summary": {"type": "string", "minLength": 1},
             "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+            "story_points": {"type": "integer", "enum": [1, 2, 3, 5, 8, 13, 21]},
+            "points_evidence": {"type": "string", "minLength": 1},
+            "issue_dependencies": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "uniqueItems": True,
+            },
             "jobs": {
                 "type": "array",
                 "minItems": 1,
@@ -312,6 +328,9 @@ Required schema:
   "base_sha": "{base_sha}",
   "summary": "specific implementation summary",
   "risk": "low|medium|high",
+  "story_points": 5,
+  "points_evidence": "short evidence-based estimate using lanes, contracts, jobs, risk, and verification scope",
+  "issue_dependencies": [123],
   "jobs": [
     {{
       "id": "api-{issue['number']}",
@@ -327,6 +346,8 @@ Required schema:
     }}
   ]
 }}
+
+Estimate the whole issue, not individual jobs. Use this calibration: 1 is a trivial bounded change; 2 is a small single-lane change; 3 is a normal single-lane implementation with tests; 5 has multiple bounded jobs or meaningful contract reads; 8 crosses lanes or contracts; 13 is a large coordinated delivery; 21 means the issue is too large for one sprint and must be split. Only list issue_dependencies that must be Done before implementation can safely begin.
 
 Rules: normally use one job per lane, and always one agent per job. Jobs in different lanes must not have overlapping write paths. If a trusted `alfred-code-auto-replan` evidence block reports a lane scope-limit failure, decompose only that lane into multiple small jobs: give each a distinct ID and branch, order them with an explicit dependency chain, keep every individual job below the reported cap, and repeat a write path only when sequential work genuinely must modify the same file. The controller still permits only one active agent in a lane. If that evidence reports an absent cross-lane contract, add one phase0 contract job before its consumers; do not let a lane invent the interface. If it reports missing declared Python dependencies, retain the authoritative full verification because the controller provisions those dependencies in an isolated environment. Preserve completed PR work listed in the evidence instead of planning it again. Use phase0 only for forbidden-zone or contract changes, and make every downstream lane depend directly on it. Identify all impacted lanes from actual code. Do not invent lanes VI/VII unless the live authority defines them. Every verify command must exercise the real package. Never include merge, deletion, deployment, or secret-reading steps.
 """

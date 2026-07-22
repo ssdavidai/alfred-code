@@ -277,6 +277,82 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "base_sha is immutable"):
             self.database.update_job("job-7", base_sha="c" * 40)
 
+    def test_sprint_commitment_addition_points_and_terminal_rollover(self):
+        self.database.set_product_stage(7, "sprint_queue", rank=2)
+        sprint = self.database.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[7],
+        )
+        self.assertEqual(sprint["number"], 0)
+        self.assertEqual(self.database.get_issue(7)["product_stage"], "active")
+        self.assertEqual(self.database.get_issue(7)["controller_state"], "planning")
+        self.assertEqual(self.database.sprint_items(sprint["id"])[0]["commitment"], "committed")
+
+        second = dict(self.issue, id="I_8", number=8, url="https://example/issues/8")
+        self.database.upsert_issue(second)
+        added = self.database.add_to_active_sprint(8)
+        self.assertEqual(added["commitment"], "added")
+        self.assertEqual(added["rank"], 1)
+
+        self.database.record_story_points(7, 5, "one lane with contract reads")
+        self.database.record_story_points(8, 3, "bounded single-lane change")
+        self.database.set_sprint_item_status(7, "done")
+        self.database.set_sprint_item_status(8, "blocked")
+        closed, items = self.database.close_active_sprint()
+
+        self.assertEqual(closed["state"], "closed")
+        self.assertIsNone(self.database.active_sprint())
+        self.assertEqual([item["story_points"] for item in items], [5, 3])
+        self.assertEqual(self.database.get_issue(7)["product_stage"], "done")
+        self.assertEqual(self.database.get_issue(8)["product_stage"], "inbox")
+
+    def test_schema_five_migrates_delivery_state_without_enrolling_old_backlog(self):
+        path = Path(self.temp.name) / "schema-five.sqlite3"
+        legacy = Database(path)
+        legacy.upsert_issue(self.issue)
+        legacy.set_issue_state(7, "planning")
+        legacy.connection.execute("DROP TABLE sprint_items")
+        legacy.connection.execute("DROP TABLE sprints")
+        legacy.connection.execute("ALTER TABLE issues DROP COLUMN project_rank")
+        legacy.connection.execute("ALTER TABLE issues DROP COLUMN product_stage")
+        legacy.connection.execute("UPDATE schema_meta SET version=5")
+        legacy.close()
+
+        migrated = Database(path)
+        self.addCleanup(migrated.close)
+
+        self.assertEqual(migrated.get_issue(7)["product_stage"], "inbox")
+        self.assertEqual(migrated.list_sprints(), [])
+        self.assertEqual(
+            migrated.connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+
+    def test_sprint_start_retires_unestimated_pre_scheduler_plan(self):
+        digest = "u" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.set_product_stage(7, "sprint_queue")
+
+        self.database.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[7],
+        )
+
+        self.assertIsNone(self.database.current_plan(7))
+        status = self.database.connection.execute(
+            "SELECT status FROM plans WHERE plan_hash=?", (digest,)
+        ).fetchone()["status"]
+        self.assertEqual(status, "superseded")
+        self.assertEqual(self.database.get_issue(7)["controller_state"], "planning")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,51 @@ class Controller:
     def _record(self, kind: str, **detail: Any) -> None:
         self.audit.write(kind, **detail)
 
+    def _sprint_workflow_enabled(self) -> bool:
+        return bool(
+            self.project
+            and self.config.github.project_number
+            and callable(getattr(self.project, "delivery_items", None))
+        )
+
+    def _adopt_project_intent(
+        self,
+        issue: dict[str, Any],
+        item: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if item is None or issue["github_state"] != "OPEN":
+            return issue
+        current_stage = str(issue.get("product_stage") or "backlog")
+        if current_stage in {"active", "legacy_active", "done"}:
+            return issue
+        requested = {
+            "Backlog": "backlog",
+            "Inbox": "inbox",
+            "Sprint queue": "sprint_queue",
+            "Needs splitting": "needs_split",
+        }.get(str(item.get("stage") or ""))
+        if requested is None:
+            return issue
+        rank = int(item.get("rank") or 0)
+        if requested == "sprint_queue" and self.database.active_sprint():
+            self.database.add_to_active_sprint(int(issue["number"]))
+            return self.database.get_issue(int(issue["number"])) or issue
+        self.database.set_product_stage(
+            int(issue["number"]),
+            requested,
+            rank=rank,
+            reason="operator moved the GitHub Project card",
+        )
+        return self.database.get_issue(int(issue["number"])) or issue
+
+    def _delivery_priority(self, issue: dict[str, Any]) -> tuple[int, int, int]:
+        sprint_item = self.database.current_sprint_item(int(issue["number"]))
+        if sprint_item:
+            return (0, int(sprint_item["rank"]), int(issue["number"]))
+        if issue.get("product_stage") == "legacy_active":
+            return (1, int(issue.get("project_rank") or issue["number"]), int(issue["number"]))
+        return (2, int(issue.get("project_rank") or issue["number"]), int(issue["number"]))
+
     def observe_issues(self) -> list[dict[str, Any]]:
         open_issues = {int(issue["number"]): issue for issue in self.github.open_issues()}
         tracked = {int(issue["number"]): issue for issue in self.database.list_issues()}
@@ -116,9 +161,17 @@ class Controller:
         project_ready = bool(
             self.config.apply and self.project and self.config.github.project_number
         )
+        delivery_items: dict[int, dict[str, Any]] = {}
         if project_ready:
             try:
-                self.project.refresh(int(self.config.github.project_number))
+                self.project.refresh(int(self.config.github.project_number), force=True)
+                if self._sprint_workflow_enabled():
+                    delivery_items = {
+                        int(item["issue_number"]): item
+                        for item in self.project.delivery_items(
+                            int(self.config.github.project_number)
+                        )
+                    }
             except AuthorityUnavailable as exc:
                 project_ready = False
                 self._record("project.refresh_failed", error=str(exc))
@@ -128,6 +181,8 @@ class Controller:
         for number in sorted(live):
             previous = tracked.get(number)
             local = self.database.upsert_issue(live[number])
+            if project_ready and self._sprint_workflow_enabled():
+                local = self._adopt_project_intent(local, delivery_items.get(number))
             self.database.observe("github", f"issue:{number}", live[number])
             jobs = self.database.list_jobs(number)
             current = self.database.current_plan(number)
@@ -141,9 +196,15 @@ class Controller:
                 and not jobs
             ):
                 self.database.set_issue_state(number, "observed", {"reason": "GitHub issue reopened"})
+                self.database.set_product_stage(
+                    number, "backlog", reason="GitHub issue reopened"
+                )
                 local = self.database.get_issue(number) or local
             elif local["github_state"] == "CLOSED" and local["controller_state"] == "observed":
                 self.database.set_issue_state(number, "closed", {"reason": "GitHub issue closed"})
+                self.database.set_product_stage(
+                    number, "done", reason="GitHub issue closed before sprint selection"
+                )
                 local = self.database.get_issue(number) or local
 
             labels = {
@@ -162,6 +223,7 @@ class Controller:
                 and not current
                 and not jobs
                 and local["controller_state"] == "observed"
+                and not self._sprint_workflow_enabled()
             ):
                 self.database.set_issue_state(
                     number,
@@ -174,11 +236,16 @@ class Controller:
                 self._sync_project(number)
 
             active = bool(current or jobs) or local["controller_state"] not in {
-                "observed",
-                "closed",
-                "completed",
+                "observed", "closed", "completed"
             }
-            if enrolled or active:
+            if self._sprint_workflow_enabled():
+                selected = local.get("product_stage") in {"active", "legacy_active"}
+            else:
+                selected = enrolled or active
+            if selected or (
+                local["github_state"] == "CLOSED"
+                and self._closed_issue_needs_recovery_audit(number)
+            ):
                 candidates.append(local)
 
         self._record(
@@ -186,7 +253,7 @@ class Controller:
             count=len(candidates),
             backlog_count=len(open_issues),
         )
-        return candidates
+        return sorted(candidates, key=self._delivery_priority)
 
     def run_once(self) -> dict[str, Any]:
         started = utcnow()
@@ -305,6 +372,9 @@ class Controller:
             for number in issue_numbers
             if number in issue_summaries
         ]
+        sprint_result = self._reconcile_active_sprint()
+        if sprint_result:
+            summary["sprint"] = sprint_result
         summary["errors"].sort(key=lambda item: int(item["issue"]))
         summary["finished_at"] = utcnow()
         self._record(
@@ -660,6 +730,20 @@ class Controller:
         )
         self.database.save_plan(issue_number, plan_hash, plan)
         plan_url = self.github.post_plan(issue_number, plan, plan_hash)
+        if plan.get("story_points") is not None:
+            self.database.record_story_points(
+                issue_number,
+                int(plan["story_points"]),
+                str(plan.get("points_evidence") or ""),
+            )
+        if int(plan.get("story_points") or 0) == 21:
+            self.database.mark_plan_needs_split(issue_number, plan_hash)
+            self.notifier.send(
+                f"issue:{issue_number}:needs-split:{plan_hash}",
+                f"Alfred #{issue_number} is estimated at 21 points and must be split before execution. The evidence and proposed jobs remain on GitHub.",
+                {"issue": issue_number, "plan_hash": plan_hash, "url": plan_url},
+            )
+            return plan, plan_hash
         issue = self.database.get_issue(issue_number) or {}
         self.notifier.send(
             f"issue:{issue_number}:plan:{plan_hash}",
@@ -667,6 +751,20 @@ class Controller:
             {"issue": issue_number, "plan_hash": plan_hash, "url": plan_url},
         )
         return plan, plan_hash
+
+    def _unresolved_issue_dependencies(self, plan: dict[str, Any]) -> list[int]:
+        unresolved: list[int] = []
+        for dependency_number in plan.get("issue_dependencies", []):
+            number = int(dependency_number)
+            dependency = self.database.get_issue(number)
+            if dependency is None:
+                dependency = self.database.upsert_issue(self.github.issue(number))
+            if dependency.get("controller_state") == "completed":
+                continue
+            if dependency.get("github_state") == "CLOSED":
+                continue
+            unresolved.append(number)
+        return unresolved
 
     def process_issue(
         self,
@@ -766,6 +864,21 @@ class Controller:
 
         jobs = self.database.list_current_jobs(issue_number)
         if not jobs:
+            unresolved = self._unresolved_issue_dependencies(plan)
+            if unresolved:
+                self.database.set_issue_state(
+                    issue_number,
+                    "approved",
+                    {"reason": "waiting for issue dependencies", "dependencies": unresolved},
+                )
+                self.notifier.send(
+                    f"issue:{issue_number}:waiting-issue-dependencies:{','.join(map(str, unresolved))}",
+                    f"Alfred #{issue_number} is approved but waiting for issue dependencies: "
+                    + ", ".join(f"#{number}" for number in unresolved),
+                    {"issue": issue_number, "dependencies": unresolved},
+                )
+                self._sync_project(issue_number)
+                return self._issue_summary(issue_number)
             jobs = self.database.materialize_jobs(issue_number, plan_hash, plan)
         for job in jobs:
             self.reconcile_job(issue, plan, job)
@@ -969,6 +1082,11 @@ class Controller:
         jobs = self.database.list_current_jobs(issue_number)
         state = "completed" if jobs and all(job["state"] == "merged" for job in jobs) else "closed"
         self.database.set_issue_state(issue_number, state)
+        issue = self.database.get_issue(issue_number) or {}
+        if state == "completed" or issue.get("product_stage") not in {"active", "legacy_active"}:
+            self.database.set_product_stage(
+                issue_number, "done", reason="GitHub issue reached a terminal state"
+            )
 
     def reconcile_job(self, issue: dict[str, Any], plan: dict[str, Any], job: dict[str, Any]) -> None:
         job_id = job["job_id"]
@@ -2783,6 +2901,62 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
     def _planned_job(plan: dict[str, Any], job_id: str) -> dict[str, Any]:
         return next(item for item in plan["jobs"] if item["id"] == job_id)
 
+    def _sprint_item_terminal_status(self, issue_number: int) -> str:
+        issue = self.database.get_issue(issue_number) or {}
+        current = self.database.current_plan(issue_number)
+        jobs = self.database.list_current_jobs(issue_number)
+        if issue.get("product_stage") == "needs_split" or (
+            current and current.get("status") == "needs_split"
+        ):
+            return "needs_split"
+        if current and current.get("status") == "rejected":
+            return "rejected"
+        if jobs and all(job["state"] == "merged" for job in jobs):
+            return "done"
+        if issue.get("controller_state") == "completed":
+            return "done"
+        if issue.get("github_state") == "CLOSED":
+            return "blocked"
+        if issue.get("controller_state") != "blocked":
+            return "active"
+        blockers = self._auto_replan_blockers(jobs)
+        attempts = self.database.event_count(issue_number, "plan.auto_replan_requested")
+        if blockers and attempts < self.config.auto_replan_max_attempts:
+            return "active"
+        return "blocked"
+
+    def _reconcile_active_sprint(self) -> dict[str, Any] | None:
+        sprint = self.database.active_sprint()
+        if sprint is None:
+            return None
+        items = self.database.sprint_items(int(sprint["id"]))
+        for item in items:
+            status = self._sprint_item_terminal_status(int(item["issue_number"]))
+            self.database.set_sprint_item_status(int(item["issue_number"]), status)
+        items = self.database.sprint_items(int(sprint["id"]))
+        if not items or any(item["status"] == "active" for item in items):
+            return {**sprint, "items": items}
+        closed, closed_items = self.database.close_active_sprint()
+        returned = [item for item in closed_items if item["status"] != "done"]
+        if self.project and self.config.github.project_number and returned:
+            urls = [
+                str((self.database.get_issue(int(item["issue_number"])) or {}).get("url") or "")
+                for item in returned
+            ]
+            self.project.move_to_top(
+                int(self.config.github.project_number), [url for url in urls if url]
+            )
+        for item in closed_items:
+            self._sync_project(int(item["issue_number"]))
+        self.notifier.send(
+            f"sprint:{closed['number']}:closed",
+            f"{closed['title']} closed: "
+            f"{sum(1 for item in closed_items if item['status'] == 'done')} done, "
+            f"{len(returned)} returned to refinement.",
+            {"sprint": closed["number"], "items": closed_items},
+        )
+        return {**closed, "items": closed_items}
+
     def _derive_issue_state(self, issue_number: int) -> str:
         jobs = self.database.list_current_jobs(issue_number)
         states = {job["state"] for job in jobs}
@@ -2808,18 +2982,35 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         jobs = self.database.list_current_jobs(issue_number)
         if not issue:
             return
+        sprint_item = self.database.current_sprint_item(issue_number)
+        if sprint_item is None and issue.get("product_stage") == "done":
+            sprint_item = self.database.latest_sprint_item(issue_number)
+        dependencies = current["plan"].get("issue_dependencies", []) if current else []
+        runtime = (
+            ", ".join(f"{job['lane']}:{job['state']}" for job in jobs)
+            or (
+                "waiting for " + ", ".join(f"#{number}" for number in dependencies)
+                if dependencies and issue["controller_state"] == "approved"
+                else f"plan:{issue['controller_state']}"
+            )
+        )
         try:
             self.project.sync_issue(
                 project_number=self.config.github.project_number,
                 issue_url=issue.get("url") or "",
                 controller_state=issue["controller_state"],
+                product_stage=str(issue.get("product_stage") or "legacy_active"),
                 plan_hash=current["plan_hash"] if current else "",
                 risk=current["plan"].get("risk", "") if current else "",
                 lanes=[job["lane"] for job in jobs] or ([j["lane"] for j in current["plan"]["jobs"]] if current else []),
-                runtime=(
-                    ", ".join(f"{job['lane']}:{job['state']}" for job in jobs)
-                    or f"plan:{issue['controller_state']}"
+                runtime=runtime,
+                story_points=(
+                    current["plan"].get("story_points")
+                    if current
+                    else sprint_item.get("story_points") if sprint_item else None
                 ),
+                iteration_id=(sprint_item or {}).get("iteration_id"),
+                iteration_title=(sprint_item or {}).get("sprint_title"),
             )
         except AuthorityUnavailable as exc:
             self.database.event(
@@ -2835,8 +3026,11 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         return {
             "number": issue_number,
             "state": issue.get("controller_state"),
+            "product_stage": issue.get("product_stage"),
             "github_state": issue.get("github_state"),
             "plan_hash": current["plan_hash"] if current else None,
+            "story_points": current["plan"].get("story_points") if current else None,
+            "sprint": self.database.current_sprint_item(issue_number),
             "jobs": [
                 {
                     "id": job["job_id"],

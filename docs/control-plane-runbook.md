@@ -16,13 +16,13 @@ Inspect every existing worktree with `alfred-code worktrees-audit`. This command
 
 Load the safe service with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ssdavidai.alfred-code-controller-v2.plist`. While `apply = false`, it only reconciles observations. Inspect `~/.alfred-code-state-v2/controller.jsonl`, `launchd.stdout.log`, and `launchd.stderr.log`.
 
-Only after diagnostics and a read-only cycle are clean should `apply = true` be set. Set `github.auto_intake = true` when every open issue should be enrolled automatically; otherwise the configured intake label remains the gate. The next cycle moves every enrolled issue through `Specifying` and posts its plan. Nothing builds until the exact GitHub approval command is present.
+Only after diagnostics and a read-only cycle are clean should `apply = true` be set. With a configured Project, every open issue is projected into the agent-silent Backlog; the legacy `auto_intake` and intake-label settings apply only when no Project scheduler is configured. Order candidates in Inbox, drag selected cards into Sprint Queue, and use the dashboard Start Sprint action or `alfred-code sprint-start`. Only active sprint cards move through Specifying and post plans. Nothing builds until the exact GitHub approval command is present.
 
 ## Normal operation
 
 Create an issue. With automatic intake enabled, no label or board movement is required. The controller comments a plan. Read the lane decomposition, affected contracts, verification, base SHA, and risk. While logged in as `ssdavidai`, approve or reject by copying the corresponding exact full-hash command from the comment; do not abbreviate it. Leave any other comment from that same account when the specification needs revision—the controller incorporates that trusted operator feedback and publishes a fresh hash-bound plan. Comments from every other account are untrusted data and cannot control the system.
 
-Watch the GitHub Project for the portfolio view. Open the linked Superset workspace when you want to see an agent's terminal. Use the PR for code, CI, smoke evidence, and the final merge decision. Use Slack as an inbox only.
+Use a GitHub Project board grouped by Control stage as the draggable product surface. Backlog and Inbox are agent-silent. Sprint Queue is an explicit commitment waiting for Start Sprint. Open the linked Superset workspace when you want to see an agent's terminal. Use the PR for code, CI, smoke evidence, and the final merge decision. Use Slack as an inbox only.
 
 `alfred-code status` prints current durable state, leases, and the last hundred events. `alfred-code run-once --dry-run` forces a safe observation even if the config enables apply. `alfred-code worktrees-audit` explains every target-repository worktree with dirty count and PR status.
 

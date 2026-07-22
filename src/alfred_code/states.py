@@ -10,6 +10,27 @@ ISSUE_STATES = {
     "closed",
 }
 
+PRODUCT_STAGES = {
+    "backlog",
+    "inbox",
+    "sprint_queue",
+    "active",
+    "legacy_active",
+    "needs_split",
+    "done",
+}
+
+SPRINT_STATES = {"active", "closed"}
+SPRINT_ITEM_STATES = {
+    "active",
+    "done",
+    "blocked",
+    "rejected",
+    "needs_split",
+}
+
+FIBONACCI_POINTS = {1, 2, 3, 5, 8, 13, 21}
+
 JOB_STATES = {
     "queued",
     "waiting_dependency",
@@ -47,4 +68,12 @@ PROJECT_STATUS = {
     "completed": "Done",
     "blocked": "Blocked",
     "closed": "Done",
+}
+
+PRODUCT_STATUS = {
+    "backlog": "Backlog",
+    "inbox": "Inbox",
+    "sprint_queue": "Sprint queue",
+    "needs_split": "Needs splitting",
+    "done": "Done",
 }

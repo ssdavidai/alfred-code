@@ -306,9 +306,17 @@ class FakeProject:
         self.refreshes = []
         self.synced = {}
         self.history = []
+        self.items = []
+        self.moved_to_top = []
 
-    def refresh(self, number):
+    def refresh(self, number, *, force=False):
         self.refreshes.append(number)
+
+    def delivery_items(self, number):
+        return copy.deepcopy(self.items)
+
+    def move_to_top(self, number, urls):
+        self.moved_to_top.append((number, list(urls)))
 
     def sync_issue(self, **values):
         self.history.append(copy.deepcopy(values))
@@ -857,8 +865,8 @@ class ControllerTests(unittest.TestCase):
 
         result = self.controller.run_once()
 
-        self.assertEqual([item["number"] for item in result["issues"]], [12])
-        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(self.planner.calls, 0)
         self.assertEqual(self.db.get_issue(13)["controller_state"], "observed")
         self.assertEqual(project.refreshes, [3])
         self.assertEqual(
@@ -875,7 +883,7 @@ class ControllerTests(unittest.TestCase):
             "closed",
         )
 
-    def test_auto_intake_plans_unlabeled_issue_and_projects_specifying_first(self):
+    def test_auto_intake_projects_unlabeled_issue_as_agent_silent_backlog(self):
         self.issue["labels"] = [{"name": "bug"}]
         project = FakeProject()
         self.controller.project = project
@@ -890,18 +898,119 @@ class ControllerTests(unittest.TestCase):
 
         result = self.controller.run_once()
 
-        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
-        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(self.planner.calls, 0)
         projected_states = [
             item["controller_state"]
             for item in project.history
             if item["issue_url"] == self.issue["url"]
         ]
-        self.assertEqual(projected_states, ["planning", "awaiting_approval"])
+        self.assertEqual(projected_states, ["observed"])
         self.assertEqual(
-            project.synced[self.issue["url"]]["runtime"],
-            "plan:awaiting_approval",
+            project.synced[self.issue["url"]]["product_stage"],
+            "backlog",
         )
+
+    def test_sprint_queue_is_silent_until_explicit_start_then_specifies(self):
+        project = FakeProject()
+        project.items = [
+            {
+                "issue_number": 12,
+                "issue_url": self.issue["url"],
+                "stage": "Sprint queue",
+                "rank": 0,
+            }
+        ]
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+
+        before = self.controller.run_once()
+
+        self.assertEqual(before["issues"], [])
+        self.assertEqual(self.planner.calls, 0)
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "sprint_queue")
+
+        self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        after = self.controller.run_once()
+
+        self.assertEqual(after["issues"][0]["state"], "awaiting_approval")
+        self.assertEqual(self.planner.calls, 1)
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "active")
+
+    def test_twenty_one_point_plan_is_not_executable_and_closes_sprint_for_refinement(self):
+        self.db.upsert_issue(self.issue)
+        self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        self.plan.update(
+            {
+                "story_points": 21,
+                "points_evidence": "Multiple lanes and contracts exceed one bounded delivery.",
+                "issue_dependencies": [],
+            }
+        )
+        self.plan_hash = content_hash(self.plan)
+        self.planner.plan = copy.deepcopy(self.plan)
+        self.planner.plan_hash = self.plan_hash
+
+        result = self.controller.run_once()
+
+        self.assertIsNone(self.db.active_sprint())
+        self.assertEqual(self.db.current_plan(12)["status"], "needs_split")
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "needs_split")
+        self.assertEqual(self.superset.worker_creates, 0)
+        self.assertEqual(result["sprint"]["state"], "closed")
+
+    def test_approved_issue_waits_for_cross_issue_dependency_before_materializing_jobs(self):
+        dependency = {
+            "id": "I_13",
+            "number": 13,
+            "title": "Required contract",
+            "body": "Ship first",
+            "state": "OPEN",
+            "url": "https://example/issues/13",
+            "labels": [],
+        }
+        self.github.extra_issues[13] = dependency
+        self.plan.update(
+            {
+                "story_points": 5,
+                "points_evidence": "One lane waiting on an external contract issue.",
+                "issue_dependencies": [13],
+            }
+        )
+        self.plan_hash = content_hash(self.plan)
+        self.planner.plan = copy.deepcopy(self.plan)
+        self.planner.plan_hash = self.plan_hash
+        self.controller.run_once()
+        self.approve()
+
+        waiting = self.controller.run_once()
+
+        self.assertEqual(waiting["issues"][0]["state"], "approved")
+        self.assertEqual(self.db.list_current_jobs(12), [])
+        self.assertEqual(self.superset.worker_creates, 0)
+
+        self.github.extra_issues[13]["state"] = "CLOSED"
+        launched = self.controller.run_once()
+
+        self.assertEqual(launched["issues"][0]["state"], "building")
+        self.assertEqual(self.superset.worker_creates, 1)
 
     def test_planning_pool_is_parallel_but_respects_its_configured_bound(self):
         bodies = {12: self.issue["body"]}

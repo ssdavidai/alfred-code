@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import threading
@@ -18,16 +19,23 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .config import ControllerConfig
+from .db import Database
+from .github import GitHubClient
+from .project import ProjectBoard
+from .sprints import SprintManager
 
 
 KANBAN_COLUMNS = [
+    ("backlog", "Backlog"),
     ("inbox", "Inbox"),
+    ("sprint_queue", "Sprint queue"),
     ("specifying", "Specifying"),
     ("approval", "Approval"),
     ("queued", "Queued"),
     ("building", "Building"),
     ("ready_merge", "Ready to merge"),
     ("blocked", "Blocked"),
+    ("needs_split", "Needs splitting"),
     ("done", "Done"),
 ]
 
@@ -41,6 +49,14 @@ STATE_TO_COLUMN = {
     "blocked": "blocked",
     "completed": "done",
     "closed": "done",
+}
+
+PRODUCT_TO_COLUMN = {
+    "backlog": "backlog",
+    "inbox": "inbox",
+    "sprint_queue": "sprint_queue",
+    "needs_split": "needs_split",
+    "done": "done",
 }
 
 UUID_RE = re.compile(
@@ -643,6 +659,21 @@ class DashboardData:
                 """
             )
         }
+        sprints = [dict(row) for row in connection.execute("SELECT * FROM sprints ORDER BY number DESC")]
+        sprint_items: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        latest_sprint_item: dict[int, dict[str, Any]] = {}
+        for row in connection.execute(
+            """
+            SELECT si.*, s.number AS sprint_number, s.title AS sprint_title,
+                   s.state AS sprint_state, s.iteration_id, s.starts_at, s.ends_at,
+                   s.closed_at
+            FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
+            ORDER BY s.number, si.rank, si.issue_number
+            """
+        ):
+            item = dict(row)
+            sprint_items[int(item["sprint_id"])].append(item)
+            latest_sprint_item[int(item["issue_number"])] = item
         connection.close()
         return {
             "issues": issues,
@@ -652,6 +683,9 @@ class DashboardData:
             "event_rows": event_rows,
             "first_events": first_events,
             "plan_stats": plan_stats,
+            "sprints": sprints,
+            "sprint_items": sprint_items,
+            "latest_sprint_item": latest_sprint_item,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -667,7 +701,14 @@ class DashboardData:
         for issue in state["issues"]:
             number = int(issue["number"])
             controller_state = str(issue["controller_state"])
-            column = STATE_TO_COLUMN.get(controller_state, "blocked")
+            product_stage = str(issue.get("product_stage") or "legacy_active")
+            column = (
+                PRODUCT_TO_COLUMN.get(
+                    product_stage, STATE_TO_COLUMN.get(controller_state, "blocked")
+                )
+                if self.config.github.project_number
+                else STATE_TO_COLUMN.get(controller_state, "blocked")
+            )
             state_counts[column] += 1
             plan_row = state["plans"].get(number)
             plan = _json(plan_row.get("plan_json") if plan_row else None, {})
@@ -686,12 +727,19 @@ class DashboardData:
             model_names = sorted({session["model"] for session in issue_sessions})
             event_meta = state["first_events"].get(number, {})
             stats = state["plan_stats"].get(number, {})
+            sprint_item = state["latest_sprint_item"].get(number)
+            story_points = (
+                plan.get("story_points")
+                if plan
+                else sprint_item.get("story_points") if sprint_item else None
+            )
             cards.append(
                 {
                     "number": number,
                     "title": issue["title"],
                     "github_state": issue["github_state"],
                     "state": controller_state,
+                    "product_stage": product_stage,
                     "column": column,
                     "url": issue["url"],
                     "labels": _json(issue["labels_json"], []),
@@ -709,6 +757,9 @@ class DashboardData:
                             "summary": plan.get("summary"),
                             "risk": plan.get("risk"),
                             "job_count": len(plan.get("jobs") or []),
+                            "story_points": plan.get("story_points"),
+                            "points_evidence": plan.get("points_evidence"),
+                            "issue_dependencies": plan.get("issue_dependencies") or [],
                         }
                         if plan_row
                         else None
@@ -719,6 +770,18 @@ class DashboardData:
                     "sessions": issue_sessions,
                     "tokens": token_totals,
                     "models": model_names,
+                    "story_points": story_points,
+                    "tokens_per_point": (
+                        token_totals["total_tokens"] / int(story_points)
+                        if story_points
+                        else None
+                    ),
+                    "points_evidence": (
+                        plan.get("points_evidence")
+                        if plan
+                        else sprint_item.get("points_evidence") if sprint_item else None
+                    ),
+                    "sprint": sprint_item,
                     "planner_telemetry": (
                         "This plan predates planner telemetry; its model and token usage are unavailable"
                         if plan_row and not any(
@@ -763,6 +826,63 @@ class DashboardData:
             bucket["issues"] = len(bucket["issues"])
             model_rows.append(bucket)
         model_rows.sort(key=lambda item: item["total_tokens"], reverse=True)
+
+        sprint_rows: list[dict[str, Any]] = []
+        for sprint in state["sprints"]:
+            items = state["sprint_items"].get(int(sprint["id"]), [])
+            start = _iso_to_seconds(sprint.get("starts_at")) or 0
+            finish = _iso_to_seconds(sprint.get("closed_at")) or time.time()
+            sprint_sessions = [
+                session
+                for session in sessions
+                if session.get("issue_number") in {item["issue_number"] for item in items}
+                and start
+                <= (_iso_to_seconds(session.get("started_at") or session.get("ended_at")) or 0)
+                <= finish
+            ]
+            sprint_tokens = {
+                key: sum(int(session.get(key) or 0) for session in sprint_sessions)
+                for key in token_fields
+            }
+            completed_points = sum(
+                int(item.get("story_points") or 0)
+                for item in items
+                if item.get("status") == "done"
+            )
+            committed_points = sum(
+                int(item.get("story_points") or 0)
+                for item in items
+                if item.get("commitment") == "committed"
+            )
+            added_points = sum(
+                int(item.get("story_points") or 0)
+                for item in items
+                if item.get("commitment") == "added"
+            )
+            sprint_rows.append(
+                {
+                    **sprint,
+                    "items": items,
+                    "committed_points": committed_points,
+                    "added_points": added_points,
+                    "completed_points": completed_points,
+                    "carryover_points": sum(
+                        int(item.get("story_points") or 0)
+                        for item in items
+                        if item.get("status") not in {"done", "active"}
+                    ),
+                    "tokens": sprint_tokens,
+                    "tokens_per_completed_point": (
+                        sprint_tokens["total_tokens"] / completed_points
+                        if completed_points
+                        else None
+                    ),
+                    "overdue": bool(
+                        sprint.get("state") == "active"
+                        and (_iso_to_seconds(sprint.get("ends_at")) or float("inf")) < time.time()
+                    ),
+                }
+            )
 
         event_items = [
             {
@@ -824,6 +944,11 @@ class DashboardData:
                     for job in card["jobs"]
                     if job["state"] in {"blocked", "quarantined"}
                 ),
+                "sprints": sprint_rows,
+                "active_sprint": next(
+                    (sprint for sprint in sprint_rows if sprint["state"] == "active"),
+                    None,
+                ),
                 "telemetry_note": (
                     "Build and review totals come from persisted Codex/Claude session usage. "
                     + (
@@ -841,9 +966,30 @@ class DashboardData:
                 "latest_event_at": latest_event,
                 "latest_event_age_seconds": _duration_seconds(latest_event),
                 "database": str(self.config.database_path),
-                "read_only": True,
+                "read_only": not bool(self.config.github.project_number),
+                "controlled_actions": (
+                    ["start_sprint"] if self.config.github.project_number else []
+                ),
             },
         }
+
+    def start_sprint(
+        self,
+        *,
+        title: str | None = None,
+        duration_days: int | None = None,
+    ) -> dict[str, Any]:
+        database = Database(self.config.database_path)
+        try:
+            project = ProjectBoard(self.config.github)
+            return SprintManager(
+                self.config,
+                database,
+                project,
+                GitHubClient(self.config.github),
+            ).start(title=title, duration_days=duration_days)
+        finally:
+            database.close()
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -852,6 +998,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], data: DashboardData, html: bytes):
         self.dashboard_data = data
         self.dashboard_html = html
+        self.action_token = secrets.token_urlsafe(32)
         super().__init__(address, DashboardHandler)
 
 
@@ -887,6 +1034,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/snapshot":
             try:
                 payload = self.server.dashboard_data.snapshot()
+                payload.setdefault("runtime", {})["action_token"] = self.server.action_token
                 body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
                 status = HTTPStatus.OK
             except Exception as exc:  # keep the local observer alive on transient WAL reads
@@ -898,7 +1046,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/healthz":
-            body = b'{"ok":true,"read_only":true}'
+            body = b'{"ok":true,"controlled_actions":["start_sprint"]}'
             self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(body))
             self.wfile.write(body)
             return
@@ -907,8 +1055,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        body = b'{"error":"dashboard is read-only"}'
-        self._headers(HTTPStatus.METHOD_NOT_ALLOWED, "application/json", len(body))
+        path = urlparse(self.path).path
+        if path != "/api/sprints/start":
+            body = b'{"error":"unsupported action"}'
+            self._headers(HTTPStatus.METHOD_NOT_ALLOWED, "application/json", len(body))
+            self.wfile.write(body)
+            return
+        origin = self.headers.get("Origin", "")
+        if origin and urlparse(origin).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            body = b'{"error":"invalid origin"}'
+            self._headers(HTTPStatus.FORBIDDEN, "application/json", len(body))
+            self.wfile.write(body)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 2 or length > 8192:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(length))
+            if payload.get("token") != self.server.action_token:
+                raise PermissionError("invalid dashboard action token")
+            result = self.server.dashboard_data.start_sprint(
+                title=str(payload.get("title") or "").strip() or None,
+                duration_days=(
+                    int(payload["duration_days"])
+                    if payload.get("duration_days") is not None
+                    else None
+                ),
+            )
+            body = json.dumps({"sprint": result}, separators=(",", ":")).encode()
+            status = HTTPStatus.CREATED
+        except PermissionError as exc:
+            body = json.dumps({"error": str(exc)}).encode()
+            status = HTTPStatus.FORBIDDEN
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode()
+            status = HTTPStatus.BAD_REQUEST
+        self._headers(status, "application/json; charset=utf-8", len(body))
         self.wfile.write(body)
 
 
@@ -925,7 +1107,7 @@ def serve_dashboard(
     html = html_path.read_bytes()
     server = DashboardHTTPServer((host, port), DashboardData(config), html)
     url = f"http://{host}:{server.server_address[1]}"
-    print(json.dumps({"dashboard": url, "read_only": True}), flush=True)
+    print(json.dumps({"dashboard": url, "controlled_actions": ["start_sprint"]}), flush=True)
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

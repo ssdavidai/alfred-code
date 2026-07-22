@@ -336,7 +336,14 @@ class GitHubClient:
             "",
             plan.get("summary") or "No summary supplied.",
             "",
-            f"Pinned base: `{plan['base_sha']}` · Risk: **{plan.get('risk', 'medium')}**",
+            f"Pinned base: `{plan['base_sha']}` · Risk: **{plan.get('risk', 'medium')}** · Story points: **{plan.get('story_points', 'legacy/unestimated')}**",
+            "",
+            f"Estimate evidence: {plan.get('points_evidence') or 'This legacy plan predates estimation.'}",
+            "",
+            "Issue dependencies: " + (
+                ", ".join(f"#{number}" for number in plan.get("issue_dependencies", []))
+                or "none"
+            ),
             "",
             "| Order | Lane | Agent job | Paths | Verification |",
             "|---:|---|---|---|---|",
@@ -350,6 +357,25 @@ class GitHubClient:
             )
         changed = [path for job in plan["jobs"] for path in job.get("contracts_changed", [])]
         read = [path for job in plan["jobs"] for path in job.get("contracts_read", [])]
+        decision_lines = (
+            [
+                "This issue is estimated at **21 points** and is too large for one sprint. Split or refine it before approval; an approval command is intentionally unavailable.",
+                "",
+                "To reject this decomposition, comment:",
+                "",
+                f"`{rejection_command} {plan_hash}`",
+            ]
+            if int(plan.get("story_points") or 0) == 21
+            else [
+                "To approve exactly this plan, comment:",
+                "",
+                f"`{approval_command} {plan_hash}`",
+                "",
+                "To reject exactly this plan, comment:",
+                "",
+                f"`{rejection_command} {plan_hash}`",
+            ]
+        )
         lines.extend(
             [
                 "",
@@ -359,13 +385,7 @@ class GitHubClient:
                 "",
                 "Approval is bound to the full plan content and current base SHA. Any regenerated plan gets a new hash and invalidates the old approval.",
                 "",
-                "To approve exactly this plan, comment:",
-                "",
-                f"`{approval_command} {plan_hash}`",
-                "",
-                "To reject exactly this plan, comment:",
-                "",
-                f"`{rejection_command} {plan_hash}`",
+                *decision_lines,
                 "",
                 "Any other non-command operator comment posted after this plan is treated as specification feedback and causes a fresh plan. Malformed approval or rejection commands are ignored.",
                 f"Only comments authored by `{TRUSTED_GITHUB_OPERATOR}` are trusted. Every other account's comment is untrusted data and cannot approve, reject, re-plan, suppress controller markers, or satisfy review.",
