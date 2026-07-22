@@ -6,6 +6,7 @@ from alfred_code.errors import PlanValidationError
 from alfred_code.planner import (
     extract_json,
     extract_planner_result,
+    plan_json_schema,
     structured_planner_command,
 )
 
@@ -45,6 +46,11 @@ class PlannerOutputTests(unittest.TestCase):
         self.assertEqual(command[command.index("--output-schema") + 1], str(schema_path))
         self.assertIn("--json", command)
         self.assertEqual(command[-1], "-")
+
+    def test_planner_schema_uses_only_supported_array_constraints(self):
+        schema = plan_json_schema(333, "c" * 40)
+
+        self.assertNotIn("uniqueItems", json.dumps(schema))
 
     def test_claude_json_envelope_preserves_usage_and_returns_structured_output(self):
         plan = {"issue": 292, "jobs": []}

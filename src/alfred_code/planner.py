@@ -67,7 +67,6 @@ def plan_json_schema(issue_number: int, base_sha: str) -> dict[str, Any]:
             "issue_dependencies": {
                 "type": "array",
                 "items": {"type": "integer", "minimum": 1},
-                "uniqueItems": True,
             },
             "jobs": {
                 "type": "array",
