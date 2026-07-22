@@ -657,8 +657,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(current_job["job_id"], "api-12-r2")
         self.assertEqual(current_job["state"], "running")
         self.assertEqual(self.superset.worker_creates, 2)
+        workspace_name = worker_workspace_name(
+            "alfred-code", 12, "I", "api-12-r2"
+        )
         self.assertEqual(
-            self.superset.workspaces_by_name["alfred-code-12-i-r2"].branch,
+            self.superset.workspaces_by_name[workspace_name].branch,
             "lane-1/12-api-r2",
         )
 

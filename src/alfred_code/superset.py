@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -20,10 +21,11 @@ def worker_workspace_name(
     lane: str,
     job_id: str,
 ) -> str:
-    """Keep first-run names stable while giving every replacement plan a new workspace."""
-    revision = re.search(r"-r([2-9][0-9]*)$", job_id)
-    suffix = f"-r{revision.group(1)}" if revision else ""
-    return f"{prefix}-{issue_number}-{lane.lower()}{suffix}"
+    """Give every controller job a stable, human-readable workspace identity."""
+    normalized = re.sub(r"[^a-z0-9]+", "-", job_id.lower()).strip("-") or "job"
+    readable = normalized[:32].rstrip("-") or "job"
+    digest = hashlib.sha256(job_id.encode()).hexdigest()[:8]
+    return f"{prefix}-{issue_number}-{lane.lower()}-{readable}-{digest}"
 
 
 @dataclass(frozen=True)
