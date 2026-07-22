@@ -600,9 +600,7 @@ class Controller:
         blockers = self._auto_replan_blockers(jobs)
         if blockers is None:
             return False
-        attempts = self.database.event_count(
-            issue_number, "plan.auto_replan_requested"
-        )
+        attempts = self.database.auto_replan_attempt_count(issue_number)
         if attempts >= self.config.auto_replan_max_attempts:
             self.notifier.send(
                 f"issue:{issue_number}:auto-replan-cap:{plan_hash}",
@@ -2933,7 +2931,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         if issue.get("controller_state") != "blocked":
             return "active"
         blockers = self._auto_replan_blockers(jobs)
-        attempts = self.database.event_count(issue_number, "plan.auto_replan_requested")
+        attempts = self.database.auto_replan_attempt_count(issue_number)
         if blockers and attempts < self.config.auto_replan_max_attempts:
             return "active"
         return "blocked"

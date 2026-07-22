@@ -140,6 +140,33 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(self.database.lease_owner("II"))
         self.assertEqual(self.database.event_count(7, "plan.auto_replan_requested"), 1)
 
+    def test_auto_replan_attempt_count_resets_after_merged_progress(self):
+        self.database.event(
+            "plan.auto_replan_requested",
+            {"plan_hash": "a" * 64},
+            issue_number=7,
+        )
+        self.database.event(
+            "plan.auto_replan_requested",
+            {"plan_hash": "b" * 64},
+            issue_number=7,
+        )
+        self.assertEqual(self.database.auto_replan_attempt_count(7), 2)
+
+        self.database.event(
+            "job.transition",
+            {"from": "ready_merge", "to": "merged"},
+            issue_number=7,
+        )
+        self.assertEqual(self.database.auto_replan_attempt_count(7), 0)
+
+        self.database.event(
+            "plan.auto_replan_requested",
+            {"plan_hash": "c" * 64},
+            issue_number=7,
+        )
+        self.assertEqual(self.database.auto_replan_attempt_count(7), 1)
+
     def test_rejection_is_durable_and_does_not_materialize_jobs(self):
         digest = "r" * 64
         self.database.save_plan(7, digest, self.plan)
