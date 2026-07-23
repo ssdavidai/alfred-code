@@ -31,6 +31,7 @@ from .db import Database
 from .errors import AlfredCodeError, AuthorityUnavailable, CommandError, PlanValidationError
 from .github import GitHubClient, PullRequestObservation
 from .notify import DurableNotifier
+from .path_policy import codex_write_scope_error
 from .planner import Planner, PreparedPlan
 from .plans import path_matches
 from .project import ProjectBoard
@@ -547,6 +548,14 @@ class Controller:
             and "declared dependencies are absent" in value
         ):
             return "dependency_environment"
+        if (
+            "codex writable scope supports only exact paths" in value
+            or (
+                "filesystem glob path" in value
+                and "only supports `deny` access" in value
+            )
+        ):
+            return "launch_scope_policy"
         return None
 
     def _auto_replan_blockers(
@@ -568,6 +577,11 @@ class Controller:
                 continue
             reason = str(job.get("last_error") or "")
             kind = self._auto_replan_blocker_kind(reason)
+            if kind is None and reason.startswith("scoped agent launch exited"):
+                scope_error = codex_write_scope_error(job.get("paths") or ())
+                if scope_error:
+                    kind = "launch_scope_policy"
+                    reason = f"{reason}; {scope_error}"
             if kind is None:
                 return None
             blockers.append(

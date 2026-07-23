@@ -870,6 +870,48 @@ class ControllerTests(unittest.TestCase):
             ["scope_limit", "contract_plan", "dependency_environment"],
         )
 
+    def test_generic_codex_exit_with_unsupported_scope_is_safely_replanned(self):
+        blockers = [
+            {
+                "job_id": "ctrl-316",
+                "lane": "I",
+                "state": "blocked",
+                "paths": ["packages/ctrl/src/api/routes/workers.ts"],
+                "last_error": (
+                    "controller finalization failed: Scope limit exceeded: "
+                    "203 LOC changed > 200 cap for lane I."
+                ),
+            },
+            {
+                "job_id": "vault-316",
+                "lane": "IV",
+                "state": "blocked",
+                "paths": [
+                    "packages/alfred-vault/src/alfred/worker_runs.py",
+                    "packages/alfred-vault/tests/test_worker_runs*.py",
+                ],
+                "last_error": (
+                    "scoped agent launch exited: agent exited before writing "
+                    "its required result marker (exit code 1)"
+                ),
+            },
+            {
+                "job_id": "learn-316",
+                "lane": "II",
+                "state": "waiting_dependency",
+                "paths": ["packages/learn/src/activities/maintenance.py"],
+                "last_error": None,
+            },
+        ]
+
+        observed = self.controller._auto_replan_blockers(blockers)
+
+        self.assertEqual(
+            [item["kind"] for item in observed],
+            ["scope_limit", "launch_scope_policy"],
+        )
+        self.assertIn("test_worker_runs*.py", observed[1]["reason"])
+
     def test_dry_run_only_observes(self):
         self.controller.config = replace(self.config, apply=False)
         self.controller.run_once()

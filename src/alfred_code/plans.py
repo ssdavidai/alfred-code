@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import PlanValidationError
+from .path_policy import codex_write_scope_error
 from .states import FIBONACCI_POINTS
 from .util import content_hash, unique
 
@@ -179,6 +180,8 @@ class PlanValidator:
             paths = unique(path.removeprefix("./") for path in paths)
             if any(path.startswith("/") or ".." in Path(path).parts for path in paths):
                 problems.append(f"{label}.paths must stay inside the repository")
+            if scope_error := codex_write_scope_error(paths):
+                problems.append(f"{label}.paths cannot be enforced safely: {scope_error}")
             if lane in self.policy.lanes:
                 allowed = self.policy.lanes[lane].get("allowed", [])
                 for path in paths:
