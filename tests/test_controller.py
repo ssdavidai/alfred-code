@@ -795,6 +795,36 @@ class ControllerTests(unittest.TestCase):
             any("requires operator guidance" in message for message, _ in self.channel.messages)
         )
 
+    def test_auto_replan_attempt_cap_resets_after_merged_progress(self):
+        first = self.controller.run_once()["issues"][0]["plan_hash"]
+        self.db.record_approval(12, first, "owner", "1", None, "now")
+        self.db.materialize_jobs(12, first, self.plan)
+        for suffix in ("old-a", "old-b"):
+            self.db.event(
+                "plan.auto_replan_requested",
+                {"plan_hash": suffix},
+                issue_number=12,
+            )
+        self.db.event(
+            "job.transition",
+            {"from": "ready_merge", "to": "merged"},
+            issue_number=12,
+        )
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            last_error="controller finalization failed: Scope limit exceeded: 214 LOC changed > 200 cap for lane I.",
+        )
+
+        result = self.controller.run_once()
+
+        replacement = self.db.current_plan(12)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(replacement["plan_hash"], first)
+        self.assertEqual(result["issues"][0]["state"], "awaiting_approval")
+        self.assertEqual(self.db.get_job("api-12")["state"], "superseded")
+        self.assertEqual(len(self.github.auto_replans), 1)
+
     def test_mixed_safe_and_unknown_blockers_do_not_replan(self):
         safe = {
             "job_id": "api-12",
@@ -839,6 +869,48 @@ class ControllerTests(unittest.TestCase):
             [item["kind"] for item in observed],
             ["scope_limit", "contract_plan", "dependency_environment"],
         )
+
+    def test_generic_codex_exit_with_unsupported_scope_is_safely_replanned(self):
+        blockers = [
+            {
+                "job_id": "ctrl-316",
+                "lane": "I",
+                "state": "blocked",
+                "paths": ["packages/ctrl/src/api/routes/workers.ts"],
+                "last_error": (
+                    "controller finalization failed: Scope limit exceeded: "
+                    "203 LOC changed > 200 cap for lane I."
+                ),
+            },
+            {
+                "job_id": "vault-316",
+                "lane": "IV",
+                "state": "blocked",
+                "paths": [
+                    "packages/alfred-vault/src/alfred/worker_runs.py",
+                    "packages/alfred-vault/tests/test_worker_runs*.py",
+                ],
+                "last_error": (
+                    "scoped agent launch exited: agent exited before writing "
+                    "its required result marker (exit code 1)"
+                ),
+            },
+            {
+                "job_id": "learn-316",
+                "lane": "II",
+                "state": "waiting_dependency",
+                "paths": ["packages/learn/src/activities/maintenance.py"],
+                "last_error": None,
+            },
+        ]
+
+        observed = self.controller._auto_replan_blockers(blockers)
+
+        self.assertEqual(
+            [item["kind"] for item in observed],
+            ["scope_limit", "launch_scope_policy"],
+        )
+        self.assertIn("test_worker_runs*.py", observed[1]["reason"])
 
     def test_dry_run_only_observes(self):
         self.controller.config = replace(self.config, apply=False)

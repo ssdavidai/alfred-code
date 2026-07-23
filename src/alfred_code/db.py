@@ -1319,6 +1319,30 @@ class Database:
         ).fetchone()
         return int(row["count"] if row else 0)
 
+    def auto_replan_attempt_count(self, issue_number: int) -> int:
+        """Count consecutive automatic replans since the latest merged progress."""
+        rows = self.connection.execute(
+            """
+            SELECT kind, detail_json FROM events
+            WHERE issue_number = ?
+              AND kind IN ('job.transition', 'plan.auto_replan_requested')
+            ORDER BY id
+            """,
+            (issue_number,),
+        )
+        attempts = 0
+        for row in rows:
+            if row["kind"] == "plan.auto_replan_requested":
+                attempts += 1
+                continue
+            try:
+                detail = json.loads(row["detail_json"])
+            except (TypeError, ValueError):
+                continue
+            if detail.get("to") == "merged":
+                attempts = 0
+        return attempts
+
     def update_job(self, job_id: str, *, state: str | None = None, **fields: Any) -> dict[str, Any]:
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")

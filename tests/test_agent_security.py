@@ -6,6 +6,7 @@ import tempfile
 import tomllib
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -165,6 +166,24 @@ class AgentSecurityTests(unittest.TestCase):
         trust_key = f"{profile_path.resolve()}:pre_tool_use:0:0"
         self.assertEqual(parsed["hooks"]["state"][trust_key]["trusted_hash"], "sha256:test")
         self.assertNotIn("danger-full-access", profile)
+
+    def test_codex_profile_rejects_unenforceable_filename_glob(self):
+        manifest = replace(
+            self.manifest,
+            allowed=("packages/learn/tests/test_worker_runs*.py",),
+        )
+
+        with self.assertRaisesRegex(
+            AgentSecurityError,
+            "Codex writable scope supports only exact paths",
+        ):
+            codex_profile(
+                manifest,
+                profile_path=self.workspace / "invalid.config.toml",
+                hook_trust_hash="sha256:test",
+                toolchain_paths=(Path("/trusted/bin"),),
+                git_metadata_paths=(Path("/trusted/git"),),
+            )
 
     def test_codex_integrations_are_replaced_as_whole_tables(self):
         arguments = _codex_isolation_arguments()

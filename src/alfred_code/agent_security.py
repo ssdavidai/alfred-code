@@ -19,9 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .path_policy import codex_write_scope_error
+
 
 SECURITY_POLICY = "alfred-scoped-v1"
-LAUNCH_REVISION = 24
+LAUNCH_REVISION = 25
 SCOPED_CLAUDE_AGENT_ID = "2dc16f0d-1e57-4f4b-9f3f-4e7835a921d1"
 SCOPED_CODEX_AGENT_ID = "e75d43da-621f-449d-81ad-e3f92d553fd3"
 SCOPED_AGENT_IDS = frozenset({SCOPED_CLAUDE_AGENT_ID, SCOPED_CODEX_AGENT_ID})
@@ -637,6 +639,10 @@ def codex_profile(
     toolchain_paths: tuple[Path, ...] | None = None,
     git_metadata_paths: tuple[Path, ...] | None = None,
 ) -> str:
+    if manifest.role == "worker":
+        scope_error = codex_write_scope_error(manifest.allowed)
+        if scope_error:
+            raise AgentSecurityError(scope_error)
     writes = [_profile_path(pattern) for pattern in manifest.allowed] if manifest.role == "worker" else []
     writes.append(WORKER_RESULT if manifest.role == "worker" else REVIEW_RESULT)
     verification_writes = _verification_write_paths(manifest)

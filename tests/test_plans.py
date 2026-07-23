@@ -107,6 +107,28 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "Phase-0-owned"):
             self.validator.validate(value, issue_number=42, base_sha=self.base)
 
+    def test_filename_glob_write_scope_is_rejected_before_approval(self):
+        value = self.valid()
+        value["jobs"][0]["paths"] = ["api/test_worker_runs*.py"]
+
+        with self.assertRaisesRegex(
+            PlanValidationError,
+            "Codex writable scope supports only exact paths",
+        ):
+            self.validator.validate(value, issue_number=42, base_sha=self.base)
+
+    def test_explicit_directory_subtree_write_scope_is_supported(self):
+        value = self.valid()
+        value["jobs"][0]["paths"] = ["api/**"]
+
+        plan, _ = self.validator.validate(
+            value,
+            issue_number=42,
+            base_sha=self.base,
+        )
+
+        self.assertEqual(plan["jobs"][0]["paths"], ["api/**"])
+
     def test_phase0_dependency_is_enforced_by_lane_authority(self):
         value = self.valid()
         value["jobs"].insert(
