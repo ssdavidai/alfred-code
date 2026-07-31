@@ -74,6 +74,7 @@ class GitHubTests(unittest.TestCase):
 
         client._json = fake_json
         self.assertEqual(client.open_issues()[0]["title"], "cached")
+        self.assertEqual(client.open_issues()[0]["url"], "https://example/issues/7")
         self.assertEqual(len(client.open_issues()), 1)
         self.assertEqual(client.issue(7)["title"], "cached")
         self.assertEqual(client.issue_comments(7), client.issue_comments(7))
