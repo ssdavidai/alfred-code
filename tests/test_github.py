@@ -45,16 +45,36 @@ class GitHubTests(unittest.TestCase):
 
         def fake_json(arguments, timeout=120):
             calls.append(tuple(arguments))
-            if arguments[:2] == ["issue", "list"]:
-                return [{"number": 7, "state": "OPEN", "title": "cached"}]
-            if arguments[:2] == ["issue", "view"]:
-                return {"number": 7, "state": "OPEN", "title": "fresh"}
+            if arguments[:2] == ["api", "repos/owner/repo/issues?state=open&per_page=100"]:
+                return [[
+                    {
+                        "node_id": "I_7",
+                        "number": 7,
+                        "state": "open",
+                        "title": "cached",
+                        "html_url": "https://example/issues/7",
+                    },
+                    {
+                        "number": 8,
+                        "title": "not an issue",
+                        "pull_request": {"url": "https://api.example/pulls/8"},
+                    },
+                ]]
+            if arguments[:2] == ["api", "repos/owner/repo/issues/7"]:
+                return {
+                    "node_id": "I_7",
+                    "number": 7,
+                    "state": "open",
+                    "title": "fresh",
+                    "html_url": "https://example/issues/7",
+                }
             if arguments[0] == "api":
                 return [{"id": 1, "body": "hello"}]
             raise AssertionError(arguments)
 
         client._json = fake_json
         self.assertEqual(client.open_issues()[0]["title"], "cached")
+        self.assertEqual(len(client.open_issues()), 1)
         self.assertEqual(client.issue(7)["title"], "cached")
         self.assertEqual(client.issue_comments(7), client.issue_comments(7))
         self.assertEqual(len(calls), 2)
@@ -62,6 +82,28 @@ class GitHubTests(unittest.TestCase):
         client.begin_cycle()
         self.assertEqual(client.issue(7)["title"], "fresh")
         self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call[:2] != ("issue", "list") for call in calls))
+
+    def test_default_branch_lookup_uses_rest_api(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        json_calls = []
+        run_calls = []
+        client._json = lambda arguments, timeout=120: (
+            json_calls.append(arguments) or {"default_branch": "trunk"}
+        )
+        client._run = lambda arguments, timeout=120: (
+            run_calls.append(arguments) or "abc123\n"
+        )
+
+        self.assertEqual(client.default_branch_sha(), "abc123")
+        self.assertEqual(
+            json_calls,
+            [["api", "repos/owner/repo"]],
+        )
+        self.assertEqual(
+            run_calls,
+            [["api", "repos/owner/repo/commits/trunk", "--jq", ".sha"]],
+        )
 
     def test_posting_pr_comment_invalidates_same_cycle_comment_cache(self):
         client = GitHubClient(

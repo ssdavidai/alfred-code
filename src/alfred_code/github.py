@@ -44,6 +44,7 @@ class GitHubClient:
         self.binary = binary
         self._issues: dict[int, dict[str, Any]] = {}
         self._issue_comments: dict[int, list[dict[str, Any]]] = {}
+        self._open_issues: list[dict[str, Any]] | None = None
         self._pull_requests: dict[str, PullRequestObservation | None] = {}
         self._pr_comments: dict[int, list[dict[str, Any]]] = {}
         self._default_branch_sha: str | None = None
@@ -53,6 +54,7 @@ class GitHubClient:
         """Drop observation caches at the start of one reconciliation cycle."""
         self._issues.clear()
         self._issue_comments.clear()
+        self._open_issues = None
         self._pull_requests.clear()
         self._pr_comments.clear()
         self._default_branch_sha = None
@@ -102,63 +104,74 @@ class GitHubClient:
         cached = self._issues.get(number)
         if cached is not None:
             return cached
-        issue = self._json(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--repo",
-                self.config.repo,
-                "--json",
-                "id,number,title,body,state,url,labels,updatedAt",
-            ]
-        )
+        value = self._json(["api", f"repos/{self.config.repo}/issues/{number}"])
+        issue = self._normalize_issue(value)
         if not isinstance(issue, dict):
             raise AuthorityUnavailable(f"GitHub issue #{number} returned a non-object response")
         self._issues[number] = issue
         return issue
 
+    @staticmethod
+    def _normalize_issue(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise AuthorityUnavailable("GitHub issue endpoint returned a non-object response")
+        return {
+            "id": value.get("node_id") or value.get("id"),
+            "number": value.get("number"),
+            "title": value.get("title"),
+            "body": value.get("body"),
+            "state": str(value.get("state") or "OPEN").upper(),
+            "url": value.get("url") or value.get("html_url"),
+            "labels": value.get("labels") or [],
+            "updatedAt": value.get("updatedAt") or value.get("updated_at"),
+        }
+
     def open_issues(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        if self._open_issues is not None:
+            return self._open_issues[:limit]
+        if limit <= 0:
+            return []
         result = self._json(
             [
-                "issue",
-                "list",
-                "--repo",
-                self.config.repo,
-                "--state",
-                "open",
-                "--limit",
-                str(limit),
-                "--json",
-                "id,number,title,body,state,url,labels,updatedAt",
+                "api",
+                f"repos/{self.config.repo}/issues?state=open&per_page={min(limit, 100)}",
+                "--paginate",
+                "--slurp",
             ]
         )
         if not isinstance(result, list):
-            raise AuthorityUnavailable("GitHub issue list returned a non-array response")
-        for issue in result:
-            if isinstance(issue, dict) and issue.get("number") is not None:
+            raise AuthorityUnavailable("GitHub issues endpoint returned a non-array response")
+        pages = result if result and all(isinstance(page, list) for page in result) else [result]
+        issues: list[dict[str, Any]] = []
+        for page in pages:
+            for value in page:
+                if not isinstance(value, dict) or value.get("pull_request"):
+                    continue
+                issue = self._normalize_issue(value)
+                if issue.get("number") is None:
+                    continue
+                issues.append(issue)
                 self._issues[int(issue["number"])] = issue
-        return result
+                if len(issues) >= limit:
+                    break
+            if len(issues) >= limit:
+                break
+        self._open_issues = issues
+        return issues
 
     def intake_issues(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        arguments = [
-            "issue",
-            "list",
-            "--repo",
-            self.config.repo,
-            "--state",
-            "open",
-            "--limit",
-            str(limit),
-            "--json",
-            "id,number,title,body,state,url,labels,updatedAt",
-        ]
-        if self.config.intake_label:
-            arguments.extend(["--label", self.config.intake_label])
-        result = self._json(arguments)
-        if not isinstance(result, list):
-            raise AuthorityUnavailable("GitHub issue list returned a non-array response")
-        return result
+        issues = self.open_issues(limit=500)
+        if not self.config.intake_label:
+            return issues[:limit]
+        return [
+            issue
+            for issue in issues
+            if self.config.intake_label
+            in {
+                str(label.get("name") or "") if isinstance(label, dict) else str(label)
+                for label in issue.get("labels") or []
+            }
+        ][:limit]
 
     def issue_comments(self, number: int) -> list[dict[str, Any]]:
         cached = self._issue_comments.get(number)
@@ -496,10 +509,12 @@ class GitHubClient:
     def default_branch_sha(self) -> str:
         if self._default_branch_sha is not None:
             return self._default_branch_sha
-        repo = self._json(
-            ["repo", "view", self.config.repo, "--json", "defaultBranchRef"]
+        repo = self._json(["api", f"repos/{self.config.repo}"])
+        branch = (
+            str(repo.get("default_branch") or "main")
+            if isinstance(repo, dict)
+            else "main"
         )
-        branch = ((repo.get("defaultBranchRef") or {}).get("name") if isinstance(repo, dict) else None) or "main"
         self._default_branch_sha = self._run(
             ["api", f"repos/{self.config.repo}/commits/{branch}", "--jq", ".sha"]
         ).strip()
