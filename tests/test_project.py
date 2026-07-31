@@ -1,6 +1,7 @@
 import unittest
 
 from alfred_code.config import GitHubConfig
+from alfred_code.errors import AuthorityUnavailable
 from alfred_code.project import ProjectBoard
 
 
@@ -8,10 +9,13 @@ class RecordingProjectBoard(ProjectBoard):
     def __init__(self):
         super().__init__(GitHubConfig(owner="owner"))
         self.calls = []
+        self.fail_command = None
 
     def _json(self, args):
         self.calls.append(tuple(args))
         command = args[1]
+        if command == self.fail_command:
+            raise AuthorityUnavailable(f"{command} failed")
         if command == "view":
             return {"id": "project-id", "number": 3}
         if command == "field-list":
@@ -33,6 +37,25 @@ class ProjectBoardTests(unittest.TestCase):
         self.assertEqual(len(board.calls), 3)
         board.refresh(3, force=True)
         self.assertEqual(len(board.calls), 6)
+
+    def test_failed_forced_refresh_preserves_last_good_snapshot(self):
+        board = RecordingProjectBoard()
+        board.refresh(3)
+        previous = (
+            board._projects[3],
+            board._fields[3],
+            board._items[3],
+            board._ordered_items[3],
+        )
+        board.fail_command = "item-list"
+
+        with self.assertRaises(AuthorityUnavailable):
+            board.refresh(3, force=True)
+
+        self.assertIs(board._projects[3], previous[0])
+        self.assertIs(board._fields[3], previous[1])
+        self.assertIs(board._items[3], previous[2])
+        self.assertIs(board._ordered_items[3], previous[3])
 
     def test_sync_explicitly_clears_stale_optional_text_fields(self):
         board = RecordingProjectBoard()

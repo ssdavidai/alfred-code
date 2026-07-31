@@ -305,6 +305,7 @@ class FakeSuperset:
 class FakeProject:
     def __init__(self):
         self.refreshes = []
+        self.refresh_error = None
         self.synced = {}
         self.history = []
         self.items = []
@@ -312,6 +313,8 @@ class FakeProject:
 
     def refresh(self, number, *, force=False):
         self.refreshes.append(number)
+        if self.refresh_error:
+            raise self.refresh_error
 
     def delivery_items(self, number):
         return copy.deepcopy(self.items)
@@ -955,6 +958,40 @@ class ControllerTests(unittest.TestCase):
             project.synced["https://example/issues/13"]["controller_state"],
             "closed",
         )
+        self.assertEqual(project.refreshes, [3])
+
+    def test_project_snapshot_refresh_is_bounded_and_recovers_after_backoff(self):
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+            project_refresh_seconds=900,
+        )
+
+        self.controller.observe_issues()
+        self.controller.observe_issues()
+        self.assertEqual(project.refreshes, [3])
+
+        self.controller._project_refresh_attempted_at[3] -= 901
+        self.controller.observe_issues()
+        self.assertEqual(project.refreshes, [3, 3])
+
+    def test_failed_project_refresh_is_not_retried_each_poll(self):
+        project = FakeProject()
+        project.refresh_error = AuthorityUnavailable("rate limit exceeded")
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+            project_refresh_seconds=900,
+        )
+
+        self.controller.observe_issues()
+        self.controller.observe_issues()
+
+        self.assertEqual(project.refreshes, [3])
+        self.assertEqual(project.synced, {})
 
     def test_auto_intake_projects_unlabeled_issue_as_agent_silent_backlog(self):
         self.issue["labels"] = [{"name": "bug"}]

@@ -69,6 +69,8 @@ class Controller:
         self.notifier = notifier
         self.project = project
         self.audit = audit or AuditLog(config.state_dir / "controller.jsonl")
+        self._project_refresh_attempted_at: dict[int, float] = {}
+        self._project_refresh_available: dict[int, bool] = {}
 
     @staticmethod
     def _verification_environment(worktree: Path | None = None) -> dict[str, str]:
@@ -106,6 +108,26 @@ class Controller:
             and self.config.github.project_number
             and callable(getattr(self.project, "delivery_items", None))
         )
+
+    def _refresh_project_snapshot(self, project_number: int) -> bool:
+        now = time.monotonic()
+        last_attempt = self._project_refresh_attempted_at.get(project_number)
+        if (
+            last_attempt is not None
+            and now - last_attempt < self.config.project_refresh_seconds
+        ):
+            return self._project_refresh_available.get(project_number, False)
+
+        self._project_refresh_attempted_at[project_number] = now
+        try:
+            if self.project is None:
+                return False
+            self.project.refresh(project_number, force=True)
+        except AuthorityUnavailable:
+            self._project_refresh_available[project_number] = False
+            raise
+        self._project_refresh_available[project_number] = True
+        return True
 
     def _adopt_project_intent(
         self,
@@ -165,12 +187,13 @@ class Controller:
         delivery_items: dict[int, dict[str, Any]] = {}
         if project_ready:
             try:
-                self.project.refresh(int(self.config.github.project_number), force=True)
-                if self._sprint_workflow_enabled():
+                project_number = int(self.config.github.project_number)
+                project_ready = self._refresh_project_snapshot(project_number)
+                if project_ready and self._sprint_workflow_enabled():
                     delivery_items = {
                         int(item["issue_number"]): item
                         for item in self.project.delivery_items(
-                            int(self.config.github.project_number)
+                            project_number
                         )
                     }
             except AuthorityUnavailable as exc:

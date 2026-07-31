@@ -185,15 +185,29 @@ class ProjectBoard:
             and number in self._items
         ):
             return
-        if force:
-            self._projects.pop(number, None)
-            self._fields.pop(number, None)
-            self._items.pop(number, None)
-            self._ordered_items.pop(number, None)
-        self._projects[number] = self._json(
+
+        # Fetch a complete snapshot before replacing the last known-good one.
+        # A rate-limit failure must not destroy the cache and trigger follow-up
+        # queries from fields(), _item(), or sync_issue().
+        project = self._json(
             ["project", "view", str(number), "--owner", self.config.owner, "--format", "json"]
         )
-        self.fields(number)
+        field_values = self._values(
+            self._json(
+                [
+                    "project",
+                    "field-list",
+                    str(number),
+                    "--owner",
+                    self.config.owner,
+                    "--limit",
+                    "100",
+                    "--format",
+                    "json",
+                ]
+            ),
+            "fields",
+        )
         values = self._values(
             self._json(
                 [
@@ -210,12 +224,17 @@ class ProjectBoard:
             ),
             "items",
         )
-        self._ordered_items[number] = values
-        self._items[number] = {
+        fields = {str(field.get("name")): field for field in field_values}
+        items = {
             str((item.get("content") or {}).get("url")): item
             for item in values
             if (item.get("content") or {}).get("url")
         }
+
+        self._projects[number] = project
+        self._fields[number] = fields
+        self._ordered_items[number] = values
+        self._items[number] = items
 
     def _item(self, number: int, issue_url: str) -> dict[str, Any] | None:
         if number in self._items:
