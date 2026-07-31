@@ -83,6 +83,7 @@ class ControllerConfig:
     state_dir: Path = Path("~/.alfred-code-state-v2").expanduser()
     apply: bool = False
     poll_seconds: int = 60
+    project_refresh_seconds: int = 900
     max_parallel_planners: int = 3
     auto_replan_max_attempts: int = 2
     sprint_duration_days: int = 14
@@ -153,6 +154,7 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         state_dir=state_dir,
         apply=bool(raw.get("apply", False)),
         poll_seconds=int(raw.get("poll_seconds", 60)),
+        project_refresh_seconds=int(raw.get("project_refresh_seconds", 900)),
         max_parallel_planners=int(raw.get("max_parallel_planners", 3)),
         auto_replan_max_attempts=int(raw.get("auto_replan_max_attempts", 2)),
         sprint_duration_days=int(raw.get("sprint_duration_days", 14)),
@@ -196,6 +198,10 @@ def load_config(path: Path | None = None) -> ControllerConfig:
     )
     if config.poll_seconds < 10:
         raise ConfigurationError("poll_seconds must be at least 10")
+    if config.project_refresh_seconds < config.poll_seconds:
+        raise ConfigurationError(
+            "project_refresh_seconds must be at least poll_seconds"
+        )
     if not 1 <= config.max_parallel_planners <= 8:
         raise ConfigurationError("max_parallel_planners must be between 1 and 8")
     if not 0 <= config.auto_replan_max_attempts <= 5:

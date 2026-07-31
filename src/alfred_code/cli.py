@@ -43,6 +43,9 @@ repo_path = "~/dev/alfred"
 state_dir = "~/.alfred-code-state-v2"
 apply = false
 poll_seconds = 60
+# A full GitHub Project snapshot is GraphQL-expensive. Issue, comment, PR, and
+# worker reconciliation still runs every poll_seconds.
+project_refresh_seconds = 900
 max_parallel_planners = 3
 auto_replan_max_attempts = 2
 sprint_duration_days = 14

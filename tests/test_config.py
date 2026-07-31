@@ -11,6 +11,7 @@ def test_parallel_planner_default_is_bounded(tmp_path: Path) -> None:
 
     assert config.max_parallel_planners == 3
     assert config.auto_replan_max_attempts == 2
+    assert config.project_refresh_seconds == 900
     assert config.planner_command[:2] == ("codex", "exec")
     assert config.planner_command[config.planner_command.index("--model") + 1] == "gpt-5.6-sol"
     assert config.planner_command[config.planner_command.index("--profile") + 1] == "alfred-planner"
@@ -46,6 +47,14 @@ def test_parallel_planner_bound_is_validated(tmp_path: Path) -> None:
     path.write_text("max_parallel_planners = 9\n")
 
     with pytest.raises(ConfigurationError, match="between 1 and 8"):
+        load_config(path)
+
+
+def test_project_refresh_cannot_run_faster_than_controller_poll(tmp_path: Path) -> None:
+    path = tmp_path / "controller.toml"
+    path.write_text("poll_seconds = 60\nproject_refresh_seconds = 30\n")
+
+    with pytest.raises(ConfigurationError, match="at least poll_seconds"):
         load_config(path)
 
 
