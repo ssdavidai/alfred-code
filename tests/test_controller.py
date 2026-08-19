@@ -2231,6 +2231,7 @@ class ControllerTests(unittest.TestCase):
         replaced = self.db.get_job("api-12")
         self.assertEqual(replaced["state"], "pr_open")
         self.assertEqual(replaced["branch"], "lane-1/12-api-clean-r1")
+        self.assertEqual(replaced["repair_attempts"], 0)
         self.assertEqual(self.github.created_prs[-1]["branch"], replaced["branch"])
         self.assertEqual(self.github.closed_prs[-1][0], 5)
         self.assertIn("no force-push", self.github.closed_prs[-1][1])
@@ -2248,6 +2249,35 @@ class ControllerTests(unittest.TestCase):
             check=True,
         ).stdout.strip()
         self.assertEqual(replacement_count, "1")
+
+        replacement_pr = PullRequestObservation(
+            6,
+            "https://example/pr/6",
+            "OPEN",
+            replaced["head_sha"],
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            replaced["branch"],
+            "## Smoke evidence\nreal output",
+        )
+        self.github.prs[replaced["branch"]] = replacement_pr
+        self.controller.run_once()
+        self.assertEqual(self.db.get_job("api-12")["state"], "reviewing")
+        self.github.verdicts[(6, replaced["head_sha"])] = "fail"
+        self.github.feedbacks[(6, replaced["head_sha"])] = {
+            "verdict": "fail",
+            "body": "FAIL: the clean delivery still has one scoped contract gap.",
+        }
+
+        self.controller.run_once()
+
+        fresh_repair = self.db.get_job("api-12")
+        self.assertEqual(
+            fresh_repair["state"], "repairing", fresh_repair.get("last_error")
+        )
+        self.assertEqual(fresh_repair["repair_attempts"], 1)
 
     def test_failed_review_launches_bound_repair_and_re_reviews_new_sha(self):
         remote, pr, repairing = self.launch_failed_review_repair()
@@ -2523,6 +2553,7 @@ class ControllerTests(unittest.TestCase):
         recovered = self.db.get_job("api-12")
         self.assertEqual(recovered["state"], "pr_open")
         self.assertEqual(recovered["branch"], "lane-1/12-api-clean-r1")
+        self.assertEqual(recovered["repair_attempts"], 0)
         self.assertEqual(self.github.created_prs[-1]["branch"], recovered["branch"])
         self.assertEqual(self.github.closed_prs[-1][0], 5)
         replacement_count = subprocess.run(

@@ -1970,7 +1970,10 @@ class Database:
                 UPDATE jobs
                 SET branch=?, state='pr_open', pr_number=NULL, pr_url=?, head_sha=?,
                     review_sha=NULL, review_workspace_id=NULL, review_agent_id=NULL,
-                    review_requested_at=NULL, last_error=NULL, updated_at=?
+                    review_requested_at=NULL, repair_attempts=0, repair_sha=NULL,
+                    repair_agent_id=NULL, repair_requested_at=NULL,
+                    repair_token=NULL, last_error=NULL,
+                    updated_at=?
                 WHERE job_id=?
                 """,
                 (replacement_branch, pr_url, head_sha, now, job_id),
@@ -1982,6 +1985,74 @@ class Database:
                     "to_branch": replacement_branch,
                     "pr_url": pr_url,
                     "head_sha": head_sha,
+                },
+                issue_number=int(previous["issue_number"]),
+                job_id=job_id,
+                connection=conn,
+            )
+        return self.get_job(job_id) or {}
+
+    def reset_clean_delivery_repair_budget(
+        self,
+        job_id: str,
+        *,
+        expected_branch: str,
+        expected_head_sha: str,
+    ) -> dict[str, Any]:
+        """Recover repair accounting for a clean delivery created before this fix."""
+        with self.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if previous is None:
+                raise KeyError(f"job {job_id} not found")
+            if (
+                str(previous["branch"]) != expected_branch
+                or str(previous["head_sha"] or "") != expected_head_sha
+            ):
+                raise ValueError("clean delivery changed before repair-budget recovery")
+            rotations = conn.execute(
+                """
+                SELECT detail_json FROM events
+                WHERE job_id=? AND kind='job.delivery_branch_rotated'
+                ORDER BY id DESC
+                """,
+                (job_id,),
+            ).fetchall()
+            matched = False
+            for row in rotations:
+                try:
+                    detail = json.loads(row["detail_json"])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    detail.get("to_branch") == expected_branch
+                    and detail.get("head_sha") == expected_head_sha
+                ):
+                    matched = True
+                    break
+            if not matched:
+                raise ValueError("job has no matching clean-delivery rotation event")
+            previous_attempts = int(previous["repair_attempts"] or 0)
+            if previous_attempts == 0:
+                return dict(previous)
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET repair_attempts=0, repair_sha=NULL, repair_agent_id=NULL,
+                    repair_requested_at=NULL, repair_token=NULL,
+                    last_error=NULL, updated_at=?
+                WHERE job_id=?
+                """,
+                (now, job_id),
+            )
+            self.event(
+                "job.clean_delivery_repair_budget_reset",
+                {
+                    "branch": expected_branch,
+                    "head_sha": expected_head_sha,
+                    "previous_attempts": previous_attempts,
                 },
                 issue_number=int(previous["issue_number"]),
                 job_id=job_id,

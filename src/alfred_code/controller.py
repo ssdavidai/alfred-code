@@ -1723,6 +1723,22 @@ class Controller:
         job_id = str(job["job_id"])
         maximum = self.config.superset.review_repair_max_attempts
         attempts = int(job.get("repair_attempts") or 0)
+        clean_budget_reset = False
+        if (
+            attempts
+            and "-clean-r" in str(job.get("branch") or "")
+            and str(job.get("repair_sha") or "") != pr.head_sha
+        ):
+            try:
+                job = self.database.reset_clean_delivery_repair_budget(
+                    job_id,
+                    expected_branch=str(job["branch"]),
+                    expected_head_sha=pr.head_sha,
+                )
+            except ValueError:
+                pass
+            attempts = int(job.get("repair_attempts") or 0)
+            clean_budget_reset = attempts == 0
         if attempts >= maximum:
             if self._recover_completed_history_scanner_blocker(
                 issue, plan, job, pr
@@ -1769,6 +1785,10 @@ class Controller:
                 last_error="cannot resolve the original scoped worker worktree for review repair",
             )
             return
+        if clean_budget_reset:
+            self._write_json_control(
+                worktree / ".lane", self._worker_lane_manifest(issue, job)
+            )
         scope_error = self._worker_workspace_error(
             issue,
             plan,
@@ -2682,12 +2702,15 @@ class Controller:
             title=f"{issue['title']} (lane {job['lane']}, clean history)",
             body=body,
         )
-        self.database.rotate_job_delivery_branch(
+        rotated_job = self.database.rotate_job_delivery_branch(
             str(job["job_id"]),
             expected_branch=original_branch,
             replacement_branch=replacement_branch,
             pr_url=pr_url,
             head_sha=head_sha,
+        )
+        self._write_json_control(
+            worktree / ".lane", self._worker_lane_manifest(issue, rotated_job)
         )
         self.github.invalidate_pr(original_branch)
         self.github.invalidate_pr(replacement_branch)
