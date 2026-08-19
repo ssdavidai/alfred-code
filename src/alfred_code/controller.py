@@ -527,6 +527,7 @@ class Controller:
                 and any(job["state"] != "merged" for job in jobs)
             )
             if current and (missing or unsafe_execution):
+                retired_plan_hash = str(current["plan_hash"])
                 reason = (
                     "controller-enforced split dependency barrier: "
                     + ", ".join(f"#{number}" for number in split_dependencies)
@@ -543,7 +544,7 @@ class Controller:
                 ]
                 self.database.supersede_plan_for_replan(
                     issue_number,
-                    str(current["plan_hash"]),
+                    retired_plan_hash,
                     reason=reason,
                     blockers=blockers,
                 )
@@ -561,6 +562,11 @@ class Controller:
                 )
                 current = None
                 jobs = []
+                self._close_superseded_split_dependency_prs(
+                    issue_number, retired_plan_hash
+                )
+            elif current is None:
+                self._close_superseded_split_dependency_prs(issue_number)
             if unresolved_split_dependencies:
                 self.database.set_issue_state(
                     issue_number,
@@ -716,6 +722,50 @@ class Controller:
             and (job.get("pr_number") is None or int(job["pr_number"]) == pr.number)
             and (not job.get("head_sha") or str(job["head_sha"]) == pr.head_sha)
         )
+
+    def _close_superseded_split_dependency_prs(
+        self,
+        issue_number: int,
+        plan_hash: str | None = None,
+    ) -> None:
+        """Finish durable cleanup of PRs retired by the split dependency barrier."""
+        if plan_hash is None:
+            event = self.database.latest_event(
+                issue_number, "plan.auto_replan_requested"
+            )
+            detail = (event or {}).get("detail", {})
+            if not str(detail.get("reason") or "").startswith(
+                "controller-enforced split dependency barrier:"
+            ):
+                return
+            plan_hash = str(detail.get("plan_hash") or "")
+        if not plan_hash:
+            return
+        for job in self.database.list_jobs(issue_number):
+            if (
+                str(job.get("plan_hash") or "") != plan_hash
+                or job.get("state") != "superseded"
+            ):
+                continue
+            pr = self.github.pr_for_branch(str(job["branch"]))
+            if pr is None or pr.merged or pr.closed_unmerged:
+                continue
+            self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+            if not self._controller_owns_pr(job, pr):
+                self.notifier.send(
+                    f"job:{job['job_id']}:split-pr-not-owned:{pr.head_sha}",
+                    f"Alfred #{issue_number} retained PR #{pr.number} because its controller "
+                    "ownership marker or exact head did not match.",
+                    {"job": job["job_id"], "pr": pr.url},
+                )
+                continue
+            self.github.close_pr(
+                pr.number,
+                f"Superseded by Alfred Code's controller-enforced split dependency barrier for "
+                f"job `{job['job_id']}`. The branch, commits, and workspace are retained; "
+                "replacement work will be specified from current source after its upstream "
+                "child issues complete.",
+            )
 
     def _attempt_auto_replan(
         self,

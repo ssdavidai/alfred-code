@@ -651,7 +651,26 @@ class ControllerTests(unittest.TestCase):
         )
         self.db.materialize_jobs(12, self.plan_hash, self.plan)
         self.db.acquire_lane("I", "api-12")
-        self.db.update_job("api-12", state="running", workspace_id="duplicate-workspace")
+        self.db.update_job(
+            "api-12",
+            state="running",
+            workspace_id="duplicate-workspace",
+            pr_number=5,
+            pr_url="https://example/pr/5",
+            head_sha="b" * 40,
+        )
+        self.github.prs["lane-1/12-api"] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            "b" * 40,
+            "RED",
+            "BLOCKED",
+            "MERGEABLE",
+            False,
+            "lane-1/12-api",
+            "Controller job: `api-12` · lane `I`\n\n## Smoke evidence\nreal output",
+        )
 
         current, jobs, halted = self.controller._prepare_plan_state(issue)
 
@@ -662,6 +681,17 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(self.db.lease_owner("I"))
         self.assertIsNone(self.db.current_plan(12))
         self.assertEqual(self.db.get_issue(12)["controller_state"], "approved")
+        self.assertEqual(self.github.closed_prs[0][0], 5)
+        self.assertIn("split dependency barrier", self.github.closed_prs[0][1])
+
+        # A restart after the durable retirement but before GitHub closure retries
+        # cleanup without reviving or accepting the superseded workspace.
+        self.github.prs["lane-1/12-api"] = replace(
+            self.github.prs["lane-1/12-api"], state="OPEN"
+        )
+        self.github.closed_prs.clear()
+        self.controller._prepare_plan_state(self.db.get_issue(12))
+        self.assertEqual(self.github.closed_prs[0][0], 5)
 
     def test_plan_publication_failure_preserves_the_valid_plan_for_retry(self):
         def fail_post(*_args, **_kwargs):
