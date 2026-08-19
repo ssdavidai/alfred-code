@@ -2486,9 +2486,9 @@ class ControllerTests(unittest.TestCase):
             ),
         )
         self.github.failure_evidence = (
-            "Finding: Generic API Key\n"
-            f"Commit: {self.sha}\n"
-            "File: file.txt\n"
+            "gitleaks\tRun gitleaks/gitleaks-action@v2\tFinding: Generic API Key\n"
+            f"gitleaks\tRun gitleaks/gitleaks-action@v2\tCommit:      {self.sha}\n"
+            "gitleaks\tRun gitleaks/gitleaks-action@v2\tFile: file.txt\n"
         )
         (self.repo / WORKER_RESULT).write_text(
             json.dumps(

@@ -2510,7 +2510,7 @@ class Controller:
         except Exception:
             return False
         finding_commits = set(
-            re.findall(r"(?im)^\s*Commit:\s*([0-9a-f]{40})\s*$", evidence)
+            re.findall(r"(?i)\bCommit:\s*([0-9a-f]{40})(?=\s|$)", evidence)
         )
         return bool(finding_commits and pr.head_sha not in finding_commits)
 
