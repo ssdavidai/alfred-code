@@ -297,6 +297,7 @@ class FakeSuperset:
         issue_number,
         controller_job,
         verify_command,
+        review_paths,
     ):
         self.review_creates += 1
         workspace = Workspace(f"r-{pr_number}-{self.review_creates}", name, branch, f"superset://{name}")
@@ -2843,7 +2844,7 @@ class ControllerTests(unittest.TestCase):
                 {
                     "lane": "review",
                     "issue": 12,
-                    "allowed": [],
+                    "allowed": ["file.txt"],
                     "verify": "true",
                     "controller_job": "api-12",
                     "role": "reviewer",
@@ -2888,7 +2889,7 @@ class ControllerTests(unittest.TestCase):
                 {
                     "lane": "review",
                     "issue": 12,
-                    "allowed": [],
+                    "allowed": ["file.txt"],
                     "verify": "true",
                     "controller_job": "api-12",
                     "role": "reviewer",
@@ -2935,7 +2936,7 @@ class ControllerTests(unittest.TestCase):
                 {
                     "lane": "review",
                     "issue": 12,
-                    "allowed": [],
+                    "allowed": ["file.txt"],
                     "verify": "true",
                     "controller_job": "api-12",
                     "role": "reviewer",
@@ -2990,7 +2991,7 @@ class ControllerTests(unittest.TestCase):
                 {
                     "lane": "review",
                     "issue": 12,
-                    "allowed": [],
+                    "allowed": ["file.txt"],
                     "verify": "true",
                     "controller_job": "api-12",
                     "role": "reviewer",

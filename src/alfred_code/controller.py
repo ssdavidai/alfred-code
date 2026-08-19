@@ -1703,6 +1703,7 @@ class Controller:
             issue_number=int(issue["number"]),
             controller_job=job["job_id"],
             verify_command=job["verify_command"],
+            review_paths=list(job["paths"]),
         )
         self.database.update_job(
             job_id,
@@ -3383,7 +3384,7 @@ class Controller:
         expected_lane = {
             "lane": "review",
             "issue": int(issue["number"]),
-            "allowed": [],
+            "allowed": job["paths"],
             "verify": job["verify_command"],
             "controller_job": job["job_id"],
             "role": "reviewer",

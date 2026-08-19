@@ -83,6 +83,7 @@ class SupersetTests(unittest.TestCase):
             issue_number=292,
             controller_job="docs-292",
             verify_command="docker compose config -q",
+            review_paths=["docs/contract.md", "packages/ctrl/CONTRACT.md"],
         )
 
         self.assertEqual(workspace.branch, "review/293-dc0110232f22")
@@ -94,7 +95,9 @@ class SupersetTests(unittest.TestCase):
         encoded = command.split()[2]
         lane = json.loads(base64.b64decode(encoded))
         self.assertEqual(lane["role"], "reviewer")
-        self.assertEqual(lane["allowed"], [])
+        self.assertEqual(
+            lane["allowed"], ["docs/contract.md", "packages/ctrl/CONTRACT.md"]
+        )
         self.assertEqual(lane["issue"], 292)
         self.assertEqual(lane["controller_job"], "docs-292")
         self.assertEqual(lane["verify"], "docker compose config -q")
