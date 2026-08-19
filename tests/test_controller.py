@@ -2187,6 +2187,13 @@ class ControllerTests(unittest.TestCase):
             False,
             job["branch"],
             "## Smoke evidence\nreal output",
+            checks=(
+                {
+                    "name": "gitleaks",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/123/job/456",
+                },
+            ),
         )
 
         self.controller.run_once()
@@ -2198,6 +2205,49 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.superset.agent_starts, 1)
         self.assertIn("gitleaks failed at docs/contract.md:234", self.superset.agent_prompts[0])
         self.assertIn("untrusted validation evidence", self.superset.agent_prompts[0])
+
+        (self.repo / "file.txt").write_text("scanner-safe final implementation\n")
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "summary": "replaced the fake credential example",
+                    "head_sha": head,
+                    "handoff_token": repairing["repair_token"],
+                    "attempt": 1,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=head,
+            attempt=1,
+        )
+
+        self.controller.run_once()
+
+        replaced = self.db.get_job("api-12")
+        self.assertEqual(replaced["state"], "pr_open")
+        self.assertEqual(replaced["branch"], "lane-1/12-api-clean-r1")
+        self.assertEqual(self.github.created_prs[-1]["branch"], replaced["branch"])
+        self.assertEqual(self.github.closed_prs[-1][0], 5)
+        self.assertIn("no force-push", self.github.closed_prs[-1][1])
+        replacement_count = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "rev-list",
+                "--count",
+                f"{self.sha}..refs/heads/{replaced['branch']}",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(replacement_count, "1")
 
     def test_failed_review_launches_bound_repair_and_re_reviews_new_sha(self):
         remote, pr, repairing = self.launch_failed_review_repair()

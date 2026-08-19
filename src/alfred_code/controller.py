@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -2017,6 +2018,17 @@ class Controller:
             status = str(result.get("status") or "")
             if status == "blocked":
                 reason = str(result.get("reason") or "repair agent reported an unspecified blocker")[:1000]
+                if (
+                    self._history_scanner_points_to_older_commits(pr)
+                    and any(
+                        token in reason.lower()
+                        for token in ("historical", "history rewrite", "squash")
+                    )
+                ):
+                    self._finalize_history_scanner_blocker(
+                        issue, plan, job, pr, details, reason
+                    )
+                    return
                 self.database.update_job(job["job_id"], state="blocked", last_error=reason)
                 self.notifier.send(
                     f"job:{job['job_id']}:repair-blocked:{pr.head_sha}:{attempt}",
@@ -2251,6 +2263,7 @@ class Controller:
                 "repair agent claimed readiness without a new repository change",
             )
             return
+        replacement: dict[str, str] | None = None
         try:
             already_staged = run(
                 ["git", "diff", "--cached", "--name-only"],
@@ -2301,8 +2314,19 @@ class Controller:
                 timeout=1200,
             )
             new_sha = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
-            run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
-            self.github.invalidate_pr(str(job["branch"]))
+            if self._history_scanner_failed(pr):
+                replacement = self._publish_clean_history_replacement(
+                    issue,
+                    plan,
+                    job,
+                    pr,
+                    worktree,
+                    verification,
+                )
+                new_sha = replacement["head_sha"]
+            else:
+                run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
+                self.github.invalidate_pr(str(job["branch"]))
         except (AuthorityUnavailable, CommandError, OSError) as exc:
             error = f"review repair finalization failed: {exc}"
             self.database.update_job(job["job_id"], state="blocked", last_error=error)
@@ -2312,16 +2336,17 @@ class Controller:
                 {"job": job["job_id"], "pr": pr.url, "workspace": job.get("workspace_id")},
             )
             return
-        self.database.update_job(
-            job["job_id"],
-            state="pr_open",
-            head_sha=new_sha,
-            review_sha=None,
-            review_workspace_id=None,
-            review_agent_id=None,
-            review_requested_at=None,
-            last_error=None,
-        )
+        if replacement is None:
+            self.database.update_job(
+                job["job_id"],
+                state="pr_open",
+                head_sha=new_sha,
+                review_sha=None,
+                review_workspace_id=None,
+                review_agent_id=None,
+                review_requested_at=None,
+                last_error=None,
+            )
         evidence = verification.strip() or "(command exited 0 with no output)"
         self.database.event(
             "job.repair_pushed",
@@ -2332,15 +2357,279 @@ class Controller:
                 "attempt": int(job.get("repair_attempts") or 0),
                 "summary": str(result.get("summary") or "")[:1000],
                 "verification": evidence[:4000],
+                "replacement_branch": (replacement or {}).get("branch"),
+                "replacement_pr": (replacement or {}).get("pr_url"),
+            },
+            issue_number=int(issue["number"]),
+            job_id=job["job_id"],
+        )
+        if replacement is None:
+            message = (
+                f"Alfred #{issue['number']} PR #{pr.number} received scoped repair commit "
+                f"{new_sha[:12]}; CI and an independent exact-SHA review will run again."
+            )
+            detail = {"job": job["job_id"], "pr": pr.url, "sha": new_sha}
+        else:
+            message = (
+                f"Alfred #{issue['number']} replaced history-scanner-blocked PR #{pr.number} "
+                f"with {replacement['pr_url']} at clean head {new_sha[:12]}; the original branch "
+                "and commits were retained without a force-push."
+            )
+            detail = {
+                "job": job["job_id"],
+                "old_pr": pr.url,
+                "pr": replacement["pr_url"],
+                "sha": new_sha,
+            }
+        self.notifier.send(
+            f"job:{job['job_id']}:repair-pushed:{new_sha}",
+            message,
+            detail,
+        )
+
+    @staticmethod
+    def _history_scanner_failed(pr: PullRequestObservation) -> bool:
+        failed_states = {
+            "FAILURE",
+            "ERROR",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+        }
+        for check in pr.checks:
+            state = str(
+                check.get("conclusion")
+                or check.get("state")
+                or check.get("status")
+                or ""
+            ).upper()
+            name = " ".join(
+                str(
+                    check.get("name")
+                    or check.get("context")
+                    or check.get("workflowName")
+                    or ""
+                )
+                .lower()
+                .split()
+            )
+            if state in failed_states and "gitleaks" in name:
+                return True
+        return False
+
+    def _history_scanner_points_to_older_commits(
+        self, pr: PullRequestObservation
+    ) -> bool:
+        if not self._history_scanner_failed(pr):
+            return False
+        evidence_reader = getattr(self.github, "pr_failure_evidence", None)
+        if not callable(evidence_reader):
+            return False
+        try:
+            evidence = str(evidence_reader(pr))
+        except Exception:
+            return False
+        finding_commits = set(
+            re.findall(r"(?im)^\s*Commit:\s*([0-9a-f]{40})\s*$", evidence)
+        )
+        return bool(finding_commits and pr.head_sha not in finding_commits)
+
+    def _finalize_history_scanner_blocker(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+        workspace: dict[str, Any],
+        reason: str,
+    ) -> None:
+        worktree = self._workspace_path(workspace)
+        if worktree is None:
+            return
+        pending = self._uncommitted_workspace_paths(worktree)
+        if pending:
+            self._quarantine_worker(
+                issue,
+                plan,
+                job,
+                "history-scanner replacement requires a clean verified worktree: "
+                + ", ".join(pending),
+            )
+            return
+        try:
+            verification = run(
+                ["bash", "-c", job["verify_command"]],
+                cwd=worktree,
+                env=self._verification_environment(worktree),
+                timeout=1200,
+            )
+            scope_error = self._worker_workspace_error(
+                issue,
+                plan,
+                job,
+                workspace,
+                expected_head=pr.head_sha,
+            )
+            if scope_error:
+                self._quarantine_worker(issue, plan, job, scope_error)
+                return
+            replacement = self._publish_clean_history_replacement(
+                issue,
+                plan,
+                job,
+                pr,
+                worktree,
+                verification,
+            )
+        except (AuthorityUnavailable, CommandError, OSError) as exc:
+            error = f"clean-history replacement failed: {exc}"
+            self.database.update_job(job["job_id"], state="blocked", last_error=error)
+            self.notifier.send(
+                f"job:{job['job_id']}:clean-history-failed:{pr.head_sha}",
+                f"Alfred #{issue['number']} PR #{pr.number} could not publish its verified "
+                f"clean-history replacement: {exc}",
+                {"job": job["job_id"], "pr": pr.url},
+            )
+            return
+        evidence = verification.strip() or "(command exited 0 with no output)"
+        self.database.event(
+            "job.clean_history_replacement_pushed",
+            {
+                "old_pr": pr.number,
+                "from_sha": pr.head_sha,
+                "to_sha": replacement["head_sha"],
+                "replacement_branch": replacement["branch"],
+                "replacement_pr": replacement["pr_url"],
+                "reason": reason,
+                "verification": evidence[:4000],
             },
             issue_number=int(issue["number"]),
             job_id=job["job_id"],
         )
         self.notifier.send(
-            f"job:{job['job_id']}:repair-pushed:{new_sha}",
-            f"Alfred #{issue['number']} PR #{pr.number} received scoped repair commit {new_sha[:12]}; CI and an independent exact-SHA review will run again.",
-            {"job": job["job_id"], "pr": pr.url, "sha": new_sha},
+            f"job:{job['job_id']}:clean-history:{replacement['head_sha']}",
+            f"Alfred #{issue['number']} replaced history-scanner-blocked PR #{pr.number} "
+            f"with {replacement['pr_url']} at clean head {replacement['head_sha'][:12]}; "
+            "no history was rewritten or deleted.",
+            {
+                "job": job["job_id"],
+                "old_pr": pr.url,
+                "pr": replacement["pr_url"],
+                "sha": replacement["head_sha"],
+            },
         )
+
+    def _publish_clean_history_replacement(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+        worktree: Path,
+        verification: str,
+    ) -> dict[str, str]:
+        """Publish the verified final tree on a new branch without rewriting history."""
+        original_branch = str(job["branch"])
+        attempt = int(job.get("repair_attempts") or 0)
+        replacement_branch = f"{original_branch}-clean-r{attempt}"
+        base_sha = self._job_base_sha(plan, job)
+        intended = run(
+            ["git", "diff", "--name-only", f"{base_sha}...HEAD"],
+            cwd=worktree,
+            timeout=30,
+        ).splitlines()
+        if not intended:
+            raise AuthorityUnavailable(
+                "clean-history replacement has no approved implementation diff"
+            )
+        outside = [
+            path
+            for path in intended
+            if not any(path_matches(path, allowed) for allowed in job["paths"])
+        ]
+        if outside:
+            raise AuthorityUnavailable(
+                "clean-history replacement escaped its approved scope: "
+                + ", ".join(outside)
+            )
+        self._prepare_branch(replacement_branch, base_sha)
+        run(["git", "switch", replacement_branch], cwd=worktree, timeout=60)
+        run(["git", "merge", "--squash", original_branch], cwd=worktree, timeout=300)
+        staged = run(
+            ["git", "diff", "--cached", "--name-only"], cwd=worktree, timeout=30
+        ).splitlines()
+        if set(staged) != set(intended):
+            raise AuthorityUnavailable(
+                "clean-history staged diff does not match the verified implementation tree"
+            )
+        deleted = run(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=D"],
+            cwd=worktree,
+            timeout=30,
+        ).splitlines()
+        if deleted:
+            raise AuthorityUnavailable(
+                "clean-history replacement would delete files: " + ", ".join(deleted)
+            )
+        run(
+            self._trusted_commit_command(
+                job,
+                f"feat: {job['title']} (#{issue['number']}, lane {job['lane']}, clean history)",
+            ),
+            cwd=worktree,
+            env=self._verification_environment(worktree),
+            timeout=1200,
+        )
+        head_sha = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+        run(
+            ["git", "push", "-u", "origin", replacement_branch],
+            cwd=worktree,
+            timeout=300,
+        )
+        evidence = verification.strip() or "(command exited 0 with no output)"
+        body = (
+            pr.body.rstrip()
+            + "\n\n## Clean-history replacement\n\n"
+            + f"Replaces #{pr.number} after its history-scanning secret check found a "
+            "non-secret example in an earlier commit. The trusted controller rebuilt this "
+            "branch from the approved base with the same verified final tree; it did not "
+            "force-push or delete the original branch.\n\n"
+            + f"Latest trusted verification: `{job['verify_command']}`\n\n"
+            + f"```text\n{evidence[:12000]}\n```"
+        )
+        pr_url = self.github.create_pr(
+            branch=replacement_branch,
+            title=f"{issue['title']} (lane {job['lane']}, clean history)",
+            body=body,
+        )
+        self.database.rotate_job_delivery_branch(
+            str(job["job_id"]),
+            expected_branch=original_branch,
+            replacement_branch=replacement_branch,
+            pr_url=pr_url,
+            head_sha=head_sha,
+        )
+        self.github.invalidate_pr(original_branch)
+        self.github.invalidate_pr(replacement_branch)
+        try:
+            self.github.close_pr(
+                pr.number,
+                f"Replaced by {pr_url} using the same verified final tree on a clean-history "
+                "branch. The original branch and commits are retained; no force-push or deletion "
+                "was used.",
+            )
+        except Exception as exc:
+            self.notifier.send(
+                f"job:{job['job_id']}:old-pr-close-failed:{pr.number}:{head_sha}",
+                f"Alfred #{issue['number']} published clean replacement {pr_url}, but could not "
+                f"close old PR #{pr.number}: {exc}",
+                {"job": job["job_id"], "old_pr": pr.url, "pr": pr_url},
+            )
+        return {
+            "branch": replacement_branch,
+            "head_sha": head_sha,
+            "pr_url": pr_url,
+        }
 
     @staticmethod
     def _job_base_sha(plan: dict[str, Any], job: dict[str, Any]) -> str:

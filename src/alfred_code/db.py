@@ -1933,6 +1933,62 @@ class Database:
                 )
         return self.get_job(job_id) or {}
 
+    def rotate_job_delivery_branch(
+        self,
+        job_id: str,
+        *,
+        expected_branch: str,
+        replacement_branch: str,
+        pr_url: str,
+        head_sha: str,
+    ) -> dict[str, Any]:
+        """Bind a job to a new non-destructive delivery branch.
+
+        This is intentionally narrower than making ``branch`` a generic mutable
+        job field. It is used only when a history-scanning CI check cannot be
+        repaired by an additive commit and the original branch is retained.
+        """
+        if not replacement_branch.startswith(f"{expected_branch}-clean-r"):
+            raise ValueError("replacement branch is not derived from the approved branch")
+        with self.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if previous is None:
+                raise KeyError(f"job {job_id} not found")
+            if str(previous["branch"]) != expected_branch:
+                raise ValueError(
+                    f"job {job_id} branch changed before clean-history rotation"
+                )
+            if str(previous["state"]) != "repairing":
+                raise ValueError(
+                    f"job {job_id} must be repairing before clean-history rotation"
+                )
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET branch=?, state='pr_open', pr_number=NULL, pr_url=?, head_sha=?,
+                    review_sha=NULL, review_workspace_id=NULL, review_agent_id=NULL,
+                    review_requested_at=NULL, last_error=NULL, updated_at=?
+                WHERE job_id=?
+                """,
+                (replacement_branch, pr_url, head_sha, now, job_id),
+            )
+            self.event(
+                "job.delivery_branch_rotated",
+                {
+                    "from_branch": expected_branch,
+                    "to_branch": replacement_branch,
+                    "pr_url": pr_url,
+                    "head_sha": head_sha,
+                },
+                issue_number=int(previous["issue_number"]),
+                job_id=job_id,
+                connection=conn,
+            )
+        return self.get_job(job_id) or {}
+
     def acquire_lane(self, lane: str, job_id: str) -> bool:
         now = utcnow()
         with self.transaction() as conn:
