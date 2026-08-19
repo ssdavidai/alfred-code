@@ -1636,7 +1636,7 @@ class Controller:
             ),
         ) if job.get("review_sha") == pr.head_sha else None
         if verdict is None and job.get("review_sha") == pr.head_sha and job.get("review_workspace_id"):
-            if self._publish_review_result(issue, job, pr):
+            if self._publish_review_result(issue, plan, job, pr):
                 return
             verdict = self.github.review_verdict(
                 pr.number,
@@ -3369,6 +3369,7 @@ class Controller:
     def _publish_review_result(
         self,
         issue: dict[str, Any],
+        plan: dict[str, Any],
         job: dict[str, Any],
         pr: PullRequestObservation,
     ) -> bool:
@@ -3420,6 +3421,10 @@ class Controller:
         result = self._load_result(worktree / REVIEW_RESULT)
         if result is None:
             launch_status = self._load_launch_status(worktree)
+            if self._restart_dead_reviewer(
+                issue, plan, job, pr, worktree, launch_status
+            ):
+                return True
             launch_error = self._launch_status_error(launch_status)
             if not launch_error and self._launch_status_timed_out(
                 job, launch_status, timestamp_field="review_requested_at"
@@ -3459,6 +3464,108 @@ class Controller:
         )
         self.github.post_pr_comment(pr.number, body)
         return False
+
+    @staticmethod
+    def _launch_pid_is_dead(status: dict[str, Any] | None) -> bool:
+        if not status or str(status.get("status") or "") != "running":
+            return False
+        pid = status.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
+
+    def _restart_dead_reviewer(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+        worktree: Path,
+        launch_status: dict[str, Any] | None,
+    ) -> bool:
+        """Restart one exact-SHA reviewer whose recorded local process vanished."""
+        if not self._launch_pid_is_dead(launch_status):
+            return False
+        issue_number = int(issue["number"])
+        previous = self.database.latest_event(issue_number, "job.review_restarted")
+        detail = (previous or {}).get("detail", {})
+        if (
+            str(detail.get("job_id") or "") == str(job["job_id"])
+            and str(detail.get("head_sha") or "") == pr.head_sha
+        ):
+            error = (
+                "scoped reviewer process stopped again after its one automatic "
+                f"exact-SHA restart for {pr.head_sha}"
+            )
+            self.database.update_job(job["job_id"], state="blocked", last_error=error)
+            self.notifier.send(
+                f"job:{job['job_id']}:review-restart-exhausted:{pr.head_sha}",
+                f"Alfred #{issue_number} independent review stopped twice at "
+                f"{pr.head_sha[:12]} and is blocked for operator attention.",
+                {"job": job["job_id"], "workspace": job.get("review_workspace_id")},
+            )
+            return True
+        started_at = utcnow()
+        write_launch_status(
+            worktree,
+            "retrying",
+            provider="controller-recovery",
+            role="reviewer",
+            controller_job=job["job_id"],
+            reason="recorded reviewer process no longer exists",
+            started_at=started_at,
+        )
+        try:
+            agent_id = self.superset.start_agent(
+                str(job["review_workspace_id"]),
+                self.config.superset.reviewer_agent,
+                self.reviewer_prompt(issue, plan, job, pr),
+            )
+        except Exception as exc:
+            error = f"scoped reviewer restart failed: {exc}"
+            write_launch_status(
+                worktree,
+                "failed",
+                provider="controller-recovery",
+                role="reviewer",
+                controller_job=job["job_id"],
+                reason=error[:500],
+                started_at=started_at,
+                finished_at=utcnow(),
+            )
+            self.database.update_job(job["job_id"], state="blocked", last_error=error)
+            return True
+        self.database.update_job(
+            job["job_id"],
+            state="reviewing",
+            review_agent_id=agent_id,
+            review_requested_at=started_at,
+            last_error=None,
+        )
+        self.database.event(
+            "job.review_restarted",
+            {
+                "job_id": job["job_id"],
+                "head_sha": pr.head_sha,
+                "workspace": job.get("review_workspace_id"),
+                "missing_pid": int((launch_status or {}).get("pid") or 0),
+            },
+            issue_number=issue_number,
+            job_id=job["job_id"],
+        )
+        self.notifier.send(
+            f"job:{job['job_id']}:review-restarted:{pr.head_sha}",
+            f"Alfred #{issue_number} safely restarted a vanished independent "
+            f"reviewer at exact SHA {pr.head_sha[:12]}.",
+            {"job": job["job_id"], "workspace": job.get("review_workspace_id")},
+        )
+        return True
 
     def _worker_workspace_name(self, issue_number: int, lane: str, job_id: str) -> str:
         return worker_workspace_name(

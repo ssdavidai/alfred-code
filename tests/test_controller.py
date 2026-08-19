@@ -2963,6 +2963,77 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("exit code 70", job["last_error"])
         self.assertEqual(self.github.review_comments, [])
 
+    def test_dead_running_reviewer_restarts_once_for_the_exact_sha(self):
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        sha = self.sha
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "## Smoke evidence\nreal output",
+        )
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        review_workspace = job["review_workspace_id"]
+        self.superset.details[review_workspace]["worktreePath"] = str(self.repo)
+        (self.repo / ".lane").write_text(
+            json.dumps(
+                {
+                    "lane": "review",
+                    "issue": 12,
+                    "allowed": [],
+                    "verify": "true",
+                    "controller_job": "api-12",
+                    "role": "reviewer",
+                    "security_policy": "alfred-scoped-v1",
+                }
+            )
+        )
+        missing_pid = 2_000_000_000
+        write_launch_status(
+            self.repo,
+            "running",
+            provider="codex",
+            role="reviewer",
+            controller_job="api-12",
+            pid=missing_pid,
+            started_at="2026-01-01T00:00:00Z",
+        )
+
+        self.controller.run_once()
+
+        restarted = self.db.get_job("api-12")
+        self.assertEqual(restarted["state"], "reviewing")
+        self.assertEqual(self.superset.agent_starts, 1)
+        self.assertEqual(self.db.event_count(12, "job.review_restarted"), 1)
+        launch = json.loads((self.repo / LAUNCH_STATUS).read_text())
+        self.assertEqual(launch["status"], "retrying")
+
+        write_launch_status(
+            self.repo,
+            "running",
+            provider="codex",
+            role="reviewer",
+            controller_job="api-12",
+            pid=missing_pid,
+            started_at="2026-01-01T00:00:01Z",
+        )
+        self.controller.run_once()
+
+        blocked = self.db.get_job("api-12")
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertIn("stopped again", blocked["last_error"])
+        self.assertEqual(self.superset.agent_starts, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
