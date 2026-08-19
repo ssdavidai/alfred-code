@@ -220,7 +220,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--dry-run", action="store_true", help="Force read-only observation")
 
     dashboard = sub.add_parser(
-        "dashboard", help="Run the read-only local operations dashboard"
+        "dashboard", help="Run the loopback-only local operations dashboard"
     )
     dashboard.add_argument("--host", default="127.0.0.1", help="Loopback address to bind")
     dashboard.add_argument("--port", type=int, default=7331, help="Local port to bind")

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
+from urllib import error, request
 
 import pytest
 
 from alfred_code import dashboard
 from alfred_code.config import ControllerConfig
 from alfred_code.config import GitHubConfig
-from alfred_code.dashboard import DashboardData, TelemetryScanner, serve_dashboard
+from alfred_code.dashboard import (
+    DashboardData,
+    DashboardHTTPServer,
+    TelemetryScanner,
+    serve_dashboard,
+)
 from alfred_code.db import Database
 
 
@@ -73,6 +80,135 @@ def test_closed_github_issue_cannot_render_in_an_active_column(tmp_path: Path) -
     assert snapshot["issues"][0]["column"] == "done"
     assert next(column for column in snapshot["columns"] if column["id"] == "backlog")["count"] == 0
     assert next(column for column in snapshot["columns"] if column["id"] == "done")["count"] == 1
+
+
+def test_needs_split_card_exposes_reason_proposed_children_and_action(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.upsert_issue(
+        {
+            "number": 42,
+            "title": "Large feature",
+            "body": "Build several bounded parts.",
+            "state": "OPEN",
+            "url": "https://example.test/issues/42",
+            "labels": [],
+        }
+    )
+    plan = {
+        "schema": 1,
+        "issue": 42,
+        "base_sha": "a" * 40,
+        "summary": "Split the contract from implementation.",
+        "risk": "high",
+        "story_points": 21,
+        "points_evidence": "Cross-lane contract and implementation work exceeds one delivery.",
+        "issue_dependencies": [],
+        "jobs": [
+            {
+                "id": "contract-42",
+                "lane": "phase0",
+                "title": "Freeze contract",
+                "paths": ["contracts/feature.md"],
+                "verify": "pytest tests/contracts",
+                "contracts_read": [],
+                "contracts_changed": ["contracts/feature.md"],
+                "depends_on": [],
+                "acceptance": ["Contract passes."],
+            }
+        ],
+    }
+    digest = "f" * 64
+    database.save_plan(42, digest, plan)
+    database.mark_plan_needs_split(42, digest)
+    database.close()
+
+    data = DashboardData(config)
+    data.telemetry.sessions = lambda: []  # type: ignore[method-assign]
+    snapshot = data.snapshot()
+    card = snapshot["issues"][0]
+
+    assert card["column"] == "needs_split"
+    assert card["plan"]["points_evidence"].startswith("Cross-lane")
+    assert card["plan"]["proposed_jobs"] == [
+        {
+            "id": "contract-42",
+            "lane": "phase0",
+            "title": "Freeze contract",
+            "paths": ["contracts/feature.md"],
+            "verify": "pytest tests/contracts",
+            "contracts_read": [],
+            "contracts_changed": ["contracts/feature.md"],
+            "depends_on": [],
+            "acceptance": ["Contract passes."],
+        }
+    ]
+    assert card["split"] is None
+    assert snapshot["runtime"]["controlled_actions"] == ["start_sprint", "split_issue"]
+
+
+def test_split_http_action_requires_token_and_dispatches_explicit_click(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.close()
+    data = DashboardData(config)
+    calls = []
+    data.split_issue = lambda number: calls.append(number) or {  # type: ignore[method-assign]
+        "status": "completed"
+    }
+    server = DashboardHTTPServer(("127.0.0.1", 0), data, b"dashboard")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/issues/42/split"
+    try:
+        denied = request.Request(
+            url,
+            data=json.dumps({"token": "wrong"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(error.HTTPError) as raised:
+            request.urlopen(denied, timeout=2)
+        assert raised.value.code == 403
+        assert calls == []
+
+        allowed = request.Request(
+            url,
+            data=json.dumps({"token": server.action_token}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(allowed, timeout=2) as response:
+            payload = json.loads(response.read())
+        assert payload["split"]["status"] == "completed"
+        assert calls == [42]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_dashboard_html_keeps_split_creation_behind_operator_button() -> None:
+    html = (
+        Path(__file__).parents[1]
+        / "src"
+        / "alfred_code"
+        / "static"
+        / "dashboard.html"
+    ).read_text()
+
+    assert "Why this needs splitting" in html
+    assert "Split into ${proposedJobs.length} child issue" in html
+    assert "Nothing has been created yet" in html
+    assert "splitIssue(number)" in html
 
 
 def test_codex_session_uses_last_cumulative_token_count(tmp_path: Path) -> None:

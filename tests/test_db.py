@@ -64,6 +64,64 @@ class DatabaseTests(unittest.TestCase):
         self.database.release_lane("job-7")
         self.assertIsNone(self.database.lease_owner("I"))
 
+    def test_split_state_is_durable_and_requires_every_child_ready(self):
+        digest = "s" * 64
+        plan = {
+            **self.plan,
+            "story_points": 21,
+            "points_evidence": "Too large for one delivery.",
+            "issue_dependencies": [],
+        }
+        child = {
+            "job_id": "job-7",
+            "marker": "<!-- split:7:job-7 -->",
+            "title": "job",
+            "lane": "I",
+        }
+        self.database.save_plan(7, digest, plan)
+        self.database.mark_plan_needs_split(7, digest)
+
+        started = self.database.begin_issue_split(7, digest, [child])
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["children"][0]["spec"], child)
+        with self.assertRaisesRegex(RuntimeError, "unfinished"):
+            self.database.complete_issue_split(7, digest, None)
+
+        self.database.record_split_child_created(
+            7, digest, "job-7", 70, "https://example/issues/70"
+        )
+        self.database.record_split_child_linked(7, digest, "job-7")
+        self.database.record_split_child_projected(7, digest, "job-7")
+        completed = self.database.complete_issue_split(
+            7, digest, "https://example/issues/7#split"
+        )
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["children"][0]["child_issue_number"], 70)
+        self.assertEqual(self.database.get_issue(7)["product_stage"], "needs_split")
+
+    def test_schema_seven_migrates_split_tables(self):
+        path = Path(self.temp.name) / "schema-seven.sqlite3"
+        legacy = Database(path)
+        legacy.connection.execute("UPDATE schema_meta SET version=7")
+        legacy.close()
+
+        migrated = Database(path)
+        self.addCleanup(migrated.close)
+        tables = {
+            row["name"]
+            for row in migrated.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+
+        self.assertEqual(
+            migrated.connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+        self.assertIn("issue_splits", tables)
+        self.assertIn("issue_split_children", tables)
+
     def test_finalize_closed_issue_supersedes_current_plan_and_preserves_history(self):
         digest = "p" * 64
         self.database.save_plan(7, digest, self.plan)
