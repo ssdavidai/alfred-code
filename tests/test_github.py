@@ -31,6 +31,25 @@ class FakeGitHub(GitHubClient):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_issue_normalization_preserves_closure_evidence(self):
+        issue = GitHubClient._normalize_issue(
+            {
+                "node_id": "I_7",
+                "number": 7,
+                "title": "Closed work",
+                "state": "closed",
+                "state_reason": "not_planned",
+                "closed_at": "2026-08-19T09:00:00Z",
+                "closed_by": {"login": "ssdavidai"},
+                "html_url": "https://github.com/owner/repo/issues/7",
+            }
+        )
+
+        self.assertEqual(issue["state"], "CLOSED")
+        self.assertEqual(issue["stateReason"], "not_planned")
+        self.assertEqual(issue["closedAt"], "2026-08-19T09:00:00Z")
+        self.assertEqual(issue["closedBy"], "ssdavidai")
+
     def test_cycle_cache_reuses_issue_and_comment_observations(self):
         client = GitHubClient(
             GitHubConfig(
@@ -74,6 +93,7 @@ class GitHubTests(unittest.TestCase):
 
         client._json = fake_json
         self.assertEqual(client.open_issues()[0]["title"], "cached")
+        self.assertEqual(client.open_issues()[0]["url"], "https://example/issues/7")
         self.assertEqual(len(client.open_issues()), 1)
         self.assertEqual(client.issue(7)["title"], "cached")
         self.assertEqual(client.issue_comments(7), client.issue_comments(7))

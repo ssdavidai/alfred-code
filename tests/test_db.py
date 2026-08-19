@@ -64,6 +64,65 @@ class DatabaseTests(unittest.TestCase):
         self.database.release_lane("job-7")
         self.assertIsNone(self.database.lease_owner("I"))
 
+    def test_finalize_closed_issue_supersedes_current_plan_and_preserves_history(self):
+        digest = "p" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+
+        changed = self.database.finalize_closed_issue(
+            7,
+            completed=False,
+            detail={"state_reason": "not_planned", "closed_by": "ssdavidai"},
+        )
+
+        self.assertTrue(changed)
+        issue = self.database.get_issue(7)
+        self.assertEqual(issue["controller_state"], "closed")
+        self.assertEqual(issue["product_stage"], "done")
+        self.assertIsNone(issue["current_plan_hash"])
+        plan = self.database.connection.execute(
+            "SELECT status, superseded_at FROM plans WHERE plan_hash=?", (digest,)
+        ).fetchone()
+        self.assertEqual(plan["status"], "superseded")
+        self.assertIsNotNone(plan["superseded_at"])
+        approval = self.database.connection.execute(
+            "SELECT revoked_at FROM approvals WHERE plan_hash=?", (digest,)
+        ).fetchone()
+        self.assertIsNotNone(approval["revoked_at"])
+        event = self.database.latest_event(7, "issue.closed_reconciled")
+        self.assertEqual(event["detail"]["plan_disposition"], "superseded")
+        self.assertEqual(event["detail"]["state_reason"], "not_planned")
+
+    def test_finalize_completed_issue_retains_completed_plan_for_audit(self):
+        digest = "p" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.record_approval(7, digest, "ssdavidai", "99", None, "now")
+        self.database.materialize_jobs(7, digest, self.plan)
+        self.database.update_job("job-7", state="merged")
+
+        self.database.finalize_closed_issue(7, completed=True)
+
+        issue = self.database.get_issue(7)
+        self.assertEqual(issue["controller_state"], "completed")
+        self.assertEqual(issue["current_plan_hash"], digest)
+        self.assertEqual(self.database.current_plan(7)["status"], "completed")
+
+    def test_reopen_issue_clears_completed_plan_without_erasing_history(self):
+        digest = "p" * 64
+        self.database.save_plan(7, digest, self.plan)
+        self.database.finalize_closed_issue(7, completed=True)
+
+        self.database.reopen_issue(7)
+
+        issue = self.database.get_issue(7)
+        self.assertEqual(issue["controller_state"], "observed")
+        self.assertEqual(issue["product_stage"], "backlog")
+        self.assertIsNone(issue["current_plan_hash"])
+        historical = self.database.connection.execute(
+            "SELECT status FROM plans WHERE plan_hash=?", (digest,)
+        ).fetchone()
+        self.assertEqual(historical["status"], "completed")
+
     def test_non_active_job_transition_releases_its_lane_atomically(self):
         digest = "p" * 64
         self.database.save_plan(7, digest, self.plan)
@@ -338,6 +397,25 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.get_issue(8)["product_stage"], "inbox")
         self.assertEqual(self.database.get_issue(8)["carryover_replan"], 1)
         self.assertEqual(self.database.get_issue(8)["controller_state"], "planning")
+
+    def test_manually_closed_sprint_item_is_terminal_without_carryover(self):
+        self.database.set_product_stage(7, "sprint_queue")
+        sprint = self.database.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[7],
+        )
+        self.database.set_sprint_item_status(7, "closed")
+
+        self.database.close_active_sprint()
+
+        issue = self.database.get_issue(7)
+        self.assertEqual(issue["product_stage"], "done")
+        self.assertEqual(issue["carryover_replan"], 0)
+        self.assertEqual(self.database.sprint_items(sprint["id"])[0]["status"], "closed")
 
     def test_blocked_sprint_carryover_retires_failed_graph_for_inbox_replan(self):
         self.database.set_product_stage(7, "sprint_queue")

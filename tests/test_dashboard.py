@@ -46,6 +46,35 @@ def test_snapshot_maps_durable_state_without_writing(tmp_path: Path) -> None:
     assert config.database_path.read_bytes() == before
 
 
+def test_closed_github_issue_cannot_render_in_an_active_column(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.upsert_issue(
+        {
+            "number": 42,
+            "title": "Historically stale closure",
+            "body": "No longer active.",
+            "state": "CLOSED",
+            "url": "https://example.test/issues/42",
+            "labels": [],
+        }
+    )
+    database.set_issue_state(42, "awaiting_approval")
+    database.close()
+
+    data = DashboardData(config)
+    data.telemetry.sessions = lambda: []  # type: ignore[method-assign]
+    snapshot = data.snapshot()
+
+    assert snapshot["issues"][0]["column"] == "done"
+    assert next(column for column in snapshot["columns"] if column["id"] == "backlog")["count"] == 0
+    assert next(column for column in snapshot["columns"] if column["id"] == "done")["count"] == 1
+
+
 def test_codex_session_uses_last_cumulative_token_count(tmp_path: Path) -> None:
     path = tmp_path / "session.jsonl"
     records = [

@@ -121,7 +121,13 @@ class GitHubClient:
             "title": value.get("title"),
             "body": value.get("body"),
             "state": str(value.get("state") or "OPEN").upper(),
-            "url": value.get("url") or value.get("html_url"),
+            "stateReason": value.get("state_reason") or value.get("stateReason"),
+            "closedAt": value.get("closed_at") or value.get("closedAt"),
+            "closedBy": str(
+                (value.get("closed_by") or value.get("closedBy") or {}).get("login")
+                or ""
+            ),
+            "url": value.get("html_url") or value.get("url"),
             "labels": value.get("labels") or [],
             "updatedAt": value.get("updatedAt") or value.get("updated_at"),
         }

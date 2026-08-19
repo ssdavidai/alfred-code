@@ -485,6 +485,159 @@ class Database:
                 connection=conn,
             )
 
+    def finalize_closed_issue(
+        self,
+        number: int,
+        *,
+        completed: bool,
+        detail: dict[str, Any] | None = None,
+    ) -> bool:
+        """Atomically make a GitHub closure terminal without erasing its history."""
+        now = utcnow()
+        target_state = "completed" if completed else "closed"
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM issues WHERE number=?", (number,)).fetchone()
+            if row is None:
+                raise KeyError(f"issue #{number} not found")
+            plan_hash = str(row["current_plan_hash"] or "")
+            plan_changed = False
+            if plan_hash:
+                plan = conn.execute(
+                    "SELECT status FROM plans WHERE plan_hash=?", (plan_hash,)
+                ).fetchone()
+                if completed:
+                    if plan is not None and plan["status"] != "completed":
+                        conn.execute(
+                            "UPDATE plans SET status='completed' WHERE plan_hash=?",
+                            (plan_hash,),
+                        )
+                        plan_changed = True
+                else:
+                    if plan is not None and plan["status"] != "superseded":
+                        conn.execute(
+                            "UPDATE plans SET status='superseded', superseded_at=? "
+                            "WHERE plan_hash=?",
+                            (now, plan_hash),
+                        )
+                        plan_changed = True
+                    conn.execute(
+                        "UPDATE approvals SET revoked_at=COALESCE(revoked_at, ?) "
+                        "WHERE plan_hash=?",
+                        (now, plan_hash),
+                    )
+
+            state_changed = row["controller_state"] != target_state
+            product_changed = (
+                row["product_stage"] != "done"
+                or int(row["carryover_replan"]) != 0
+            )
+            clear_plan = bool(plan_hash and not completed)
+            if not (state_changed or product_changed or plan_changed or clear_plan):
+                return False
+
+            conn.execute(
+                "UPDATE issues SET controller_state=?, product_stage='done', "
+                "carryover_replan=0, current_plan_hash=CASE WHEN ? THEN NULL "
+                "ELSE current_plan_hash END, updated_at=? WHERE number=?",
+                (target_state, int(clear_plan), now, number),
+            )
+            if state_changed:
+                self.event(
+                    "issue.transition",
+                    {
+                        "from": row["controller_state"],
+                        "to": target_state,
+                        **(detail or {}),
+                    },
+                    issue_number=number,
+                    connection=conn,
+                )
+            if product_changed:
+                self.event(
+                    "product.transition",
+                    {
+                        "from": row["product_stage"],
+                        "to": "done",
+                        "rank": row["project_rank"],
+                        "reason": "GitHub issue reached a terminal state",
+                    },
+                    issue_number=number,
+                    connection=conn,
+                )
+            self.event(
+                "issue.closed_reconciled",
+                {
+                    "state": target_state,
+                    "plan_hash": plan_hash or None,
+                    "plan_disposition": (
+                        "completed" if completed and plan_hash else
+                        "superseded" if plan_hash else None
+                    ),
+                    **(detail or {}),
+                },
+                issue_number=number,
+                connection=conn,
+            )
+        return True
+
+    def reopen_issue(self, number: int) -> None:
+        """Return an explicitly reopened issue to a clean, unapproved backlog state."""
+        now = utcnow()
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM issues WHERE number=?", (number,)).fetchone()
+            if row is None:
+                raise KeyError(f"issue #{number} not found")
+            plan_hash = str(row["current_plan_hash"] or "")
+            if plan_hash:
+                plan = conn.execute(
+                    "SELECT status FROM plans WHERE plan_hash=?", (plan_hash,)
+                ).fetchone()
+                if plan is not None and plan["status"] != "completed":
+                    conn.execute(
+                        "UPDATE plans SET status='superseded', superseded_at=? "
+                        "WHERE plan_hash=?",
+                        (now, plan_hash),
+                    )
+                    conn.execute(
+                        "UPDATE approvals SET revoked_at=COALESCE(revoked_at, ?) "
+                        "WHERE plan_hash=?",
+                        (now, plan_hash),
+                    )
+            conn.execute(
+                "UPDATE issues SET controller_state='observed', product_stage='backlog', "
+                "current_plan_hash=NULL, carryover_replan=0, updated_at=? WHERE number=?",
+                (now, number),
+            )
+            if row["controller_state"] != "observed":
+                self.event(
+                    "issue.transition",
+                    {
+                        "from": row["controller_state"],
+                        "to": "observed",
+                        "reason": "GitHub issue reopened",
+                    },
+                    issue_number=number,
+                    connection=conn,
+                )
+            if row["product_stage"] != "backlog":
+                self.event(
+                    "product.transition",
+                    {
+                        "from": row["product_stage"],
+                        "to": "backlog",
+                        "rank": row["project_rank"],
+                        "reason": "GitHub issue reopened",
+                    },
+                    issue_number=number,
+                    connection=conn,
+                )
+            self.event(
+                "issue.reopened_reconciled",
+                {"retired_plan_hash": plan_hash or None},
+                issue_number=number,
+                connection=conn,
+            )
+
     def active_sprint(self) -> dict[str, Any] | None:
         return self._dict(
             self.connection.execute(
@@ -838,7 +991,7 @@ class Database:
                 (now, sprint["id"]),
             )
             for item in items:
-                stage = "done" if item["status"] == "done" else (
+                stage = "done" if item["status"] in {"done", "closed"} else (
                     "needs_split" if item["status"] == "needs_split" else "inbox"
                 )
                 carryover_replan = int(item["status"] == "blocked")
