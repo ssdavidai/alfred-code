@@ -12,6 +12,7 @@ from .util import content_hash, run, run_json, utcnow
 
 PLAN_MARKER = "<!-- alfred-code-plan:{plan_hash} -->"
 AUTO_REPLAN_MARKER = "<!-- alfred-code-auto-replan:{plan_hash}:{evidence_hash} -->"
+SPLIT_SUMMARY_MARKER = "<!-- alfred-code-split-summary:{issue_number}:{plan_hash} -->"
 REVIEW_RE = re.compile(r"<!-- alfred-code-review:([0-9a-f]{40,64}):(pass|fail) -->")
 
 
@@ -198,6 +199,135 @@ class GitHubClient:
         ).strip()
         self._issue_comments.pop(number, None)
         return result
+
+    def find_issue_by_marker(
+        self, marker: str, *, limit: int = 1000
+    ) -> dict[str, Any] | None:
+        """Recover a split child across restarts, including if it was later closed."""
+        return self.issues_by_markers({marker}, limit=limit).get(marker)
+
+    def issues_by_markers(
+        self,
+        markers: set[str],
+        *,
+        limit: int = 1000,
+    ) -> dict[str, dict[str, Any]]:
+        if not markers:
+            return {}
+        result = self._json(
+            [
+                "api",
+                f"repos/{self.config.repo}/issues?state=all&per_page=100",
+                "--paginate",
+                "--slurp",
+            ]
+        )
+        if not isinstance(result, list):
+            raise AuthorityUnavailable("GitHub issues endpoint returned a non-array response")
+        pages = result if result and all(isinstance(page, list) for page in result) else [result]
+        found: dict[str, dict[str, Any]] = {}
+        count = 0
+        for page in pages:
+            for value in page:
+                if not isinstance(value, dict) or value.get("pull_request"):
+                    continue
+                count += 1
+                body = str(value.get("body") or "")
+                for marker in markers.difference(found):
+                    if marker in body:
+                        found[marker] = self._normalize_issue(value)
+                if len(found) == len(markers):
+                    return found
+                if count >= limit:
+                    return found
+        return found
+
+    def create_issue(self, *, title: str, body: str) -> dict[str, Any]:
+        self.assert_trusted_operator()
+        value = self._json(
+            [
+                "api",
+                "--method",
+                "POST",
+                f"repos/{self.config.repo}/issues",
+                "-f",
+                f"title={title}",
+                "-f",
+                f"body={body}",
+            ]
+        )
+        issue = self._normalize_issue(value)
+        if issue.get("number") is None or not issue.get("url"):
+            raise AuthorityUnavailable("GitHub did not return the created issue identity")
+        number = int(issue["number"])
+        self._issues[number] = issue
+        if self._open_issues is not None:
+            self._open_issues.append(issue)
+        return issue
+
+    def sub_issues(self, parent_issue_number: int) -> list[dict[str, Any]]:
+        result = self._json(
+            [
+                "api",
+                f"repos/{self.config.repo}/issues/{parent_issue_number}/sub_issues?per_page=100",
+            ]
+        )
+        if not isinstance(result, list):
+            raise AuthorityUnavailable("GitHub sub-issues endpoint returned a non-array response")
+        return [self._normalize_issue(value) for value in result if isinstance(value, dict)]
+
+    def add_sub_issue(self, parent_issue_number: int, child_issue_number: int) -> None:
+        self.assert_trusted_operator()
+        if any(
+            int(issue.get("number") or 0) == child_issue_number
+            for issue in self.sub_issues(parent_issue_number)
+        ):
+            return
+        child = self._json(
+            ["api", f"repos/{self.config.repo}/issues/{child_issue_number}"]
+        )
+        try:
+            child_database_id = int(child["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AuthorityUnavailable(
+                f"GitHub issue #{child_issue_number} has no numeric database id"
+            ) from exc
+        self._json(
+            [
+                "api",
+                "--method",
+                "POST",
+                f"repos/{self.config.repo}/issues/{parent_issue_number}/sub_issues",
+                "-F",
+                f"sub_issue_id={child_database_id}",
+            ]
+        )
+
+    def post_split_summary(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        children: list[dict[str, Any]],
+    ) -> str | None:
+        marker = SPLIT_SUMMARY_MARKER.format(
+            issue_number=issue_number,
+            plan_hash=plan_hash,
+        )
+        for comment in self.issue_comments(issue_number):
+            if self._is_trusted_comment(comment) and marker in str(comment.get("body") or ""):
+                return comment.get("html_url")
+        lines = [
+            marker,
+            "## Split into independently plannable child issues",
+            "",
+            f"The 21-point plan `{plan_hash[:12]}` was split only after an explicit dashboard action. The parent remains open as the epic; every child starts in **Inbox** and must be prioritized into a future sprint before any agent plans or builds it.",
+            "",
+        ]
+        lines.extend(
+            f"- #{int(child['child_issue_number'])} — {child['spec']['title']}"
+            for child in children
+        )
+        return self.post_issue_comment(issue_number, "\n".join(lines))
 
     def post_auto_replan(
         self,

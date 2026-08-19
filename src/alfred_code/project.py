@@ -38,7 +38,7 @@ Start the queued sprint from the local Alfred dashboard or with `alfred-code spr
 
 Approved work takes the highest-priority runnable lane without bypassing dependencies or scoped agent permissions. Superset owns isolated execution workspaces; GitHub issues, pull requests, checks, and immutable controller events remain authoritative. Nothing merges automatically.
 
-A sprint closes when every card is Done or terminally Blocked. Done means merged. Blocked cards return to the top of Inbox with their specification, point estimate, token history, and blocker intact. A 21-point estimate is routed to Needs splitting and cannot be approved as one delivery.
+A sprint closes when every card is Done or terminally Blocked. Done means merged. Blocked cards return to the top of Inbox with their specification, point estimate, token history, and blocker intact. A 21-point estimate is routed to Needs splitting and cannot be approved as one delivery. Open that card in the local dashboard to see the evidence and proposed boundaries; only the operator's Split action creates native child issues, and those children start agent-silent in Inbox.
 """
 
 

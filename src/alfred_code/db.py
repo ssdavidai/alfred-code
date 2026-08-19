@@ -16,7 +16,7 @@ from .states import (
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA = """
@@ -52,6 +52,38 @@ CREATE TABLE IF NOT EXISTS plans (
     superseded_at TEXT
 );
 CREATE INDEX IF NOT EXISTS plans_issue_idx ON plans(issue_number, created_at);
+
+CREATE TABLE IF NOT EXISTS issue_splits (
+    parent_issue_number INTEGER NOT NULL REFERENCES issues(number),
+    plan_hash TEXT NOT NULL REFERENCES plans(plan_hash),
+    status TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    completed_at TEXT,
+    summary_comment_url TEXT,
+    last_error TEXT,
+    PRIMARY KEY(parent_issue_number, plan_hash)
+);
+
+CREATE TABLE IF NOT EXISTS issue_split_children (
+    parent_issue_number INTEGER NOT NULL,
+    plan_hash TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    marker TEXT NOT NULL UNIQUE,
+    spec_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    child_issue_number INTEGER,
+    child_url TEXT,
+    created_at TEXT,
+    linked_at TEXT,
+    project_synced_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY(parent_issue_number, plan_hash, job_id),
+    FOREIGN KEY(parent_issue_number, plan_hash)
+        REFERENCES issue_splits(parent_issue_number, plan_hash)
+);
+CREATE INDEX IF NOT EXISTS issue_split_children_child_idx
+    ON issue_split_children(child_issue_number);
 
 CREATE TABLE IF NOT EXISTS approvals (
     plan_hash TEXT PRIMARY KEY REFERENCES plans(plan_hash),
@@ -195,7 +227,7 @@ class Database:
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             return
-        if row["version"] not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
+        if row["version"] not in {1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION}:
             raise RuntimeError(
                 f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
             )
@@ -1111,6 +1143,284 @@ class Database:
                 connection=conn,
             )
         return True
+
+    def begin_issue_split(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        children: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not children:
+            raise ValueError("a split requires at least one child issue")
+        now = utcnow()
+        with self.transaction() as conn:
+            current = conn.execute(
+                """
+                SELECT i.current_plan_hash, i.product_stage, p.status
+                FROM issues i
+                LEFT JOIN plans p ON p.plan_hash=i.current_plan_hash
+                WHERE i.number=?
+                """,
+                (issue_number,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"issue #{issue_number} not found")
+            if current["current_plan_hash"] != plan_hash:
+                raise RuntimeError("the requested split is not the issue's current plan")
+            if current["status"] != "needs_split" or current["product_stage"] != "needs_split":
+                raise RuntimeError("only the current Needs splitting plan can create child issues")
+
+            split = conn.execute(
+                "SELECT * FROM issue_splits WHERE parent_issue_number=? AND plan_hash=?",
+                (issue_number, plan_hash),
+            ).fetchone()
+            if split is None:
+                conn.execute(
+                    """
+                    INSERT INTO issue_splits(
+                        parent_issue_number, plan_hash, status, requested_at
+                    ) VALUES (?, ?, 'running', ?)
+                    """,
+                    (issue_number, plan_hash, now),
+                )
+                for ordinal, child in enumerate(children):
+                    conn.execute(
+                        """
+                        INSERT INTO issue_split_children(
+                            parent_issue_number, plan_hash, job_id, ordinal, marker,
+                            spec_json, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                        """,
+                        (
+                            issue_number,
+                            plan_hash,
+                            str(child["job_id"]),
+                            ordinal,
+                            str(child["marker"]),
+                            canonical_json(child),
+                        ),
+                    )
+                self.event(
+                    "split.requested",
+                    {"plan_hash": plan_hash, "children": len(children)},
+                    issue_number=issue_number,
+                    connection=conn,
+                )
+            elif split["status"] != "completed":
+                stored = {
+                    row["job_id"]: row["spec_json"]
+                    for row in conn.execute(
+                        """
+                        SELECT job_id, spec_json FROM issue_split_children
+                        WHERE parent_issue_number=? AND plan_hash=?
+                        """,
+                        (issue_number, plan_hash),
+                    )
+                }
+                proposed = {
+                    str(child["job_id"]): canonical_json(child) for child in children
+                }
+                if stored != proposed:
+                    raise RuntimeError("stored split boundaries differ from the current plan")
+                conn.execute(
+                    """
+                    UPDATE issue_splits SET status='running', last_error=NULL
+                    WHERE parent_issue_number=? AND plan_hash=?
+                    """,
+                    (issue_number, plan_hash),
+                )
+                self.event(
+                    "split.resumed",
+                    {"plan_hash": plan_hash},
+                    issue_number=issue_number,
+                    connection=conn,
+                )
+        return self.issue_split(issue_number, plan_hash) or {}
+
+    def issue_split(
+        self,
+        issue_number: int,
+        plan_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        if plan_hash is None:
+            current = self.connection.execute(
+                "SELECT current_plan_hash FROM issues WHERE number=?", (issue_number,)
+            ).fetchone()
+            plan_hash = str(current["current_plan_hash"] or "") if current else ""
+        if not plan_hash:
+            return None
+        row = self.connection.execute(
+            "SELECT * FROM issue_splits WHERE parent_issue_number=? AND plan_hash=?",
+            (issue_number, plan_hash),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["children"] = []
+        for child in self.connection.execute(
+            """
+            SELECT * FROM issue_split_children
+            WHERE parent_issue_number=? AND plan_hash=?
+            ORDER BY ordinal, job_id
+            """,
+            (issue_number, plan_hash),
+        ):
+            value = dict(child)
+            value["spec"] = json.loads(value.pop("spec_json"))
+            result["children"].append(value)
+        return result
+
+    def record_split_child_created(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        job_id: str,
+        child_issue_number: int,
+        child_url: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE issue_split_children
+                SET status='created', child_issue_number=?, child_url=?,
+                    created_at=COALESCE(created_at, ?), last_error=NULL
+                WHERE parent_issue_number=? AND plan_hash=? AND job_id=?
+                """,
+                (
+                    child_issue_number,
+                    child_url,
+                    utcnow(),
+                    issue_number,
+                    plan_hash,
+                    job_id,
+                ),
+            )
+            self.event(
+                "split.child_created",
+                {
+                    "plan_hash": plan_hash,
+                    "job_id": job_id,
+                    "child_issue_number": child_issue_number,
+                    "url": child_url,
+                },
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def record_split_child_linked(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        job_id: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE issue_split_children SET status='linked', linked_at=?, last_error=NULL
+                WHERE parent_issue_number=? AND plan_hash=? AND job_id=?
+                """,
+                (utcnow(), issue_number, plan_hash, job_id),
+            )
+
+    def record_split_child_projected(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        job_id: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE issue_split_children
+                SET status='ready', project_synced_at=?, last_error=NULL
+                WHERE parent_issue_number=? AND plan_hash=? AND job_id=?
+                """,
+                (utcnow(), issue_number, plan_hash, job_id),
+            )
+            self.event(
+                "split.child_ready",
+                {"plan_hash": plan_hash, "job_id": job_id},
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def fail_split_child(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        job_id: str,
+        error: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE issue_split_children SET status='failed', last_error=?
+                WHERE parent_issue_number=? AND plan_hash=? AND job_id=?
+                """,
+                (error, issue_number, plan_hash, job_id),
+            )
+            self.event(
+                "split.child_failed",
+                {"plan_hash": plan_hash, "job_id": job_id, "error": error},
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def fail_issue_split(self, issue_number: int, plan_hash: str, error: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE issue_splits SET status='failed', last_error=?
+                WHERE parent_issue_number=? AND plan_hash=?
+                """,
+                (error, issue_number, plan_hash),
+            )
+            self.event(
+                "split.failed",
+                {"plan_hash": plan_hash, "error": error},
+                issue_number=issue_number,
+                connection=conn,
+            )
+
+    def complete_issue_split(
+        self,
+        issue_number: int,
+        plan_hash: str,
+        summary_comment_url: str | None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.transaction() as conn:
+            pending = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM issue_split_children
+                WHERE parent_issue_number=? AND plan_hash=? AND status!='ready'
+                """,
+                (issue_number, plan_hash),
+            ).fetchone()
+            if int(pending["count"] if pending else 0):
+                raise RuntimeError("cannot complete a split while child issues are unfinished")
+            split = conn.execute(
+                "SELECT status FROM issue_splits WHERE parent_issue_number=? AND plan_hash=?",
+                (issue_number, plan_hash),
+            ).fetchone()
+            if split is None:
+                raise KeyError("split record disappeared")
+            if split["status"] != "completed":
+                conn.execute(
+                    """
+                    UPDATE issue_splits SET status='completed', completed_at=?,
+                        summary_comment_url=?, last_error=NULL
+                    WHERE parent_issue_number=? AND plan_hash=?
+                    """,
+                    (now, summary_comment_url, issue_number, plan_hash),
+                )
+                self.event(
+                    "split.completed",
+                    {"plan_hash": plan_hash, "summary_comment_url": summary_comment_url},
+                    issue_number=issue_number,
+                    connection=conn,
+                )
+        return self.issue_split(issue_number, plan_hash) or {}
 
     def invalidate_plan(self, issue_number: int, reason: str) -> None:
         now = utcnow()

@@ -22,6 +22,7 @@ from .config import ControllerConfig
 from .db import Database
 from .github import GitHubClient
 from .project import ProjectBoard
+from .splits import IssueSplitter
 from .sprints import SprintManager
 
 
@@ -70,6 +71,7 @@ PLANNER_SCHEMA_ISSUE_RE = re.compile(r"alfred-code-plan-(\d+)-")
 PLANNER_MODEL_RE = re.compile(r"(?:^|\s)--model\s+(\S+)")
 PLANNER_EFFORT_RE = re.compile(r"(?:^|\s)--effort\s+(\S+)")
 CODEX_EFFORT_RE = re.compile(r'model_reasoning_effort\s*=\s*\\?["\']?([a-z]+)', re.I)
+SPLIT_ACTION_RE = re.compile(r"^/api/issues/([1-9][0-9]*)/split$")
 
 
 def _json(value: str | None, fallback: Any) -> Any:
@@ -580,6 +582,7 @@ class DashboardData:
     def __init__(self, config: ControllerConfig):
         self.config = config
         self.telemetry = TelemetryScanner(config.database_path)
+        self._split_lock = threading.Lock()
 
     @staticmethod
     def _connect(path: Path) -> sqlite3.Connection:
@@ -659,6 +662,29 @@ class DashboardData:
                 """
             )
         }
+        splits: dict[int, dict[str, Any]] = {}
+        for row in connection.execute(
+            """
+            SELECT s.* FROM issue_splits s JOIN issues i
+            ON i.number=s.parent_issue_number AND i.current_plan_hash=s.plan_hash
+            ORDER BY s.parent_issue_number
+            """
+        ):
+            split = dict(row)
+            split["children"] = []
+            splits[int(split["parent_issue_number"])] = split
+        for row in connection.execute(
+            """
+            SELECT c.* FROM issue_split_children c JOIN issues i
+            ON i.number=c.parent_issue_number AND i.current_plan_hash=c.plan_hash
+            ORDER BY c.parent_issue_number, c.ordinal, c.job_id
+            """
+        ):
+            child = dict(row)
+            child["spec"] = _json(child.pop("spec_json", "{}"), {})
+            split = splits.get(int(child["parent_issue_number"]))
+            if split is not None:
+                split["children"].append(child)
         sprints = [dict(row) for row in connection.execute("SELECT * FROM sprints ORDER BY number DESC")]
         sprint_items: dict[int, list[dict[str, Any]]] = defaultdict(list)
         latest_sprint_item: dict[int, dict[str, Any]] = {}
@@ -683,6 +709,7 @@ class DashboardData:
             "event_rows": event_rows,
             "first_events": first_events,
             "plan_stats": plan_stats,
+            "splits": splits,
             "sprints": sprints,
             "sprint_items": sprint_items,
             "latest_sprint_item": latest_sprint_item,
@@ -763,6 +790,20 @@ class DashboardData:
                             "story_points": plan.get("story_points"),
                             "points_evidence": plan.get("points_evidence"),
                             "issue_dependencies": plan.get("issue_dependencies") or [],
+                            "proposed_jobs": [
+                                {
+                                    "id": job.get("id"),
+                                    "lane": job.get("lane"),
+                                    "title": job.get("title"),
+                                    "paths": job.get("paths") or [],
+                                    "verify": job.get("verify"),
+                                    "contracts_read": job.get("contracts_read") or [],
+                                    "contracts_changed": job.get("contracts_changed") or [],
+                                    "depends_on": job.get("depends_on") or [],
+                                    "acceptance": job.get("acceptance") or [],
+                                }
+                                for job in plan.get("jobs") or []
+                            ],
                         }
                         if plan_row
                         else None
@@ -770,6 +811,7 @@ class DashboardData:
                     "plan_count": int(stats.get("plan_count") or 0),
                     "invalidated_count": int(stats.get("invalidated_count") or 0),
                     "jobs": state["jobs_by_issue"].get(number, []),
+                    "split": state["splits"].get(number),
                     "sessions": issue_sessions,
                     "tokens": token_totals,
                     "models": model_names,
@@ -971,7 +1013,9 @@ class DashboardData:
                 "database": str(self.config.database_path),
                 "read_only": not bool(self.config.github.project_number),
                 "controlled_actions": (
-                    ["start_sprint"] if self.config.github.project_number else []
+                    ["start_sprint", "split_issue"]
+                    if self.config.github.project_number
+                    else []
                 ),
             },
         }
@@ -993,6 +1037,21 @@ class DashboardData:
             ).start(title=title, duration_days=duration_days)
         finally:
             database.close()
+
+    def split_issue(self, issue_number: int) -> dict[str, Any]:
+        if not self._split_lock.acquire(blocking=False):
+            raise RuntimeError("another issue split is already running")
+        database = Database(self.config.database_path)
+        try:
+            return IssueSplitter(
+                self.config,
+                database,
+                ProjectBoard(self.config.github),
+                GitHubClient(self.config.github),
+            ).split(issue_number)
+        finally:
+            database.close()
+            self._split_lock.release()
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -1049,7 +1108,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/healthz":
-            body = b'{"ok":true,"controlled_actions":["start_sprint"]}'
+            body = b'{"ok":true,"controlled_actions":["start_sprint","split_issue"]}'
             self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(body))
             self.wfile.write(body)
             return
@@ -1059,7 +1118,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path != "/api/sprints/start":
+        split_match = SPLIT_ACTION_RE.fullmatch(path)
+        if path != "/api/sprints/start" and split_match is None:
             body = b'{"error":"unsupported action"}'
             self._headers(HTTPStatus.METHOD_NOT_ALLOWED, "application/json", len(body))
             self.wfile.write(body)
@@ -1077,16 +1137,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if payload.get("token") != self.server.action_token:
                 raise PermissionError("invalid dashboard action token")
-            result = self.server.dashboard_data.start_sprint(
-                title=str(payload.get("title") or "").strip() or None,
-                duration_days=(
-                    int(payload["duration_days"])
-                    if payload.get("duration_days") is not None
-                    else None
-                ),
-            )
-            body = json.dumps({"sprint": result}, separators=(",", ":")).encode()
-            status = HTTPStatus.CREATED
+            if split_match is not None:
+                result = self.server.dashboard_data.split_issue(int(split_match.group(1)))
+                body = json.dumps({"split": result}, separators=(",", ":")).encode()
+                status = HTTPStatus.OK
+            else:
+                result = self.server.dashboard_data.start_sprint(
+                    title=str(payload.get("title") or "").strip() or None,
+                    duration_days=(
+                        int(payload["duration_days"])
+                        if payload.get("duration_days") is not None
+                        else None
+                    ),
+                )
+                body = json.dumps({"sprint": result}, separators=(",", ":")).encode()
+                status = HTTPStatus.CREATED
         except PermissionError as exc:
             body = json.dumps({"error": str(exc)}).encode()
             status = HTTPStatus.FORBIDDEN
@@ -1110,7 +1175,12 @@ def serve_dashboard(
     html = html_path.read_bytes()
     server = DashboardHTTPServer((host, port), DashboardData(config), html)
     url = f"http://{host}:{server.server_address[1]}"
-    print(json.dumps({"dashboard": url, "controlled_actions": ["start_sprint"]}), flush=True)
+    print(
+        json.dumps(
+            {"dashboard": url, "controlled_actions": ["start_sprint", "split_issue"]}
+        ),
+        flush=True,
+    )
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

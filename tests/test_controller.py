@@ -1158,6 +1158,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(self.db.active_sprint())
         self.assertEqual(self.db.current_plan(12)["status"], "needs_split")
         self.assertEqual(self.db.get_issue(12)["product_stage"], "needs_split")
+        self.assertIsNone(self.db.issue_split(12))
         self.assertEqual(self.superset.worker_creates, 0)
         self.assertEqual(result["sprint"]["state"], "closed")
 

@@ -159,6 +159,106 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(result, "https://example/pr/7")
         self.assertNotIn(branch, client._pull_requests)
 
+    def test_create_issue_uses_rest_and_populates_observation_cache(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+        client._open_issues = []
+        calls = []
+        client._json = lambda arguments, timeout=120: calls.append(arguments) or {
+            "id": 99,
+            "node_id": "I_99",
+            "number": 99,
+            "state": "open",
+            "title": "Child",
+            "body": "marker",
+            "html_url": "https://example/issues/99",
+        }
+
+        issue = client.create_issue(title="Child", body="marker")
+
+        self.assertEqual(issue["number"], 99)
+        self.assertEqual(client.issue(99), issue)
+        self.assertEqual(client.open_issues(), [issue])
+        self.assertEqual(
+            calls,
+            [[
+                "api",
+                "--method",
+                "POST",
+                "repos/owner/repo/issues",
+                "-f",
+                "title=Child",
+                "-f",
+                "body=marker",
+            ]],
+        )
+
+    def test_issue_marker_recovery_scans_all_states_once(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        calls = []
+        client._json = lambda arguments, timeout=120: calls.append(arguments) or [[
+            {
+                "id": 12,
+                "number": 12,
+                "state": "closed",
+                "title": "Old child",
+                "body": "<!-- child:one -->",
+                "html_url": "https://example/issues/12",
+            },
+            {
+                "id": 13,
+                "number": 13,
+                "state": "open",
+                "title": "New child",
+                "body": "<!-- child:two -->",
+                "html_url": "https://example/issues/13",
+            },
+        ]]
+
+        found = client.issues_by_markers({"<!-- child:one -->", "<!-- child:two -->"})
+
+        self.assertEqual(found["<!-- child:one -->"]["state"], "CLOSED")
+        self.assertEqual(found["<!-- child:two -->"]["number"], 13)
+        self.assertEqual(len(calls), 1)
+
+    def test_add_sub_issue_is_idempotent_and_uses_numeric_database_id(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+        calls = []
+
+        def fake_json(arguments, timeout=120):
+            calls.append(arguments)
+            if arguments[-1].endswith("sub_issues?per_page=100"):
+                return []
+            if arguments[-1] == "repos/owner/repo/issues/8":
+                return {"id": 808, "number": 8}
+            if len(arguments) > 3 and arguments[3] == "repos/owner/repo/issues/7/sub_issues":
+                return {"id": 808, "number": 8}
+            raise AssertionError(arguments)
+
+        client._json = fake_json
+
+        client.add_sub_issue(7, 8)
+
+        self.assertEqual(
+            calls[-1],
+            [
+                "api",
+                "--method",
+                "POST",
+                "repos/owner/repo/issues/7/sub_issues",
+                "-F",
+                "sub_issue_id=808",
+            ],
+        )
+
+        calls.clear()
+        client._json = lambda arguments, timeout=120: calls.append(arguments) or [
+            {"id": 808, "number": 8, "state": "open"}
+        ]
+        client.add_sub_issue(7, 8)
+        self.assertEqual(len(calls), 1)
+
     def test_close_and_reopen_issue_use_explicit_state_commands_and_invalidate_cache(self):
         client = GitHubClient(
             GitHubConfig(repo="owner/repo", owner="owner", approvers=("owner",))
