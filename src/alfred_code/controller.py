@@ -1724,6 +1724,10 @@ class Controller:
         maximum = self.config.superset.review_repair_max_attempts
         attempts = int(job.get("repair_attempts") or 0)
         if attempts >= maximum:
+            if self._recover_completed_history_scanner_blocker(
+                issue, plan, job, pr
+            ):
+                return
             error = (
                 f"automated validation failed after {attempts} bounded repair attempt(s); "
                 "operator attention is required"
@@ -1886,6 +1890,82 @@ class Controller:
                 "attempt": attempt,
             },
         )
+
+    def _recover_completed_history_scanner_blocker(
+        self,
+        issue: dict[str, Any],
+        plan: dict[str, Any],
+        job: dict[str, Any],
+        pr: PullRequestObservation,
+    ) -> bool:
+        """Recover a bounded repair that an older controller terminalized.
+
+        The recovery is deliberately narrower than reopening arbitrary blocked
+        jobs: the durable launch and result markers must still be bound to the
+        current PR head, repair token, and final attempt, and GitHub's failing
+        history scanner must identify an older commit rather than the final
+        verified tree.
+        """
+        if (
+            job.get("state") not in {"blocked", "quarantined"}
+            or str(job.get("repair_sha") or "") != pr.head_sha
+            or not self._history_scanner_points_to_older_commits(pr)
+        ):
+            return False
+        workspace_id = str(job.get("workspace_id") or "")
+        if not workspace_id:
+            return False
+        details = self.superset.workspace_details(workspace_id)
+        self.database.observe("superset", f"workspace:{workspace_id}", details)
+        worktree = self._workspace_path(details)
+        if worktree is None:
+            return False
+        attempt = int(job.get("repair_attempts") or 0)
+        launch_status = self._load_launch_status(worktree)
+        result = self._load_result(worktree / WORKER_RESULT)
+        if not (
+            launch_status
+            and str(launch_status.get("status") or "") == "completed"
+            and str(launch_status.get("mode") or "") == "repair"
+            and str(launch_status.get("head_sha") or "") == pr.head_sha
+            and type(launch_status.get("attempt")) is int
+            and launch_status["attempt"] == attempt
+            and result
+            and str(result.get("status") or "") == "blocked"
+            and str(result.get("head_sha") or "") == pr.head_sha
+            and str(result.get("handoff_token") or "")
+            == str(job.get("repair_token") or "")
+            and type(result.get("attempt")) is int
+            and result["attempt"] == attempt
+        ):
+            return False
+        reason = str(result.get("reason") or "")[:1000]
+        if not any(
+            token in reason.lower()
+            for token in ("historical", "history rewrite", "squash")
+        ):
+            return False
+        self.database.update_job(job["job_id"], state="repairing", last_error=None)
+        self.database.event(
+            "job.clean_history_recovery_started",
+            {
+                "pr": pr.number,
+                "head_sha": pr.head_sha,
+                "attempt": attempt,
+                "reason": reason,
+            },
+            issue_number=int(issue["number"]),
+            job_id=job["job_id"],
+        )
+        self._finalize_history_scanner_blocker(
+            issue,
+            plan,
+            self.database.get_job(job["job_id"]) or job,
+            pr,
+            details,
+            reason,
+        )
+        return True
 
     def _resume_legacy_review_repair(
         self,

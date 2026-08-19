@@ -2468,6 +2468,84 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("operator attention", capped["last_error"])
         self.assertEqual(self.superset.agent_starts, 1)
 
+    def test_capped_historical_gitleaks_repair_recovers_after_restart(self):
+        self.controller.config = replace(
+            self.config,
+            superset=replace(self.config.superset, review_repair_max_attempts=1),
+        )
+        remote, pr, repairing = self.launch_failed_review_repair()
+        self.github.prs[repairing["branch"]] = replace(
+            pr,
+            ci="RED",
+            checks=(
+                {
+                    "name": "gitleaks",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/123/job/456",
+                },
+            ),
+        )
+        self.github.failure_evidence = (
+            "Finding: Generic API Key\n"
+            f"Commit: {self.sha}\n"
+            "File: file.txt\n"
+        )
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the historical finding requires a squash onto the approved base",
+                    "head_sha": pr.head_sha,
+                    "handoff_token": repairing["repair_token"],
+                    "attempt": 1,
+                }
+            )
+        )
+        self.write_launch_status(
+            "completed",
+            exit_code=0,
+            mode="repair",
+            head_sha=pr.head_sha,
+            attempt=1,
+        )
+        self.db.update_job(
+            "api-12",
+            state="blocked",
+            last_error=(
+                "automated validation failed after 1 bounded repair attempt(s); "
+                "operator attention is required"
+            ),
+        )
+        self.db.release_lane("api-12")
+
+        self.controller.run_once()
+
+        recovered = self.db.get_job("api-12")
+        self.assertEqual(recovered["state"], "pr_open")
+        self.assertEqual(recovered["branch"], "lane-1/12-api-clean-r1")
+        self.assertEqual(self.github.created_prs[-1]["branch"], recovered["branch"])
+        self.assertEqual(self.github.closed_prs[-1][0], 5)
+        replacement_count = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "rev-list",
+                "--count",
+                f"{self.sha}..refs/heads/{recovered['branch']}",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(replacement_count, "1")
+        self.assertTrue(
+            any(
+                event["kind"] == "job.clean_history_recovery_started"
+                for event in self.db.events(20)
+            )
+        )
+
     def test_issue_scope_drift_blocks_active_work(self):
         self.controller.run_once()
         self.approve()
