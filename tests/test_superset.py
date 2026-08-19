@@ -71,6 +71,24 @@ class SupersetTests(unittest.TestCase):
         self.assertEqual(lane["role"], "worker")
         self.assertEqual(lane["security_policy"], "alfred-scoped-v1")
 
+    def test_sprint_integration_workspace_has_no_autonomous_agent(self):
+        client = FakeSuperset()
+
+        workspace = client.create_integration_workspace(
+            repo_path=Path("/repo"),
+            sprint_number=4,
+            branch="alfred-code/sprint-4-integration",
+        )
+
+        self.assertEqual(workspace.branch, "alfred-code/sprint-4-integration")
+        create = next(call for call in client.calls if call[:2] == ["workspaces", "create"])
+        self.assertEqual(
+            create[create.index("--name") + 1], "alfred-code-sprint-4-integration"
+        )
+        self.assertNotIn("--agent", create)
+        self.assertNotIn("--prompt", create)
+        self.assertNotIn("--command", create)
+
     def test_review_workspace_uses_a_distinct_exact_sha_branch(self):
         client = FakeSuperset()
 

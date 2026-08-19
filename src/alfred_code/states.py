@@ -5,6 +5,7 @@ ISSUE_STATES = {
     "approved",
     "building",
     "ready_merge",
+    "integrated",
     "completed",
     "blocked",
     "closed",
@@ -23,6 +24,7 @@ PRODUCT_STAGES = {
 SPRINT_STATES = {"active", "closed"}
 SPRINT_ITEM_STATES = {
     "active",
+    "integrated",
     "done",
     "closed",
     "blocked",
@@ -66,6 +68,7 @@ PROJECT_STATUS = {
     "approved": "Queued",
     "building": "Building",
     "ready_merge": "Ready to merge",
+    "integrated": "Ready to merge",
     "completed": "Done",
     "blocked": "Blocked",
     "closed": "Done",

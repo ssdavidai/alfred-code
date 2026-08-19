@@ -159,6 +159,29 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(result, "https://example/pr/7")
         self.assertNotIn(branch, client._pull_requests)
 
+    def test_guarded_merge_is_bound_to_the_reviewed_head_without_admin_bypass(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+        calls = []
+        client._run = lambda arguments, timeout=120: calls.append(arguments) or ""
+
+        client.merge_pr(17, head_sha="a" * 40)
+
+        self.assertEqual(
+            calls,
+            [[
+                "pr",
+                "merge",
+                "17",
+                "--repo",
+                "owner/repo",
+                "--squash",
+                "--match-head-commit",
+                "a" * 40,
+            ]],
+        )
+        self.assertNotIn("--admin", calls[0])
+
     def test_create_issue_uses_rest_and_populates_observation_cache(self):
         client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
         client._authenticated_login = TRUSTED_GITHUB_OPERATOR

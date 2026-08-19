@@ -216,6 +216,7 @@ class PreparedPlan:
     decision_context_hash: str
     policy: LanePolicy
     prompt: str
+    checkout_path: Path
 
 
 class Planner:
@@ -311,7 +312,7 @@ ISSUE BODY:
 OPERATOR DECISION COMMENTS:
 {json.dumps(decision_comments, indent=2)}
 
-PINNED DEFAULT-BRANCH SHA:
+PINNED DELIVERY-BRANCH SHA:
 {base_sha}
 
 OPEN PULL REQUESTS:
@@ -352,12 +353,35 @@ Estimate the whole issue, not individual jobs. Use this calibration: 1 is a triv
 Rules: normally use one job per lane, and always one agent per job. Jobs in different lanes must not have overlapping write paths. Every job path is an enforced write capability: use an exact file or an explicit directory subtree ending in `/**`; never use filename globs such as `test_*.py`, and never widen a failed filename glob to its parent directory. If a trusted `alfred-code-auto-replan` evidence block reports a launch-scope-policy failure, replace the unsupported glob with the exact files required by the remaining work. If it reports a lane scope-limit failure, decompose only that lane into multiple small jobs: give each a distinct ID and branch, order them with an explicit dependency chain, keep every individual job below the reported cap, and repeat a write path only when sequential work genuinely must modify the same file. The controller still permits only one active agent in a lane. If that evidence reports an absent cross-lane contract, add one phase0 contract job before its consumers; do not let a lane invent the interface. If it reports missing declared Python dependencies, retain the authoritative full verification because the controller provisions those dependencies in an isolated environment. Preserve completed PR work listed in the evidence instead of planning it again. Use phase0 only for forbidden-zone or contract changes, and make every downstream lane depend directly on it. Identify all impacted lanes from actual code. Do not invent lanes VI/VII unless the live authority defines them. Every verify command must exercise the real package. Never include merge, deletion, deployment, or secret-reading steps.
 """
 
-    def prepare_plans(self, issue_numbers: list[int]) -> list[PreparedPlan]:
+    def prepare_plans(
+        self,
+        issue_numbers: list[int],
+        *,
+        base_sha: str | None = None,
+        checkout_path: Path | None = None,
+    ) -> list[PreparedPlan]:
         """Capture shared repository evidence once before parallel model execution."""
         if not issue_numbers:
             return []
-        base_sha = self.github.default_branch_sha()
-        verify_default_branch_checkout(self.config.repo_path, base_sha)
+        requested_base = base_sha
+        base_sha = requested_base or self.github.default_branch_sha()
+        if requested_base is None:
+            verify_default_branch_checkout(self.config.repo_path, base_sha)
+        else:
+            run(
+                ["git", "cat-file", "-e", f"{base_sha}^{{commit}}"],
+                cwd=self.config.repo_path,
+                timeout=30,
+            )
+        checkout = (checkout_path or self.config.repo_path).resolve()
+        checkout_head = run(["git", "rev-parse", "HEAD"], cwd=checkout, timeout=30).strip()
+        if checkout_head != base_sha:
+            raise PlanValidationError(
+                [
+                    f"planner checkout {checkout} is {checkout_head[:12]}, expected pinned "
+                    f"delivery SHA {base_sha[:12]}"
+                ]
+            )
         policy, policy_text = self.policy_at(base_sha)
         evidence = self.repository_evidence(base_sha)
         open_prs = self.github.open_prs()
@@ -386,6 +410,7 @@ Rules: normally use one job per lane, and always one agent per job. Jobs in diff
                         open_prs=open_prs,
                         evidence=evidence,
                     ),
+                    checkout_path=checkout,
                 )
             )
         return prepared
@@ -408,7 +433,7 @@ Rules: normally use one job per lane, and always one agent per job. Jobs in diff
                         prepared.base_sha,
                         schema_path=schema_path,
                     ),
-                    cwd=self.config.repo_path,
+                    cwd=prepared.checkout_path,
                     input_text=prepared.prompt,
                     timeout=self.config.planner_timeout_seconds,
                 )
@@ -419,7 +444,7 @@ Rules: normally use one job per lane, and always one agent per job. Jobs in diff
                     prepared.issue_number,
                     prepared.base_sha,
                 ),
-                cwd=self.config.repo_path,
+                cwd=prepared.checkout_path,
                 input_text=prepared.prompt,
                 timeout=self.config.planner_timeout_seconds,
             )

@@ -87,6 +87,9 @@ class ControllerConfig:
     max_parallel_planners: int = 3
     auto_replan_max_attempts: int = 2
     sprint_duration_days: int = 14
+    sprint_integration_enabled: bool = False
+    sprint_auto_merge: bool = False
+    sprint_verify_command: str = "git diff --check"
     planner_command: tuple[str, ...] = DEFAULT_PLANNER_COMMAND
     planner_timeout_seconds: int = 900
     github: GitHubConfig = field(default_factory=GitHubConfig)
@@ -158,6 +161,9 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         max_parallel_planners=int(raw.get("max_parallel_planners", 3)),
         auto_replan_max_attempts=int(raw.get("auto_replan_max_attempts", 2)),
         sprint_duration_days=int(raw.get("sprint_duration_days", 14)),
+        sprint_integration_enabled=bool(raw.get("sprint_integration_enabled", False)),
+        sprint_auto_merge=bool(raw.get("sprint_auto_merge", False)),
+        sprint_verify_command=str(raw.get("sprint_verify_command", "git diff --check")),
         planner_command=tuple(planner),
         planner_timeout_seconds=int(raw.get("planner_timeout_seconds", 900)),
         github=GitHubConfig(
@@ -208,6 +214,12 @@ def load_config(path: Path | None = None) -> ControllerConfig:
         raise ConfigurationError("auto_replan_max_attempts must be between 0 and 5")
     if not 1 <= config.sprint_duration_days <= 42:
         raise ConfigurationError("sprint_duration_days must be between 1 and 42")
+    if config.sprint_auto_merge and not config.sprint_integration_enabled:
+        raise ConfigurationError(
+            "sprint_auto_merge requires sprint_integration_enabled"
+        )
+    if not config.sprint_verify_command.strip():
+        raise ConfigurationError("sprint_verify_command must not be empty")
     if config.superset.worker_launch_timeout_seconds < 30:
         raise ConfigurationError("superset.worker_launch_timeout_seconds must be at least 30")
     if config.superset.worker_progress_timeout_seconds < 60:
