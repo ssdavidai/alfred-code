@@ -311,6 +311,52 @@ class GitHubTests(unittest.TestCase):
         approval = client.find_approval(5, digest)
         self.assertEqual(approval["comment_id"], "3")
 
+    def test_dashboard_approval_post_is_exact_trusted_and_idempotent(self):
+        digest = "a" * 64
+        client = FakeGitHub()
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+        client.comments = [
+            {
+                "id": 1,
+                "body": f"/approve-plan {digest}",
+                "user": {"login": "intruder"},
+                "html_url": "https://example/untrusted",
+            }
+        ]
+
+        created = client.post_plan_approval(5, digest)
+
+        self.assertTrue(created["created"])
+        self.assertEqual(created["actor"], TRUSTED_GITHUB_OPERATOR)
+        self.assertEqual(client.posts, [(5, f"/approve-plan {digest}")])
+
+        client = FakeGitHub()
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+        client.comments = [
+            {
+                "id": 2,
+                "body": f"/approve-plan {digest}\n",
+                "user": {"login": TRUSTED_GITHUB_OPERATOR},
+                "html_url": "https://example/trusted",
+            }
+        ]
+
+        existing = client.post_plan_approval(5, digest)
+
+        self.assertFalse(existing["created"])
+        self.assertEqual(existing["comment_id"], "2")
+        self.assertEqual(existing["comment_url"], "https://example/trusted")
+        self.assertEqual(client.posts, [])
+
+    def test_dashboard_approval_requires_full_lowercase_hash(self):
+        client = FakeGitHub()
+        client._authenticated_login = TRUSTED_GITHUB_OPERATOR
+
+        with self.assertRaisesRegex(ValueError, "full 64-character lowercase hash"):
+            client.post_plan_approval(5, "a" * 12)
+        with self.assertRaisesRegex(ValueError, "full 64-character lowercase hash"):
+            client.post_plan_approval(5, "A" * 64)
+
     def test_latest_exact_decision_wins_and_feedback_is_distinct(self):
         client = FakeGitHub()
         digest = "d" * 64

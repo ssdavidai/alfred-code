@@ -72,6 +72,8 @@ PLANNER_MODEL_RE = re.compile(r"(?:^|\s)--model\s+(\S+)")
 PLANNER_EFFORT_RE = re.compile(r"(?:^|\s)--effort\s+(\S+)")
 CODEX_EFFORT_RE = re.compile(r'model_reasoning_effort\s*=\s*\\?["\']?([a-z]+)', re.I)
 SPLIT_ACTION_RE = re.compile(r"^/api/issues/([1-9][0-9]*)/split$")
+APPROVE_ACTION_RE = re.compile(r"^/api/issues/([1-9][0-9]*)/approve$")
+PLAN_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _json(value: str | None, fallback: Any) -> Any:
@@ -583,6 +585,7 @@ class DashboardData:
         self.config = config
         self.telemetry = TelemetryScanner(config.database_path)
         self._split_lock = threading.Lock()
+        self._approval_lock = threading.Lock()
 
     @staticmethod
     def _connect(path: Path) -> sqlite3.Connection:
@@ -1013,7 +1016,7 @@ class DashboardData:
                 "database": str(self.config.database_path),
                 "read_only": not bool(self.config.github.project_number),
                 "controlled_actions": (
-                    ["start_sprint", "split_issue"]
+                    ["start_sprint", "split_issue", "approve_plan"]
                     if self.config.github.project_number
                     else []
                 ),
@@ -1052,6 +1055,44 @@ class DashboardData:
         finally:
             database.close()
             self._split_lock.release()
+
+    def approve_plan(self, issue_number: int, plan_hash: str) -> dict[str, Any]:
+        if not self.config.github.project_number:
+            raise RuntimeError("dashboard approval requires a configured GitHub project")
+        if PLAN_HASH_RE.fullmatch(plan_hash) is None:
+            raise ValueError("plan approval requires the full 64-character lowercase hash")
+        if not self._approval_lock.acquire(blocking=False):
+            raise RuntimeError("another plan approval is already being submitted")
+        database = Database(self.config.database_path)
+        try:
+            issue = database.get_issue(issue_number)
+            if issue is None:
+                raise ValueError(f"issue #{issue_number} is not tracked")
+            if str(issue.get("github_state") or "").upper() != "OPEN":
+                raise ValueError(f"issue #{issue_number} is closed")
+            current = database.current_plan(issue_number)
+            if current is None:
+                raise ValueError(f"issue #{issue_number} has no current plan")
+            if current["plan_hash"] != plan_hash:
+                raise ValueError(
+                    "this plan is stale; refresh the dashboard and review the current plan"
+                )
+            if current["status"] != "awaiting_approval":
+                raise ValueError(
+                    f"plan {plan_hash[:12]} is {current['status'].replace('_', ' ')}, not awaiting approval"
+                )
+            if issue["controller_state"] != "awaiting_approval":
+                raise ValueError(
+                    f"issue #{issue_number} is {str(issue['controller_state']).replace('_', ' ')}, not awaiting approval"
+                )
+            if int(current["plan"].get("story_points") or 0) == 21:
+                raise ValueError("21-point plans must be split before they can be approved")
+            return GitHubClient(self.config.github).post_plan_approval(
+                issue_number, plan_hash
+            )
+        finally:
+            database.close()
+            self._approval_lock.release()
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -1108,7 +1149,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/healthz":
-            body = b'{"ok":true,"controlled_actions":["start_sprint","split_issue"]}'
+            body = b'{"ok":true,"controlled_actions":["start_sprint","split_issue","approve_plan"]}'
             self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(body))
             self.wfile.write(body)
             return
@@ -1119,7 +1160,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         split_match = SPLIT_ACTION_RE.fullmatch(path)
-        if path != "/api/sprints/start" and split_match is None:
+        approve_match = APPROVE_ACTION_RE.fullmatch(path)
+        if path != "/api/sprints/start" and split_match is None and approve_match is None:
             body = b'{"error":"unsupported action"}'
             self._headers(HTTPStatus.METHOD_NOT_ALLOWED, "application/json", len(body))
             self.wfile.write(body)
@@ -1141,6 +1183,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.dashboard_data.split_issue(int(split_match.group(1)))
                 body = json.dumps({"split": result}, separators=(",", ":")).encode()
                 status = HTTPStatus.OK
+            elif approve_match is not None:
+                result = self.server.dashboard_data.approve_plan(
+                    int(approve_match.group(1)),
+                    str(payload.get("plan_hash") or ""),
+                )
+                body = json.dumps({"approval": result}, separators=(",", ":")).encode()
+                status = HTTPStatus.CREATED if result.get("created") else HTTPStatus.OK
             else:
                 result = self.server.dashboard_data.start_sprint(
                     title=str(payload.get("title") or "").strip() or None,
@@ -1177,7 +1226,10 @@ def serve_dashboard(
     url = f"http://{host}:{server.server_address[1]}"
     print(
         json.dumps(
-            {"dashboard": url, "controlled_actions": ["start_sprint", "split_issue"]}
+            {
+                "dashboard": url,
+                "controlled_actions": ["start_sprint", "split_issue", "approve_plan"],
+            }
         ),
         flush=True,
     )

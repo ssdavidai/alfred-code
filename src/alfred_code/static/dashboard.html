@@ -246,6 +246,20 @@
     .split-card .job-meta { line-height: 1.55; }
     .split-card a { color: var(--blue); text-decoration: none; }
     .split-card a:hover { text-decoration: underline; }
+    .plan-brief { padding: 15px; border: 1px solid #3f4d44; border-radius: 11px; background: linear-gradient(145deg, var(--panel-2), var(--panel)); }
+    .plan-summary { color: var(--text); font-size: 13px; line-height: 1.58; }
+    .plan-evidence { margin-top: 11px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .plan-fingerprint { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; line-height: 1.6; overflow-wrap: anywhere; }
+    .plan-list { display: grid; gap: 10px; margin-top: 10px; }
+    .plan-job { padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .plan-job-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .plan-job-id { margin-top: 4px; color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
+    .plan-field { margin-top: 12px; }
+    .plan-field-label { color: var(--dim); font-size: 9px; letter-spacing: .045em; text-transform: uppercase; }
+    .plan-field-value { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+    .plan-field-value.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+    .acceptance-list { display: grid; gap: 6px; margin: 6px 0 0; padding-left: 17px; color: var(--text); font-size: 11px; line-height: 1.5; }
+    .approval-note { margin-top: 10px; padding: 10px 11px; border: 1px solid #3d5b48; border-radius: 8px; background: var(--green-soft); color: #b6d9c1; font-size: 10px; line-height: 1.5; }
     .session { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
     .session-model { color: var(--text); font-size: 11px; }
     .session-role { color: var(--dim); font-size: 10px; }
@@ -382,7 +396,16 @@
   </aside>
 
   <script>
-    const state = { snapshot: null, view: 'board', selected: null, query: '', loading: false, splitting: new Set() };
+    const state = {
+      snapshot: null,
+      view: 'board',
+      selected: null,
+      query: '',
+      loading: false,
+      splitting: new Set(),
+      approving: new Set(),
+      submittedApprovals: new Map()
+    };
     const $ = (id) => document.getElementById(id);
 
     function node(tag, className, text) {
@@ -555,6 +578,31 @@
       }
     }
 
+    async function approvePlan(number, planHash) {
+      if (state.approving.has(number)) return;
+      state.approving.add(number);
+      openIssue(number);
+      try {
+        const response = await fetch(`/api/issues/${number}/approve`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            token: state.snapshot.runtime.action_token,
+            plan_hash: planHash
+          })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Plan approval failed: ${response.status}`);
+        state.submittedApprovals.set(number, planHash);
+        await refresh();
+      } catch (error) {
+        window.alert(error.message);
+      } finally {
+        state.approving.delete(number);
+        if (state.selected === number) openIssue(number);
+      }
+    }
+
     function renderBoard() {
       const board = $('board');
       board.replaceChildren();
@@ -696,6 +744,78 @@
       return value;
     }
 
+    function appendPlanField(container, label, values, options = {}) {
+      const normalized = Array.isArray(values) ? values.filter(Boolean) : [values].filter(Boolean);
+      const field = node('div', 'plan-field');
+      field.append(node('div', 'plan-field-label', label));
+      const value = node(
+        'div',
+        `plan-field-value${options.mono ? ' mono' : ''}`,
+        normalized.length ? normalized.join(options.separator || ', ') : (options.empty || 'None')
+      );
+      field.append(value);
+      container.append(field);
+    }
+
+    function renderPlan(issue) {
+      const plan = issue.plan;
+      const section = node('section', 'detail-section');
+      const awaiting = plan.status === 'awaiting_approval' && issue.state === 'awaiting_approval';
+      section.append(node('h3', '', awaiting ? 'Plan for approval' : 'Execution plan'));
+
+      const brief = node('div', 'plan-brief');
+      brief.append(node('div', 'plan-summary', plan.summary || 'No summary supplied.'));
+      if (plan.points_evidence) {
+        brief.append(node('div', 'plan-evidence', `Estimate evidence: ${plan.points_evidence}`));
+      }
+      brief.append(
+        node(
+          'div',
+          'plan-fingerprint',
+          `PLAN ${plan.hash}\nBASE ${plan.base_sha}\nApproval is bound to this exact plan and base commit.`
+        )
+      );
+      section.append(brief);
+
+      const proposedJobs = plan.proposed_jobs || [];
+      const list = node('div', 'plan-list');
+      proposedJobs.forEach((job, index) => {
+        const item = node('article', 'plan-job');
+        const head = node('div', 'plan-job-head');
+        const heading = node('div');
+        heading.append(
+          node('div', 'job-title', `${index + 1}. ${job.title}`),
+          node('div', 'plan-job-id', job.id)
+        );
+        head.append(heading, node('span', 'badge lane', `Lane ${job.lane}`));
+        item.append(head);
+        appendPlanField(item, 'Paths in scope', job.paths, {mono: true});
+        appendPlanField(item, 'Contracts read', job.contracts_read, {mono: true});
+        appendPlanField(item, 'Contracts changed', job.contracts_changed, {mono: true});
+        appendPlanField(item, 'Runs after', job.depends_on, {mono: true, empty: 'No job dependencies'});
+        appendPlanField(item, 'Verification', job.verify, {mono: true, empty: 'No verification command supplied'});
+        const acceptance = node('div', 'plan-field');
+        acceptance.append(node('div', 'plan-field-label', 'Acceptance criteria'));
+        const criteria = node('ol', 'acceptance-list');
+        (job.acceptance || []).forEach((criterion) => criteria.append(node('li', '', criterion)));
+        if (!(job.acceptance || []).length) criteria.append(node('li', '', 'No acceptance criteria supplied.'));
+        acceptance.append(criteria);
+        item.append(acceptance);
+        list.append(item);
+      });
+      if (proposedJobs.length) section.append(list);
+      if (awaiting) {
+        section.append(
+          node(
+            'div',
+            'approval-note',
+            'Approve plan posts the exact full-hash command to GitHub as the trusted operator. The controller will independently verify the author, hash, and current base before building.'
+          )
+        );
+      }
+      return section;
+    }
+
     function openIssue(number) {
       const issue = state.snapshot.issues.find((item) => item.number === number);
       if (!issue) return;
@@ -705,9 +825,36 @@
       $('drawerTitle').textContent = issue.title;
       const actions = $('drawerActions');
       actions.replaceChildren();
+      const proposedJobs = issue.plan?.proposed_jobs || [];
+      const canApprove = issue.plan
+        && issue.plan.status === 'awaiting_approval'
+        && issue.state === 'awaiting_approval'
+        && issue.plan.story_points !== 21
+        && state.snapshot.runtime.controlled_actions.includes('approve_plan');
+      if (canApprove) {
+        const approving = state.approving.has(number);
+        const submitted = state.submittedApprovals.get(number) === issue.plan.hash;
+        const approvalLabel = issue.plan.story_points
+          ? `Approve ${issue.plan.story_points}-point plan`
+          : 'Approve plan';
+        const approveButton = node(
+          'button',
+          'primary',
+          approving
+            ? 'Approving…'
+            : submitted
+              ? 'Approval submitted'
+              : approvalLabel
+        );
+        approveButton.type = 'button';
+        approveButton.disabled = approving || submitted;
+        if (!approveButton.disabled) {
+          approveButton.addEventListener('click', () => approvePlan(number, issue.plan.hash));
+        }
+        actions.append(approveButton);
+      }
       if (issue.url) actions.append(link('Open GitHub issue ↗', issue.url));
       issue.jobs.filter((job) => job.pr_url).forEach((job) => actions.append(link(`PR #${job.pr_number} ↗`, job.pr_url)));
-      const proposedJobs = issue.plan?.proposed_jobs || [];
       if (issue.column === 'needs_split' && proposedJobs.length) {
         const split = issue.split;
         const splitting = state.splitting.has(number);
@@ -746,11 +893,7 @@
       overview.append(grid);
       body.append(overview);
 
-      if (issue.plan?.summary) {
-        const section = node('section', 'detail-section');
-        section.append(node('h3', '', 'Current plan'), node('div', 'notice', issue.plan.summary));
-        body.append(section);
-      }
+      if (issue.plan) body.append(renderPlan(issue));
 
       if (issue.column === 'needs_split') {
         const why = node('section', 'detail-section');
