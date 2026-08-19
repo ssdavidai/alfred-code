@@ -702,13 +702,16 @@ class DashboardData:
             number = int(issue["number"])
             controller_state = str(issue["controller_state"])
             product_stage = str(issue.get("product_stage") or "legacy_active")
-            column = (
-                PRODUCT_TO_COLUMN.get(
-                    product_stage, STATE_TO_COLUMN.get(controller_state, "blocked")
+            if str(issue.get("github_state") or "").upper() == "CLOSED":
+                column = "done"
+            else:
+                column = (
+                    PRODUCT_TO_COLUMN.get(
+                        product_stage, STATE_TO_COLUMN.get(controller_state, "blocked")
+                    )
+                    if self.config.github.project_number
+                    else STATE_TO_COLUMN.get(controller_state, "blocked")
                 )
-                if self.config.github.project_number
-                else STATE_TO_COLUMN.get(controller_state, "blocked")
-            )
             state_counts[column] += 1
             plan_row = state["plans"].get(number)
             plan = _json(plan_row.get("plan_json") if plan_row else None, {})

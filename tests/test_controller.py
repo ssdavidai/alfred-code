@@ -960,6 +960,55 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(project.refreshes, [3])
 
+    def test_historical_closed_issue_with_stale_plan_is_reconciled(self):
+        self.controller.run_once()
+        plan_hash = self.db.current_plan(12)["plan_hash"]
+        self.github.issue_value.update(
+            {
+                "state": "CLOSED",
+                "stateReason": "completed",
+                "closedAt": "2026-08-19T09:00:00Z",
+                "closedBy": "ssdavidai",
+            }
+        )
+        self.db.upsert_issue(self.github.issue_value)
+        self.assertEqual(self.db.get_issue(12)["controller_state"], "awaiting_approval")
+
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"][0]["state"], "closed")
+        issue = self.db.get_issue(12)
+        self.assertEqual(issue["product_stage"], "done")
+        self.assertIsNone(issue["current_plan_hash"])
+        historical = self.db.connection.execute(
+            "SELECT status FROM plans WHERE plan_hash=?", (plan_hash,)
+        ).fetchone()
+        self.assertEqual(historical["status"], "superseded")
+        evidence = self.db.latest_event(12, "issue.closed_reconciled")["detail"]
+        self.assertEqual(evidence["state_reason"], "completed")
+        self.assertEqual(evidence["closed_by"], "ssdavidai")
+
+    def test_reopened_terminal_issue_returns_to_clean_backlog(self):
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            github=replace(self.config.github, project_number=3),
+        )
+        self.controller.run_once()
+        self.github.issue_value["state"] = "CLOSED"
+        self.controller.run_once()
+        self.assertEqual(self.db.get_issue(12)["controller_state"], "closed")
+
+        self.github.issue_value["state"] = "OPEN"
+        result = self.controller.run_once()
+
+        self.assertEqual(result["issues"], [])
+        issue = self.db.get_issue(12)
+        self.assertEqual(issue["controller_state"], "observed")
+        self.assertEqual(issue["product_stage"], "backlog")
+        self.assertIsNone(issue["current_plan_hash"])
+
     def test_project_snapshot_refresh_is_bounded_and_recovers_after_backoff(self):
         project = FakeProject()
         self.controller.project = project
@@ -2266,6 +2315,37 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.github.reopened_issues, [])
         self.assertEqual(result["issues"][0]["state"], "closed")
         self.assertEqual(self.db.get_job("web-12")["state"], "closed")
+
+    def test_historical_close_backfill_never_reopens_or_mutates_pull_requests(self):
+        self.add_dependent_job()
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        branch = "lane-1/12-api"
+        merged_at = "2026-07-17T20:16:35Z"
+        self.github.prs[branch] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "MERGED",
+            "b" * 40,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "Closes #12\n\nController job: `api-12` · lane `I`",
+            merged_at,
+        )
+        self.github.issue_value["state"] = "CLOSED"
+        self.github.issue_value["updatedAt"] = merged_at
+        self.db.upsert_issue(self.github.issue_value)
+
+        result = self.controller.run_once()
+
+        self.assertEqual(self.github.reopened_issues, [])
+        self.assertEqual(self.github.updated_pr_bodies, [])
+        self.assertEqual(result["issues"][0]["state"], "closed")
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "done")
 
     def test_multi_job_issue_closes_only_after_every_job_is_merged(self):
         self.add_dependent_job()

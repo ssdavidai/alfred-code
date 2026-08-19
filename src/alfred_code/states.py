@@ -24,6 +24,7 @@ SPRINT_STATES = {"active", "closed"}
 SPRINT_ITEM_STATES = {
     "active",
     "done",
+    "closed",
     "blocked",
     "rejected",
     "needs_split",

@@ -177,7 +177,7 @@ class Controller:
             elif (
                 issue["github_state"] == "CLOSED"
                 and number not in live
-                and self._closed_issue_needs_recovery_audit(number)
+                and self._closed_issue_needs_terminal_reconciliation(number)
             ):
                 live[number] = self.github.issue(number)
 
@@ -205,30 +205,34 @@ class Controller:
         for number in sorted(live):
             previous = tracked.get(number)
             local = self.database.upsert_issue(live[number])
+            if (
+                previous
+                and previous["github_state"] == "OPEN"
+                and local["github_state"] == "CLOSED"
+            ):
+                self.database.event(
+                    "issue.github_close_observed",
+                    {
+                        "updated_at": live[number].get("updatedAt"),
+                        "state_reason": live[number].get("stateReason"),
+                        "closed_at": live[number].get("closedAt"),
+                        "closed_by": live[number].get("closedBy"),
+                    },
+                    issue_number=number,
+                )
             if project_ready and self._sprint_workflow_enabled():
                 local = self._adopt_project_intent(local, delivery_items.get(number))
             self.database.observe("github", f"issue:{number}", live[number])
-            jobs = self.database.list_jobs(number)
+            jobs = self.database.list_current_jobs(number)
             current = self.database.current_plan(number)
 
             if (
                 previous
                 and previous["github_state"] == "CLOSED"
                 and local["github_state"] == "OPEN"
-                and local["controller_state"] == "closed"
-                and not current
-                and not jobs
+                and local["controller_state"] in {"closed", "completed"}
             ):
-                self.database.set_issue_state(number, "observed", {"reason": "GitHub issue reopened"})
-                self.database.set_product_stage(
-                    number, "backlog", reason="GitHub issue reopened"
-                )
-                local = self.database.get_issue(number) or local
-            elif local["github_state"] == "CLOSED" and local["controller_state"] == "observed":
-                self.database.set_issue_state(number, "closed", {"reason": "GitHub issue closed"})
-                self.database.set_product_stage(
-                    number, "done", reason="GitHub issue closed before sprint selection"
-                )
+                self.database.reopen_issue(number)
                 local = self.database.get_issue(number) or local
 
             labels = {
@@ -271,7 +275,7 @@ class Controller:
                 selected = enrolled or active
             if selected or (
                 local["github_state"] == "CLOSED"
-                and self._closed_issue_needs_recovery_audit(number)
+                and self._closed_issue_needs_terminal_reconciliation(number)
             ):
                 candidates.append(local)
 
@@ -819,11 +823,12 @@ class Controller:
             if (
                 self.config.apply
                 and current
+                and self._closed_issue_recovery_is_pending(issue_number)
                 and self._recover_premature_multi_job_close(live, current["plan"], jobs)
             ):
                 self._sync_project(issue_number)
                 return self._issue_summary(issue_number)
-            self._close_issue(issue_number, recovery_checked=True)
+            self._close_issue(live, recovery_checked=True)
             self._sync_project(issue_number)
             return self._issue_summary(issue_number)
         if not self.config.apply:
@@ -945,6 +950,8 @@ class Controller:
             return False
         if any(job["state"] not in TERMINAL_JOB_STATES for job in jobs):
             return True
+        if jobs and all(job["state"] == "merged" for job in jobs):
+            return False
         if any(
             str(job.get("last_error") or "") == "GitHub issue or PR closed without merge"
             for job in jobs
@@ -959,6 +966,51 @@ class Controller:
         return bool(
             recovered
             and (neutralized is None or int(neutralized["id"]) > int(recovered["id"]))
+        )
+
+    def _closed_issue_needs_terminal_reconciliation(self, issue_number: int) -> bool:
+        issue = self.database.get_issue(issue_number)
+        if not issue or issue.get("github_state") != "CLOSED":
+            return False
+        if self._closed_issue_needs_recovery_audit(issue_number):
+            return True
+        if issue.get("controller_state") not in {"closed", "completed"}:
+            return True
+        if issue.get("product_stage") != "done":
+            return True
+        current = self.database.current_plan(issue_number)
+        if issue.get("controller_state") == "closed" and current is not None:
+            return True
+        return bool(
+            issue.get("controller_state") == "completed"
+            and current is not None
+            and current.get("status") != "completed"
+        )
+
+    def _closed_issue_recovery_is_pending(self, issue_number: int) -> bool:
+        observed = self.database.latest_event(issue_number, "issue.github_close_observed")
+        reconciled = self.database.latest_event(issue_number, "issue.closed_reconciled")
+        if observed is not None and (
+            reconciled is None or int(observed["id"]) > int(reconciled["id"])
+        ):
+            return True
+
+        # Resume the bounded recovery handshake emitted by the older release.
+        # This is deliberately narrower than the general recovery audit so a
+        # historical operator closure cannot gain new external side effects.
+        recovered = self.database.latest_event(
+            issue_number, "issue.premature_close_recovered"
+        )
+        neutralized = self.database.latest_event(
+            issue_number, "issue.auto_close_link_neutralized"
+        )
+        legacy_pending = bool(
+            recovered
+            and (neutralized is None or int(neutralized["id"]) > int(recovered["id"]))
+        )
+        return bool(
+            legacy_pending
+            and (reconciled is None or int(recovered["id"]) > int(reconciled["id"]))
         )
 
     @staticmethod
@@ -1095,7 +1147,13 @@ class Controller:
         )
         return True
 
-    def _close_issue(self, issue_number: int, *, recovery_checked: bool = False) -> None:
+    def _close_issue(
+        self,
+        issue: dict[str, Any],
+        *,
+        recovery_checked: bool = False,
+    ) -> None:
+        issue_number = int(issue["number"])
         for job in self.database.list_current_jobs(issue_number):
             pr = self.github.pr_for_branch(job["branch"])
             if pr:
@@ -1129,12 +1187,20 @@ class Controller:
             self.database.release_lane(job["job_id"])
         jobs = self.database.list_current_jobs(issue_number)
         state = "completed" if jobs and all(job["state"] == "merged" for job in jobs) else "closed"
-        self.database.set_issue_state(issue_number, state)
-        issue = self.database.get_issue(issue_number) or {}
-        if state == "completed" or issue.get("product_stage") not in {"active", "legacy_active"}:
-            self.database.set_product_stage(
-                issue_number, "done", reason="GitHub issue reached a terminal state"
-            )
+        self.database.finalize_closed_issue(
+            issue_number,
+            completed=state == "completed",
+            detail={
+                "state_reason": issue.get("stateReason"),
+                "closed_at": issue.get("closedAt"),
+                "closed_by": issue.get("closedBy"),
+                "recovery_checked": recovery_checked,
+                "jobs": [
+                    {"job_id": job["job_id"], "state": job["state"], "pr": job.get("pr_number")}
+                    for job in jobs
+                ],
+            },
+        )
 
     def reconcile_job(self, issue: dict[str, Any], plan: dict[str, Any], job: dict[str, Any]) -> None:
         job_id = job["job_id"]
@@ -2964,7 +3030,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         if issue.get("controller_state") == "completed":
             return "done"
         if issue.get("github_state") == "CLOSED":
-            return "blocked"
+            return "closed"
         if issue.get("controller_state") != "blocked":
             return "active"
         blockers = self._auto_replan_blockers(jobs)
@@ -3034,7 +3100,9 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
             return {**sprint, "items": items}
         self._close_blocked_carryover_prs(sprint, items)
         closed, closed_items = self.database.close_active_sprint()
-        returned = [item for item in closed_items if item["status"] != "done"]
+        returned = [
+            item for item in closed_items if item["status"] not in {"done", "closed"}
+        ]
         if self.project and self.config.github.project_number and returned:
             urls = [
                 str((self.database.get_issue(int(item["issue_number"])) or {}).get("url") or "")
@@ -3049,6 +3117,7 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
             f"sprint:{closed['number']}:closed",
             f"{closed['title']} closed: "
             f"{sum(1 for item in closed_items if item['status'] == 'done')} done, "
+            f"{sum(1 for item in closed_items if item['status'] == 'closed')} closed, "
             f"{len(returned)} returned to refinement.",
             {"sprint": closed["number"], "items": closed_items},
         )
