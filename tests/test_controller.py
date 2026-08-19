@@ -396,6 +396,7 @@ class ControllerTests(unittest.TestCase):
             DurableNotifier(self.db, self.channel),
             audit=AuditLog(self.root / "audit.jsonl"),
         )
+        self.controller._sync_source_checkout = lambda: self.sha
         self.controller._prepare_exact_branch = lambda branch, head_sha: None
 
     def test_controller_verification_prefers_repository_ci_node_version(self):
@@ -406,6 +407,31 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(
             environment["npm_config_script_shell"],
             str((Path.home() / ".claude/bin/alfred-code-npm-shell").resolve()),
+        )
+
+    def test_cycle_fails_before_issue_observation_when_source_sync_is_unsafe(self):
+        def refuse_sync():
+            raise AuthorityUnavailable("controller source checkout is dirty")
+
+        self.controller._sync_source_checkout = refuse_sync
+
+        with self.assertRaisesRegex(AuthorityUnavailable, "dirty"):
+            self.controller.run_once()
+
+        self.assertEqual(self.db.list_issues(), [])
+        failures = [
+            event
+            for event in self.db.events(20)
+            if event["kind"] == "reconcile.authority_failed"
+        ]
+        self.assertEqual(failures, [])
+        audit = [json.loads(line) for line in (self.root / "audit.jsonl").read_text().splitlines()]
+        self.assertTrue(
+            any(
+                event["kind"] == "reconcile.authority_failed"
+                and event["authority"] == "repository"
+                for event in audit
+            )
         )
 
     def test_reviewer_prompt_embeds_approved_offline_evidence(self):

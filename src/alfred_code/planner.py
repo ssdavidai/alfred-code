@@ -13,6 +13,7 @@ from .config import ControllerConfig
 from .errors import CommandError, PlanValidationError
 from .github import GitHubClient
 from .plans import LanePolicy, PlanValidator
+from .source import verify_default_branch_checkout
 from .util import content_hash, run
 
 
@@ -356,7 +357,7 @@ Rules: normally use one job per lane, and always one agent per job. Jobs in diff
         if not issue_numbers:
             return []
         base_sha = self.github.default_branch_sha()
-        run(["git", "fetch", "--no-tags", "origin", base_sha], cwd=self.config.repo_path, timeout=120)
+        verify_default_branch_checkout(self.config.repo_path, base_sha)
         policy, policy_text = self.policy_at(base_sha)
         evidence = self.repository_evidence(base_sha)
         open_prs = self.github.open_prs()
