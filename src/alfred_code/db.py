@@ -1270,6 +1270,58 @@ class Database:
             result["children"].append(value)
         return result
 
+    def split_child_dependencies(self, child_issue_number: int) -> list[int]:
+        """Resolve a split child's job dependencies to their sibling issue numbers.
+
+        The split graph is controller-authored durable state. Child planners may
+        refine implementation details, but they must not be able to erase the
+        ordering that the operator approved when the parent was split.
+        """
+        child = self.connection.execute(
+            """
+            SELECT parent_issue_number, plan_hash, job_id, spec_json
+            FROM issue_split_children
+            WHERE child_issue_number=?
+            ORDER BY parent_issue_number DESC, ordinal
+            LIMIT 1
+            """,
+            (child_issue_number,),
+        ).fetchone()
+        if child is None:
+            return []
+        spec = json.loads(child["spec_json"])
+        dependency_ids = [str(value) for value in spec.get("depends_on") or []]
+        if not dependency_ids:
+            return []
+        placeholders = ",".join("?" for _ in dependency_ids)
+        rows = list(
+            self.connection.execute(
+                f"""
+                SELECT job_id, child_issue_number
+                FROM issue_split_children
+                WHERE parent_issue_number=? AND plan_hash=?
+                  AND job_id IN ({placeholders})
+                """,
+                (
+                    int(child["parent_issue_number"]),
+                    str(child["plan_hash"]),
+                    *dependency_ids,
+                ),
+            )
+        )
+        resolved = {
+            str(row["job_id"]): int(row["child_issue_number"])
+            for row in rows
+            if row["child_issue_number"] is not None
+        }
+        missing = [job_id for job_id in dependency_ids if job_id not in resolved]
+        if missing:
+            raise RuntimeError(
+                "split dependency graph is incomplete for child "
+                f"#{child_issue_number}: {', '.join(missing)}"
+            )
+        return [resolved[job_id] for job_id in dependency_ids]
+
     def record_split_child_created(
         self,
         issue_number: int,
@@ -1709,7 +1761,11 @@ class Database:
                         job["lane"],
                         job["title"],
                         job["branch"],
-                        None if job.get("depends_on") else plan["base_sha"],
+                        (
+                            None
+                            if job.get("depends_on") or plan.get("issue_dependencies")
+                            else plan["base_sha"]
+                        ),
                         canonical_json(job["paths"]),
                         job["verify"],
                         canonical_json(

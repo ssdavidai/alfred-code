@@ -58,6 +58,7 @@ class FakeGitHub:
         self.invalidated_prs = []
         self.auto_replans = []
         self.closed_prs = []
+        self.failure_evidence = "gitleaks failed at docs/contract.md:234"
 
     def intake_issues(self):
         return [copy.deepcopy(self.issue_value)] if self.issue_value["state"] == "OPEN" else []
@@ -138,6 +139,9 @@ class FakeGitHub:
 
     def pr_files(self, number):
         return ["file.txt"]
+
+    def pr_failure_evidence(self, pr):
+        return self.failure_evidence
 
     def create_pr(self, **values):
         self.created_prs.append(copy.deepcopy(values))
@@ -256,6 +260,7 @@ class FakeSuperset:
         self.worker_creates = 0
         self.review_creates = 0
         self.agent_starts = 0
+        self.agent_prompts = []
 
     def workspace_by_name(self, name):
         return self.workspaces_by_name.get(name)
@@ -275,6 +280,7 @@ class FakeSuperset:
 
     def start_agent(self, workspace_id, agent, prompt):
         self.agent_starts += 1
+        self.agent_prompts.append(prompt)
         return f"retry-agent-{self.agent_starts}"
 
     def ensure_project(self, repo_path):
@@ -517,6 +523,56 @@ class ControllerTests(unittest.TestCase):
             **values,
         )
 
+    def record_split_dependency(self, dependency_number=11):
+        parent_issue = {
+            "id": "I_42",
+            "number": 42,
+            "title": "Epic",
+            "body": "Split this",
+            "state": "OPEN",
+            "url": "https://example/issues/42",
+            "labels": [],
+        }
+        dependency_issue = {
+            "id": f"I_{dependency_number}",
+            "number": dependency_number,
+            "title": "Contract child",
+            "body": "Contract",
+            "state": "OPEN",
+            "url": f"https://example/issues/{dependency_number}",
+            "labels": [],
+        }
+        self.db.upsert_issue(parent_issue)
+        self.db.upsert_issue(dependency_issue)
+        self.github.extra_issues[42] = {**copy.deepcopy(parent_issue), "state": "CLOSED"}
+        self.github.extra_issues[dependency_number] = copy.deepcopy(dependency_issue)
+        parent_plan = {"base_sha": self.sha, "jobs": []}
+        parent_hash = content_hash(parent_plan)
+        self.db.save_plan(42, parent_hash, parent_plan)
+        self.db.mark_plan_needs_split(42, parent_hash)
+        self.db.begin_issue_split(
+            42,
+            parent_hash,
+            [
+                {
+                    "job_id": "contract-42",
+                    "marker": "contract-marker",
+                    "depends_on": [],
+                },
+                {
+                    "job_id": "api-42",
+                    "marker": "api-marker",
+                    "depends_on": ["contract-42"],
+                },
+            ],
+        )
+        self.db.record_split_child_created(
+            42, parent_hash, "contract-42", dependency_number, dependency_issue["url"]
+        )
+        self.db.record_split_child_created(
+            42, parent_hash, "api-42", 12, self.issue["url"]
+        )
+
     def launch_failed_review_repair(self):
         remote = self.root / "repair-remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
@@ -571,6 +627,42 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.list_jobs(), [])
         self.assertEqual(self.superset.worker_creates, 0)
 
+    def test_split_dependency_is_injected_into_generated_plan(self):
+        self.record_split_dependency()
+        self.github.extra_issues[11]["state"] = "CLOSED"
+
+        self.controller.run_once()
+
+        current = self.db.current_plan(12)
+        self.assertEqual(current["plan"]["issue_dependencies"], [11])
+        self.assertEqual(current["plan_hash"], content_hash(current["plan"]))
+
+    def test_split_dependency_barrier_retires_already_started_duplicate_work(self):
+        self.record_split_dependency()
+        issue = self.db.upsert_issue(self.issue)
+        self.db.save_plan(12, self.plan_hash, self.plan)
+        self.db.record_approval(
+            12,
+            self.plan_hash,
+            "owner",
+            "approval-1",
+            "https://example/approval",
+            "2026-01-01T00:00:00Z",
+        )
+        self.db.materialize_jobs(12, self.plan_hash, self.plan)
+        self.db.acquire_lane("I", "api-12")
+        self.db.update_job("api-12", state="running", workspace_id="duplicate-workspace")
+
+        current, jobs, halted = self.controller._prepare_plan_state(issue)
+
+        self.assertTrue(halted)
+        self.assertIsNone(current)
+        self.assertEqual(jobs, [])
+        self.assertEqual(self.db.get_job("api-12")["state"], "superseded")
+        self.assertIsNone(self.db.lease_owner("I"))
+        self.assertIsNone(self.db.current_plan(12))
+        self.assertEqual(self.db.get_issue(12)["controller_state"], "approved")
+
     def test_plan_publication_failure_preserves_the_valid_plan_for_retry(self):
         def fail_post(*_args, **_kwargs):
             raise RuntimeError("GitHub comment authority unavailable")
@@ -620,6 +712,31 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(child["base_sha"], merged_main)
         self.assertEqual(self.db.get_job("api-12")["base_sha"], self.sha)
+
+    def test_issue_dependent_job_launches_from_current_main(self):
+        remote = self.root / "issue-dependency-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "file.txt").write_text("external issue dependency merged\n")
+        subprocess.run(["git", "add", "file.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "external dependency merged"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=self.repo, check=True, capture_output=True)
+        merged_main = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        self.github.sha = merged_main
+        plan = copy.deepcopy(self.plan)
+        plan["issue_dependencies"] = [11]
+        plan_hash = content_hash(plan)
+        self.db.upsert_issue(self.issue)
+        self.db.save_plan(12, plan_hash, plan)
+        self.db.record_approval(12, plan_hash, "owner", "1", None, "now")
+        self.db.materialize_jobs(12, plan_hash, plan)
+
+        job = self.controller._ensure_job_base_sha(plan, self.db.get_job("api-12"))
+
+        self.assertEqual(job["base_sha"], merged_main)
 
     def test_exact_rejection_blocks_without_materializing_jobs(self):
         self.controller.run_once()
@@ -1348,6 +1465,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.planner.calls, 1)
 
     def test_approved_issue_waits_for_cross_issue_dependency_before_materializing_jobs(self):
+        remote = self.root / "cross-issue-dependency-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=self.repo, check=True, capture_output=True)
         dependency = {
             "id": "I_13",
             "number": 13,
@@ -2000,6 +2121,53 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.db.get_job("api-12")["state"], "merged")
         self.assertIsNone(self.db.lease_owner("I"))
         self.assertEqual(self.superset.deleted, [])
+
+    def test_red_ci_starts_scoped_repair_without_releasing_lane(self):
+        remote = self.root / "ci-repair-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        self.controller.run_once()
+        self.approve()
+        self.controller.run_once()
+        job = self.db.get_job("api-12")
+        self.superset.details[job["workspace_id"]]["worktreePath"] = str(self.repo)
+        subprocess.run(["git", "checkout", job["branch"]], cwd=self.repo, check=True, capture_output=True)
+        self.write_worker_lane()
+        (self.repo / "file.txt").write_text("implementation with a scanner false positive\n")
+        (self.repo / WORKER_RESULT).write_text(
+            json.dumps({"status": "ready", "summary": "initial implementation"})
+        )
+        self.write_launch_status("completed", exit_code=0)
+        self.controller.run_once()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.github.prs[job["branch"]] = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            head,
+            "RED",
+            "BLOCKED",
+            "MERGEABLE",
+            False,
+            job["branch"],
+            "## Smoke evidence\nreal output",
+        )
+
+        self.controller.run_once()
+
+        repairing = self.db.get_job("api-12")
+        self.assertEqual(repairing["state"], "repairing")
+        self.assertEqual(repairing["repair_attempts"], 1)
+        self.assertEqual(self.db.lease_owner("I"), "api-12")
+        self.assertEqual(self.superset.agent_starts, 1)
+        self.assertIn("gitleaks failed at docs/contract.md:234", self.superset.agent_prompts[0])
+        self.assertIn("untrusted validation evidence", self.superset.agent_prompts[0])
 
     def test_failed_review_launches_bound_repair_and_re_reviews_new_sha(self):
         remote, pr, repairing = self.launch_failed_review_repair()
