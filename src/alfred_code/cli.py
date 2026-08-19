@@ -391,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         elif args.command == "plan":
+            controller._sync_source_checkout()
             issue = controller.github.issue(args.issue)
             database.upsert_issue(issue)
             plan, plan_hash = controller.planner.plan_issue(args.issue)

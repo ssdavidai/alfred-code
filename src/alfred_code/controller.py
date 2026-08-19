@@ -35,6 +35,7 @@ from .path_policy import codex_write_scope_error
 from .planner import Planner, PreparedPlan
 from .plans import path_matches
 from .project import ProjectBoard
+from .source import sync_default_branch_checkout
 from .states import TERMINAL_JOB_STATES
 from .superset import SupersetClient, worker_workspace_name
 from .util import content_hash, run, utcnow
@@ -101,6 +102,17 @@ class Controller:
 
     def _record(self, kind: str, **detail: Any) -> None:
         self.audit.write(kind, **detail)
+
+    def _sync_source_checkout(self) -> str:
+        synced = sync_default_branch_checkout(self.config.repo_path)
+        self._record(
+            "repository.synced",
+            branch=synced.branch,
+            before_sha=synced.before_sha,
+            head_sha=synced.head_sha,
+            changed=synced.changed,
+        )
+        return synced.head_sha
 
     def _sprint_workflow_enabled(self) -> bool:
         return bool(
@@ -298,6 +310,16 @@ class Controller:
         if callable(begin_cycle):
             begin_cycle()
         self._record("reconcile.started", apply=self.config.apply)
+        if self.config.apply:
+            try:
+                summary["source_sha"] = self._sync_source_checkout()
+            except Exception as exc:
+                self._record(
+                    "reconcile.authority_failed",
+                    authority="repository",
+                    error=str(exc),
+                )
+                raise
         try:
             issues = self.observe_issues()
         except Exception as exc:
