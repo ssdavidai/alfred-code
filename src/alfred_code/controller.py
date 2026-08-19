@@ -122,6 +122,198 @@ class Controller:
             and callable(getattr(self.project, "delivery_items", None))
         )
 
+    def _sprint_integration_enabled(self) -> bool:
+        return self._sprint_workflow_enabled() and self.config.sprint_integration_enabled
+
+    def _fetch_remote_branch(self, branch: str) -> str | None:
+        repo = self.config.repo_path
+        try:
+            run(
+                ["git", "fetch", "--no-tags", "origin", f"refs/heads/{branch}"],
+                cwd=repo,
+                timeout=300,
+            )
+        except CommandError:
+            return None
+        return run(["git", "rev-parse", "FETCH_HEAD"], cwd=repo, timeout=30).strip()
+
+    def _ensure_active_sprint_integration(
+        self,
+        default_branch_sha: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._sprint_integration_enabled():
+            return None
+        sprint = self.database.active_sprint()
+        if sprint is None:
+            return None
+        sprint_id = int(sprint["id"])
+        branch = str(sprint.get("branch") or f"alfred-code/sprint-{sprint['number']}-integration")
+        base_sha = str(sprint.get("base_sha") or default_branch_sha or "")
+        if not base_sha:
+            base_sha = self.github.default_branch_sha()
+
+        remote_head = self._fetch_remote_branch(branch)
+        if remote_head is None:
+            self._prepare_branch(branch, base_sha)
+            run(
+                ["git", "push", "-u", "origin", f"refs/heads/{branch}:refs/heads/{branch}"],
+                cwd=self.config.repo_path,
+                timeout=300,
+            )
+            remote_head = self._fetch_remote_branch(branch)
+            if remote_head is None:
+                raise AuthorityUnavailable(
+                    f"sprint integration branch {branch!r} was pushed but cannot be observed"
+                )
+        try:
+            run(
+                ["git", "merge-base", "--is-ancestor", base_sha, remote_head],
+                cwd=self.config.repo_path,
+                timeout=30,
+            )
+        except CommandError as exc:
+            raise AuthorityUnavailable(
+                f"sprint branch {branch!r} is not descended from its recorded base "
+                f"{base_sha[:12]}"
+            ) from exc
+
+        workspace = self.superset.create_integration_workspace(
+            repo_path=self.config.repo_path,
+            sprint_number=int(sprint["number"]),
+            branch=branch,
+        )
+        updates: dict[str, Any] = {}
+        expected = {
+            "base_sha": base_sha,
+            "branch": branch,
+            "workspace_id": workspace.id,
+            "workspace_url": workspace.url,
+            "integration_head_sha": remote_head,
+        }
+        for key, value in expected.items():
+            if sprint.get(key) != value:
+                updates[key] = value
+        if updates:
+            sprint = self.database.update_sprint(sprint_id, **updates)
+            self._record(
+                "sprint.integration_ready",
+                sprint=sprint["number"],
+                branch=branch,
+                head_sha=remote_head,
+                workspace=workspace.id,
+            )
+        self._sync_sprint_worktree(sprint, remote_head)
+        return sprint
+
+    def _refresh_sprint_head(self, sprint: dict[str, Any]) -> dict[str, Any]:
+        branch = str(sprint.get("branch") or "")
+        if not branch:
+            raise AuthorityUnavailable("active sprint has no integration branch")
+        head = self._fetch_remote_branch(branch)
+        if head is None:
+            raise AuthorityUnavailable(f"cannot observe remote sprint branch {branch!r}")
+        if sprint.get("integration_head_sha") != head:
+            sprint = self.database.update_sprint(
+                int(sprint["id"]),
+                integration_head_sha=head,
+                **(
+                    {
+                        "retro_state": "pending",
+                        "retro_workspace_id": None,
+                        "retro_agent_id": None,
+                        "retro_requested_at": None,
+                        "retro_sha": None,
+                        "retro_verdict": None,
+                        "retro_findings": None,
+                        "last_error": None,
+                    }
+                    if sprint.get("delivery_sha") and sprint.get("delivery_sha") != head
+                    else {}
+                ),
+            )
+        self._sync_sprint_worktree(sprint, head)
+        return sprint
+
+    def _sync_sprint_worktree(self, sprint: dict[str, Any], remote_head: str) -> Path:
+        workspace_id = str(sprint.get("workspace_id") or "")
+        if not workspace_id:
+            raise AuthorityUnavailable("active sprint has no integration workspace")
+        details = self.superset.workspace_details(workspace_id)
+        worktree = self._workspace_path(details)
+        if worktree is None:
+            raise AuthorityUnavailable(
+                f"Superset did not expose a worktree path for sprint workspace {workspace_id}"
+            )
+        branch = str(sprint.get("branch") or "")
+        current_branch = run(
+            ["git", "branch", "--show-current"], cwd=worktree, timeout=30
+        ).strip()
+        if current_branch != branch:
+            raise AuthorityUnavailable(
+                f"sprint workspace is on {current_branch!r}, expected {branch!r}"
+            )
+        status = run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree,
+            timeout=30,
+        )
+        if status.strip():
+            raise AuthorityUnavailable(
+                "sprint integration worktree is dirty; refusing to move its branch"
+            )
+        current_head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+        if current_head != remote_head:
+            try:
+                run(
+                    ["git", "merge-base", "--is-ancestor", current_head, remote_head],
+                    cwd=worktree,
+                    timeout=30,
+                )
+            except CommandError as exc:
+                raise AuthorityUnavailable(
+                    f"sprint worktree {current_head[:12]} cannot fast-forward to "
+                    f"{remote_head[:12]}"
+                ) from exc
+            run(["git", "merge", "--ff-only", remote_head], cwd=worktree, timeout=300)
+        observed = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+        if observed != remote_head:
+            raise AuthorityUnavailable(
+                f"sprint worktree failed to reach observed remote head {remote_head[:12]}"
+            )
+        return worktree
+
+    def _sprint_for_issue(self, issue_number: int) -> dict[str, Any] | None:
+        if not self._sprint_integration_enabled():
+            return None
+        item = self.database.current_sprint_item(issue_number)
+        if item is None or not item.get("sprint_branch"):
+            return None
+        return self.database.active_sprint()
+
+    def _delivery_base_sha(self, issue_number: int) -> str:
+        sprint = self._sprint_for_issue(issue_number)
+        if sprint is None:
+            return self.github.default_branch_sha()
+        return str(self._refresh_sprint_head(sprint)["integration_head_sha"])
+
+    def _planning_base_sha(self, issue_numbers: list[int]) -> str | None:
+        if not issue_numbers or not self._sprint_integration_enabled():
+            return None
+        if any(self.database.current_sprint_item(number) is None for number in issue_numbers):
+            return None
+        sprint = self.database.active_sprint()
+        if sprint is None:
+            return None
+        return str(self._refresh_sprint_head(sprint)["integration_head_sha"])
+
+    def _planning_checkout(self, issue_numbers: list[int], base_sha: str) -> Path | None:
+        if not issue_numbers or not self._sprint_integration_enabled():
+            return None
+        sprint = self.database.active_sprint()
+        if sprint is None:
+            return None
+        return self._sync_sprint_worktree(sprint, base_sha)
+
     def _refresh_project_snapshot(self, project_number: int) -> bool:
         now = time.monotonic()
         last_attempt = self._project_refresh_attempted_at.get(project_number)
@@ -314,6 +506,7 @@ class Controller:
         if self.config.apply:
             try:
                 summary["source_sha"] = self._sync_source_checkout()
+                self._ensure_active_sprint_integration(summary["source_sha"])
             except Exception as exc:
                 self._record(
                     "reconcile.authority_failed",
@@ -347,7 +540,16 @@ class Controller:
         prepared: list[PreparedPlan] = []
         if planning:
             try:
-                prepared = self.planner.prepare_plans(planning)
+                planning_base = self._planning_base_sha(planning)
+                prepared = (
+                    self.planner.prepare_plans(
+                        planning,
+                        base_sha=planning_base,
+                        checkout_path=self._planning_checkout(planning, planning_base),
+                    )
+                    if planning_base
+                    else self.planner.prepare_plans(planning)
+                )
             except Exception as exc:
                 for number in planning:
                     self._record_planning_failure(summary, number, exc)
@@ -621,11 +823,11 @@ class Controller:
                 current = None
 
         if current and not jobs and not self.database.is_approved(current["plan_hash"]):
-            live_sha = self.github.default_branch_sha()
+            live_sha = self._delivery_base_sha(issue_number)
             if live_sha != current["base_sha"]:
                 self.database.invalidate_plan(
                     issue_number,
-                    "default branch advanced before approval",
+                    "delivery branch advanced before approval",
                 )
                 current = None
 
@@ -1037,12 +1239,12 @@ class Controller:
                 )
                 self._sync_project(issue_number)
                 return self._issue_summary(issue_number)
-            live_sha = self.github.default_branch_sha()
+            live_sha = self._delivery_base_sha(issue_number)
             if live_sha != plan["base_sha"]:
                 self.database.invalidate_plan(issue_number, "base advanced before approval was observed")
                 self.notifier.send(
                     f"issue:{issue_number}:stale-approval:{plan_hash}",
-                    f"Alfred #{issue_number}'s approval was rejected because main advanced. A fresh plan will be generated.",
+                    f"Alfred #{issue_number}'s approval was rejected because its delivery branch advanced. A fresh plan will be generated.",
                     {"issue": issue_number, "plan_hash": plan_hash},
                 )
                 self._sync_project(issue_number)
@@ -1497,12 +1699,16 @@ class Controller:
                     )
                 workspace, agent_id = existing, None
             else:
-                workspace, agent_id = self.superset.create_worker(
-                    repo_path=self.config.repo_path,
-                    issue_number=int(issue["number"]),
-                    job=job,
-                    prompt=self.worker_prompt(issue, plan, job),
-                )
+                sprint = self._sprint_for_issue(int(issue["number"]))
+                arguments = {
+                    "repo_path": self.config.repo_path,
+                    "issue_number": int(issue["number"]),
+                    "job": job,
+                    "prompt": self.worker_prompt(issue, plan, job),
+                }
+                if sprint is not None:
+                    arguments["base_branch"] = str(sprint["branch"])
+                workspace, agent_id = self.superset.create_worker(**arguments)
             self.database.update_job(
                 job_id,
                 state="running",
@@ -1555,6 +1761,9 @@ class Controller:
         if pr.merged:
             self.database.update_job(job_id, state="merged", review_sha=pr.head_sha, last_error=None)
             self.database.release_lane(job_id)
+            sprint = self._sprint_for_issue(int(issue["number"]))
+            if sprint is not None:
+                self._refresh_sprint_head(sprint)
             if (
                 self.config.apply
                 and self.config.superset.cleanup_merged_workspaces
@@ -1650,11 +1859,33 @@ class Controller:
                 self.database.update_job(job_id, state="blocked", last_error="PR conflicts with its base")
             else:
                 self.database.update_job(job_id, state="ready_merge", review_sha=pr.head_sha, last_error=None)
-                self.notifier.send(
-                    f"job:{job_id}:ready:{pr.head_sha}",
-                    f"Alfred #{issue['number']} PR #{pr.number} is CI-green and independently reviewed at {pr.head_sha[:12]}. It is ready for your merge decision: {pr.url}",
-                    {"job": job_id, "pr": pr.url, "sha": pr.head_sha},
-                )
+                sprint = self._sprint_for_issue(int(issue["number"]))
+                if sprint is not None and self.config.sprint_auto_merge:
+                    expected_base = str(sprint["branch"])
+                    if pr.base_branch != expected_base:
+                        self.database.update_job(
+                            job_id,
+                            state="blocked",
+                            last_error=(
+                                f"PR targets {pr.base_branch!r}, expected sprint branch "
+                                f"{expected_base!r}"
+                            ),
+                        )
+                        return
+                    self.github.merge_pr(pr.number, head_sha=pr.head_sha)
+                    self.github.invalidate_pr(str(job["branch"]))
+                    self.notifier.send(
+                        f"job:{job_id}:sprint-merge:{pr.head_sha}",
+                        f"Alfred #{issue['number']} PR #{pr.number} passed CI and exact-SHA review; "
+                        f"the controller squash-merged it into Sprint {sprint['number']} ({expected_base}).",
+                        {"job": job_id, "pr": pr.url, "sha": pr.head_sha, "sprint": sprint["number"]},
+                    )
+                else:
+                    self.notifier.send(
+                        f"job:{job_id}:ready:{pr.head_sha}",
+                        f"Alfred #{issue['number']} PR #{pr.number} is CI-green and independently reviewed at {pr.head_sha[:12]}. It is ready for your merge decision: {pr.url}",
+                        {"job": job_id, "pr": pr.url, "sha": pr.head_sha},
+                    )
             return
         if verdict == "fail":
             feedback = self.github.review_feedback(
@@ -2702,6 +2933,11 @@ class Controller:
             branch=replacement_branch,
             title=f"{issue['title']} (lane {job['lane']}, clean history)",
             body=body,
+            base=(
+                str(sprint["branch"])
+                if (sprint := self._sprint_for_issue(int(issue["number"]))) is not None
+                else "main"
+            ),
         )
         rotated_job = self.database.rotate_job_delivery_branch(
             str(job["job_id"]),
@@ -2748,6 +2984,10 @@ class Controller:
             return self.database.update_job(job["job_id"], base_sha=str(plan["base_sha"]))
 
         refresh = getattr(self.github, "refresh_default_branch_sha", None)
+        sprint = self._sprint_for_issue(int(job["issue_number"]))
+        if sprint is not None:
+            base_sha = str(self._refresh_sprint_head(sprint)["integration_head_sha"])
+            return self.database.update_job(job["job_id"], base_sha=base_sha)
         base_sha = str(refresh() if callable(refresh) else self.github.default_branch_sha())
         repo = self.config.repo_path
         run(["git", "fetch", "--no-tags", "origin", "main"], cwd=repo, timeout=300)
@@ -3323,10 +3563,15 @@ class Controller:
             )
             run(["git", "push", "-u", "origin", job["branch"]], cwd=worktree, timeout=300)
             evidence = verification.strip() or "(command exited 0 with no output)"
+            sprint = self._sprint_for_issue(int(issue["number"]))
             issue_reference = (
-                f"Closes #{issue['number']}"
-                if len(plan.get("jobs", [])) == 1
-                else f"Part of #{issue['number']}"
+                f"Part of Sprint {sprint['number']} for #{issue['number']}"
+                if sprint is not None
+                else (
+                    f"Closes #{issue['number']}"
+                    if len(plan.get("jobs", [])) == 1
+                    else f"Part of #{issue['number']}"
+                )
             )
             body = (
                 f"{issue_reference}\n\n"
@@ -3339,6 +3584,7 @@ class Controller:
                 branch=job["branch"],
                 title=f"{issue['title']} (lane {job['lane']})",
                 body=body,
+                base=str(sprint["branch"]) if sprint is not None else "main",
             )
         except (AuthorityUnavailable, CommandError, OSError) as exc:
             self.database.update_job(job["job_id"], state="blocked", last_error=f"controller finalization failed: {exc}")
@@ -3688,7 +3934,9 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         if current and current.get("status") == "rejected":
             return "rejected"
         if jobs and all(job["state"] == "merged" for job in jobs):
-            return "done"
+            return "integrated" if self._sprint_for_issue(issue_number) is not None else "done"
+        if issue.get("controller_state") == "integrated":
+            return "integrated"
         if issue.get("controller_state") == "completed":
             return "done"
         if issue.get("github_state") == "CLOSED":
@@ -3753,11 +4001,15 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         sprint = self.database.active_sprint()
         if sprint is None:
             return None
+        if self._sprint_integration_enabled():
+            sprint = self._ensure_active_sprint_integration() or sprint
         items = self.database.sprint_items(int(sprint["id"]))
         for item in items:
             status = self._sprint_item_terminal_status(int(item["issue_number"]))
             self.database.set_sprint_item_status(int(item["issue_number"]), status)
         items = self.database.sprint_items(int(sprint["id"]))
+        if self._sprint_integration_enabled():
+            return self._reconcile_sprint_delivery(sprint, items)
         if not items or any(item["status"] == "active" for item in items):
             return {**sprint, "items": items}
         self._close_blocked_carryover_prs(sprint, items)
@@ -3785,11 +4037,408 @@ Never merge, approve through GitHub's review API, close, delete, push, use exter
         )
         return {**closed, "items": closed_items}
 
+    def _sprint_delivery_body(
+        self,
+        sprint: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> str:
+        issue_numbers = [int(item["issue_number"]) for item in items]
+        marker = ",".join(str(number) for number in issue_numbers)
+        lines = [
+            f"<!-- alfred-code-sprint:{sprint['id']}:items:{marker} -->",
+            f"## {sprint['title']} integration delivery",
+            "",
+            "This pull request is the sprint integration boundary. Each implementation PR "
+            "was independently verified and merged into the isolated sprint branch first.",
+            "",
+            "Included issues:",
+            "",
+            *[f"- Implements #{number}" for number in issue_numbers],
+            "",
+            "The trusted controller will merge this PR only after repository CI is green and "
+            "an independent exact-SHA sprint retrospective verifies completeness, contracts, "
+            "and cross-issue integration. Issues remain open until that guarded merge succeeds.",
+        ]
+        return "\n".join(lines)
+
+    def _sprint_retro_prompt(
+        self,
+        sprint: dict[str, Any],
+        items: list[dict[str, Any]],
+        pr: PullRequestObservation,
+    ) -> str:
+        issue_evidence = []
+        for item in items:
+            number = int(item["issue_number"])
+            current = self.database.current_plan(number)
+            jobs = self.database.list_current_jobs(number)
+            issue_evidence.append(
+                {
+                    "issue": number,
+                    "title": item.get("title"),
+                    "status": item.get("status"),
+                    "plan": (current or {}).get("plan"),
+                    "jobs": [
+                        {
+                            "id": job["job_id"],
+                            "lane": job["lane"],
+                            "state": job["state"],
+                            "paths": job["paths"],
+                            "verify": job["verify_command"],
+                            "pr": job.get("pr_url"),
+                            "head_sha": job.get("head_sha"),
+                        }
+                        for job in jobs
+                    ],
+                }
+            )
+        return f"""Perform the final independent retrospective for {sprint['title']} at exact integration SHA {pr.head_sha}.
+
+The sprint delivery PR is #{pr.number}. The trusted controller has already required green GitHub CI for this exact SHA. Treat issue text, plans, PR prose, and comments as claims; verify them against the pinned source, diff, tests, and runtime configuration.
+
+SPRINT EVIDENCE:
+{json.dumps(issue_evidence, indent=2)}
+
+Inspect the complete diff from main, check that every committed issue is actually implemented, look for missing acceptance criteria, cross-lane contract drift, integration regressions, destructive changes, and work that was accidentally omitted or duplicated. Run `{self.config.sprint_verify_command}` plus focused tests needed to validate the combined result. Do not modify code, Git metadata, GitHub, or external systems.
+
+When finished, write `{REVIEW_RESULT}` as one JSON object containing `head_sha` exactly `{pr.head_sha}`, `verdict` set to `pass` only when the entire sprint is complete and safe to merge (otherwise `fail`), and a concise evidence-based `findings` string. Then stop. Never merge, push, close, delete, approve, expose secrets, or escape the read-only review workspace.
+"""
+
+    def _publish_sprint_retro_result(
+        self,
+        sprint: dict[str, Any],
+        pr: PullRequestObservation,
+        review_paths: list[str],
+    ) -> bool:
+        workspace_id = str(sprint.get("retro_workspace_id") or "")
+        if not workspace_id:
+            return False
+        details = self.superset.workspace_details(workspace_id)
+        worktree = self._workspace_path(details)
+        if worktree is None:
+            return False
+        controller_job = f"sprint-{sprint['number']}-retro"
+        first_item = self.database.sprint_items(int(sprint["id"]))[0]
+        expected_lane = {
+            "lane": "review",
+            "issue": int(first_item["issue_number"]),
+            "allowed": review_paths,
+            "verify": self.config.sprint_verify_command,
+            "controller_job": controller_job,
+            "role": "reviewer",
+            "security_policy": SECURITY_POLICY,
+        }
+        error: str | None
+        try:
+            lane = json.loads((worktree / ".lane").read_text())
+            head = run(["git", "rev-parse", "HEAD"], cwd=worktree, timeout=30).strip()
+            status = run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=worktree,
+                timeout=30,
+            )
+            changed = self._status_paths(status)
+        except (OSError, json.JSONDecodeError, CommandError) as exc:
+            error = f"cannot prove sprint reviewer workspace integrity: {exc}"
+        else:
+            unexpected = [path for path in changed if path not in RUNTIME_CONTROL_FILES]
+            if lane != expected_lane:
+                error = "sprint reviewer .lane manifest drifted"
+            elif head != pr.head_sha:
+                error = f"sprint reviewer HEAD drifted from exact PR SHA {pr.head_sha}"
+            elif unexpected:
+                error = "sprint reviewer modified read-only paths: " + ", ".join(unexpected)
+            else:
+                error = None
+        if error:
+            self.database.update_sprint(
+                int(sprint["id"]),
+                retro_state="failed",
+                retro_verdict="fail",
+                retro_findings=error,
+                last_error=error,
+            )
+            return True
+        result = self._load_result(worktree / REVIEW_RESULT)
+        if result is None:
+            return False
+        verdict = str(result.get("verdict") or "fail").lower()
+        if verdict not in {"pass", "fail"} or str(result.get("head_sha") or "") != pr.head_sha:
+            verdict = "fail"
+        findings = str(result.get("findings") or "Sprint reviewer returned no findings summary.")[:8000]
+        try:
+            verification = run(
+                ["bash", "-c", self.config.sprint_verify_command],
+                cwd=worktree,
+                env=self._verification_environment(worktree),
+                timeout=1800,
+            )
+        except (CommandError, OSError) as exc:
+            verdict = "fail"
+            verification = str(exc)
+            findings = f"{findings}\n\nTrusted verification failed: {exc}"[:8000]
+        marker = f"<!-- alfred-code-sprint-retro:{sprint['number']}:{pr.head_sha}:{verdict} -->"
+        self.github.post_pr_comment(
+            pr.number,
+            f"## Alfred Code sprint retrospective\n\n{findings}\n\n"
+            f"Verification: `{self.config.sprint_verify_command}`\n\n```text\n"
+            f"{(verification.strip() or '(command exited 0 with no output)')[:12000]}\n```\n\n{marker}",
+        )
+        self.database.update_sprint(
+            int(sprint["id"]),
+            retro_state="passed" if verdict == "pass" else "failed",
+            retro_sha=pr.head_sha,
+            retro_verdict=verdict,
+            retro_findings=findings,
+            last_error=None if verdict == "pass" else findings,
+        )
+        return True
+
+    def _finish_merged_sprint(
+        self,
+        sprint: dict[str, Any],
+        items: list[dict[str, Any]],
+        pr: PullRequestObservation,
+    ) -> dict[str, Any]:
+        for item in items:
+            number = int(item["issue_number"])
+            live = self.github.issue(number)
+            if str(live.get("state") or "OPEN").upper() == "OPEN":
+                self.github.close_issue(number)
+                live = self.github.issue(number)
+            self.database.upsert_issue(live)
+            self.database.set_issue_state(number, "completed")
+            self.database.set_product_stage(
+                number,
+                "done",
+                rank=int(item["rank"]),
+                reason=f"Sprint {sprint['number']} integration PR #{pr.number} merged",
+            )
+            self.database.set_sprint_item_status(number, "done")
+            self._sync_project(number)
+        closed, closed_items = self.database.close_active_sprint()
+        self.database.update_sprint(
+            int(closed["id"]),
+            integration_head_sha=pr.head_sha,
+            delivery_pr_number=pr.number,
+            delivery_pr_url=pr.url,
+            delivery_sha=pr.head_sha,
+            retro_state="passed",
+            retro_sha=pr.head_sha,
+            retro_verdict="pass",
+            last_error=None,
+        )
+        self.notifier.send(
+            f"sprint:{closed['number']}:merged:{pr.head_sha}",
+            f"{closed['title']} passed final CI and its exact-SHA retrospective, merged as "
+            f"PR #{pr.number}, closed {len(closed_items)} issue(s), and is now complete.",
+            {"sprint": closed["number"], "pr": pr.url, "sha": pr.head_sha},
+        )
+        return {**closed, "items": closed_items, "delivery_pr_url": pr.url, "retro_state": "passed"}
+
+    def _reconcile_sprint_delivery(
+        self,
+        sprint: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        sprint = self._refresh_sprint_head(sprint)
+        if not items or any(item["status"] == "active" for item in items):
+            return {**sprint, "items": items}
+        unfinished = [
+            item for item in items if item["status"] not in {"integrated", "done", "closed"}
+        ]
+        if unfinished:
+            error = "Sprint cannot enter retrospective while items remain " + ", ".join(
+                f"#{item['issue_number']}:{item['status']}" for item in unfinished
+            )
+            if sprint.get("last_error") != error:
+                sprint = self.database.update_sprint(
+                    int(sprint["id"]), retro_state="blocked", last_error=error
+                )
+            return {**sprint, "items": items}
+
+        branch = str(sprint["branch"])
+        head = str(sprint["integration_head_sha"])
+        pr = self.github.pr_for_branch(branch)
+        if pr is None:
+            if sprint.get("delivery_pr_url"):
+                return {**sprint, "items": items}
+            body = self._sprint_delivery_body(sprint, items)
+            url = self.github.create_pr(
+                branch=branch,
+                base="main",
+                title=f"{sprint['title']}: integrated delivery",
+                body=body,
+            )
+            sprint = self.database.update_sprint(
+                int(sprint["id"]),
+                delivery_pr_url=url,
+                delivery_sha=head,
+                retro_state="waiting_ci",
+                last_error=None,
+            )
+            self.notifier.send(
+                f"sprint:{sprint['number']}:delivery-pr:{head}",
+                f"{sprint['title']} finished implementation and opened its integration PR: {url}. "
+                "Final CI and the exact-SHA retrospective are next.",
+                {"sprint": sprint["number"], "pr": url, "sha": head},
+            )
+            return {**sprint, "items": items}
+
+        self.database.observe("github", f"pr:{pr.number}", asdict(pr))
+        if pr.base_branch != "main":
+            error = f"sprint delivery PR #{pr.number} targets {pr.base_branch!r}, expected 'main'"
+            sprint = self.database.update_sprint(
+                int(sprint["id"]), retro_state="failed", last_error=error
+            )
+            return {**sprint, "items": items}
+        if pr.merged:
+            if sprint.get("retro_verdict") != "pass" or sprint.get("retro_sha") != pr.head_sha:
+                raise AuthorityUnavailable(
+                    f"sprint delivery PR #{pr.number} merged without a passing exact-SHA retrospective"
+                )
+            return self._finish_merged_sprint(sprint, items, pr)
+        if pr.closed_unmerged:
+            error = f"sprint delivery PR #{pr.number} was closed without merge"
+            sprint = self.database.update_sprint(
+                int(sprint["id"]), retro_state="failed", last_error=error
+            )
+            return {**sprint, "items": items}
+
+        expected_body = self._sprint_delivery_body(sprint, items)
+        if pr.body != expected_body:
+            self.github.update_pr_body(pr.number, expected_body)
+        reset: dict[str, Any] = {}
+        if sprint.get("delivery_sha") != pr.head_sha:
+            reset = {
+                "delivery_sha": pr.head_sha,
+                "retro_state": "waiting_ci",
+                "retro_workspace_id": None,
+                "retro_agent_id": None,
+                "retro_requested_at": None,
+                "retro_sha": None,
+                "retro_verdict": None,
+                "retro_findings": None,
+                "last_error": None,
+            }
+        identity = {
+            "delivery_pr_number": pr.number,
+            "delivery_pr_url": pr.url,
+            **reset,
+        }
+        if any(sprint.get(key) != value for key, value in identity.items()):
+            sprint = self.database.update_sprint(int(sprint["id"]), **identity)
+
+        if pr.mergeable == "CONFLICTING":
+            error = f"sprint delivery PR #{pr.number} conflicts with main"
+            sprint = self.database.update_sprint(
+                int(sprint["id"]), retro_state="failed", last_error=error
+            )
+            return {**sprint, "items": items}
+        if pr.ci == "RED":
+            error = "Final sprint CI failed:\n" + self.github.pr_failure_evidence(pr)
+            sprint = self.database.update_sprint(
+                int(sprint["id"]),
+                retro_state="failed",
+                retro_verdict="fail",
+                retro_findings=error[:8000],
+                last_error=error[:8000],
+            )
+            return {**sprint, "items": items}
+        if pr.ci != "GREEN":
+            if sprint.get("retro_state") != "waiting_ci":
+                sprint = self.database.update_sprint(
+                    int(sprint["id"]), retro_state="waiting_ci", last_error=None
+                )
+            return {**sprint, "items": items}
+
+        if sprint.get("retro_verdict") == "pass" and sprint.get("retro_sha") == pr.head_sha:
+            if self.config.sprint_auto_merge:
+                self.github.merge_pr(pr.number, head_sha=pr.head_sha)
+                self.github.invalidate_pr(branch)
+                sprint = self.database.update_sprint(
+                    int(sprint["id"]), retro_state="merging", last_error=None
+                )
+            return {**sprint, "items": items}
+        if sprint.get("retro_verdict") == "fail" and sprint.get("retro_sha") == pr.head_sha:
+            return {**sprint, "items": items}
+
+        review_paths = self.github.pr_files(pr.number)
+        if not review_paths:
+            error = "sprint delivery PR has no changed files to review"
+            sprint = self.database.update_sprint(
+                int(sprint["id"]), retro_state="failed", last_error=error
+            )
+            return {**sprint, "items": items}
+        if sprint.get("retro_workspace_id"):
+            self._publish_sprint_retro_result(sprint, pr, review_paths)
+            sprint = self.database.active_sprint() or sprint
+            if sprint.get("retro_verdict") == "pass" and self.config.sprint_auto_merge:
+                self.github.merge_pr(pr.number, head_sha=pr.head_sha)
+                self.github.invalidate_pr(branch)
+                sprint = self.database.update_sprint(
+                    int(sprint["id"]), retro_state="merging", last_error=None
+                )
+            return {**sprint, "items": items}
+
+        review_name = (
+            f"{self.config.superset.workspace_prefix}-sprint-{sprint['number']}-retro-"
+            f"{pr.head_sha[:8]}"
+        )
+        existing = self.superset.workspace_by_name(review_name)
+        if existing:
+            sprint = self.database.update_sprint(
+                int(sprint["id"]),
+                retro_state="reviewing",
+                retro_workspace_id=existing.id,
+                retro_requested_at=sprint.get("retro_requested_at") or utcnow(),
+                retro_sha=pr.head_sha,
+                last_error=None,
+            )
+            return {**sprint, "items": items}
+        review_branch = f"review/sprint-{sprint['number']}-{pr.head_sha[:12]}"
+        self._prepare_exact_branch(review_branch, pr.head_sha)
+        project_id = self.superset.ensure_project(self.config.repo_path)
+        controller_job = f"sprint-{sprint['number']}-retro"
+        workspace, agent_id = self.superset.create_review_workspace(
+            project_id,
+            pr.number,
+            review_name,
+            review_branch,
+            self._sprint_retro_prompt(sprint, items, pr),
+            issue_number=int(items[0]["issue_number"]),
+            controller_job=controller_job,
+            verify_command=self.config.sprint_verify_command,
+            review_paths=review_paths,
+        )
+        sprint = self.database.update_sprint(
+            int(sprint["id"]),
+            retro_state="reviewing",
+            retro_workspace_id=workspace.id,
+            retro_agent_id=agent_id,
+            retro_requested_at=utcnow(),
+            retro_sha=pr.head_sha,
+            retro_verdict=None,
+            retro_findings=None,
+            last_error=None,
+        )
+        self.notifier.send(
+            f"sprint:{sprint['number']}:retro:{pr.head_sha}",
+            f"{sprint['title']} final CI is green. The independent exact-SHA retrospective "
+            f"is running in Superset: {workspace.url or workspace.name}",
+            {"sprint": sprint["number"], "pr": pr.url, "workspace": workspace.id},
+        )
+        return {**sprint, "items": items}
+
     def _derive_issue_state(self, issue_number: int) -> str:
         jobs = self.database.list_current_jobs(issue_number)
         states = {job["state"] for job in jobs}
         if jobs and states <= {"merged"}:
-            state = "completed"
+            state = (
+                "integrated"
+                if self._sprint_for_issue(issue_number) is not None
+                else "completed"
+            )
         elif states.intersection({"blocked", "quarantined", "closed"}):
             state = "blocked"
         elif jobs and states <= {"ready_merge", "merged"}:

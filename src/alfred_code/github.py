@@ -30,6 +30,7 @@ class PullRequestObservation:
     body: str = ""
     merged_at: str = ""
     checks: tuple[dict[str, Any], ...] = ()
+    base_branch: str = "main"
 
     @property
     def merged(self) -> bool:
@@ -454,6 +455,24 @@ class GitHubClient:
         self._pull_requests.clear()
         self._pr_comments.pop(number, None)
 
+    def merge_pr(self, number: int, *, head_sha: str) -> None:
+        """Squash-merge one already validated PR without bypassing branch protection."""
+        self.assert_trusted_operator()
+        self._run(
+            [
+                "pr",
+                "merge",
+                str(number),
+                "--repo",
+                self.config.repo,
+                "--squash",
+                "--match-head-commit",
+                head_sha,
+            ],
+            timeout=300,
+        )
+        self._pull_requests.clear()
+
     def ensure_label(self, name: str, color: str, description: str) -> None:
         try:
             self._run(
@@ -719,7 +738,7 @@ class GitHubClient:
                 "--limit",
                 "1",
                 "--json",
-                "number,url,state,headRefOid,headRefName,mergeStateStatus,mergeable,statusCheckRollup,isDraft,body,mergedAt",
+                "number,url,state,headRefOid,headRefName,baseRefName,mergeStateStatus,mergeable,statusCheckRollup,isDraft,body,mergedAt",
             ]
         )
         if not result:
@@ -736,6 +755,7 @@ class GitHubClient:
             mergeable=str(pr.get("mergeable") or "UNKNOWN").upper(),
             is_draft=bool(pr.get("isDraft")),
             branch=str(pr.get("headRefName") or branch),
+            base_branch=str(pr.get("baseRefName") or "main"),
             body=str(pr.get("body") or ""),
             merged_at=str(pr.get("mergedAt") or ""),
             checks=tuple(

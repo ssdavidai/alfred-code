@@ -6,6 +6,10 @@ poll_seconds = 60
 max_parallel_planners = 3
 auto_replan_max_attempts = 2
 sprint_duration_days = 14
+# Opt in only when the repository's protected main branch and CI are configured.
+sprint_integration_enabled = false
+sprint_auto_merge = false
+sprint_verify_command = "git diff --check"
 planner_command = ["codex", "exec", "--profile", "alfred-planner", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\"", "-c", "web_search=\"disabled\"", "-c", "mcp_servers={}", "-c", "plugins={}", "-c", "memories={generate_memories=false,use_memories=false}", "--ephemeral", "--strict-config", "--json"]
 planner_timeout_seconds = 900
 

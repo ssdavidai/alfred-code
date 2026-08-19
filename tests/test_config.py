@@ -11,6 +11,9 @@ def test_parallel_planner_default_is_bounded(tmp_path: Path) -> None:
 
     assert config.max_parallel_planners == 3
     assert config.auto_replan_max_attempts == 2
+    assert config.sprint_integration_enabled is False
+    assert config.sprint_auto_merge is False
+    assert config.sprint_verify_command == "git diff --check"
     assert config.project_refresh_seconds == 900
     assert config.planner_command[:2] == ("codex", "exec")
     assert config.planner_command[config.planner_command.index("--model") + 1] == "gpt-5.6-sol"
@@ -64,6 +67,29 @@ def test_auto_replan_bound_is_validated(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="between 0 and 5"):
         load_config(path)
+
+
+def test_sprint_auto_merge_requires_isolated_sprint_integration(tmp_path: Path) -> None:
+    path = tmp_path / "controller.toml"
+    path.write_text("sprint_auto_merge = true\n")
+
+    with pytest.raises(ConfigurationError, match="requires sprint_integration_enabled"):
+        load_config(path)
+
+
+def test_sprint_integration_configuration_is_loaded(tmp_path: Path) -> None:
+    path = tmp_path / "controller.toml"
+    path.write_text(
+        "sprint_integration_enabled = true\n"
+        "sprint_auto_merge = true\n"
+        'sprint_verify_command = "./scripts/verify-sprint.sh"\n'
+    )
+
+    config = load_config(path)
+
+    assert config.sprint_integration_enabled is True
+    assert config.sprint_auto_merge is True
+    assert config.sprint_verify_command == "./scripts/verify-sprint.sh"
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,7 @@ STATE_TO_COLUMN = {
     "approved": "queued",
     "building": "building",
     "ready_merge": "ready_merge",
+    "integrated": "ready_merge",
     "blocked": "blocked",
     "completed": "done",
     "closed": "done",
@@ -895,7 +896,7 @@ class DashboardData:
             completed_points = sum(
                 int(item.get("story_points") or 0)
                 for item in items
-                if item.get("status") == "done"
+                if item.get("status") in {"integrated", "done"}
             )
             committed_points = sum(
                 int(item.get("story_points") or 0)
@@ -917,7 +918,7 @@ class DashboardData:
                     "carryover_points": sum(
                         int(item.get("story_points") or 0)
                         for item in items
-                        if item.get("status") not in {"done", "active"}
+                        if item.get("status") not in {"integrated", "done", "active"}
                     ),
                     "tokens": sprint_tokens,
                     "tokens_per_completed_point": (

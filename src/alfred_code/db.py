@@ -16,7 +16,7 @@ from .states import (
 from .util import canonical_json, utcnow
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA = """
@@ -147,6 +147,22 @@ CREATE TABLE IF NOT EXISTS sprints (
     starts_at TEXT NOT NULL,
     ends_at TEXT NOT NULL,
     closed_at TEXT,
+    base_sha TEXT,
+    branch TEXT UNIQUE,
+    workspace_id TEXT,
+    workspace_url TEXT,
+    integration_head_sha TEXT,
+    delivery_pr_number INTEGER,
+    delivery_pr_url TEXT,
+    delivery_sha TEXT,
+    retro_state TEXT NOT NULL DEFAULT 'pending',
+    retro_workspace_id TEXT,
+    retro_agent_id TEXT,
+    retro_requested_at TEXT,
+    retro_sha TEXT,
+    retro_verdict TEXT,
+    retro_findings TEXT,
+    last_error TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sprints_state_idx ON sprints(state, number);
@@ -227,7 +243,7 @@ class Database:
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             return
-        if row["version"] not in {1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION}:
+        if row["version"] not in {1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION}:
             raise RuntimeError(
                 f"database schema {row['version']} is not supported by controller {SCHEMA_VERSION}"
             )
@@ -280,6 +296,37 @@ class Database:
                     "ALTER TABLE issues ADD COLUMN carryover_replan "
                     "INTEGER NOT NULL DEFAULT 0 CHECK (carryover_replan IN (0, 1))"
                 )
+
+            sprint_columns = {
+                item["name"] for item in self.connection.execute("PRAGMA table_info(sprints)")
+            }
+            sprint_additions = {
+                "base_sha": "TEXT",
+                "branch": "TEXT",
+                "workspace_id": "TEXT",
+                "workspace_url": "TEXT",
+                "integration_head_sha": "TEXT",
+                "delivery_pr_number": "INTEGER",
+                "delivery_pr_url": "TEXT",
+                "delivery_sha": "TEXT",
+                "retro_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "retro_workspace_id": "TEXT",
+                "retro_agent_id": "TEXT",
+                "retro_requested_at": "TEXT",
+                "retro_sha": "TEXT",
+                "retro_verdict": "TEXT",
+                "retro_findings": "TEXT",
+                "last_error": "TEXT",
+            }
+            for name, declaration in sprint_additions.items():
+                if name not in sprint_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE sprints ADD COLUMN {name} {declaration}"
+                    )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sprints_branch_idx "
+                "ON sprints(branch) WHERE branch IS NOT NULL"
+            )
 
         if self._jobs_has_lane_uniqueness():
             self._remove_jobs_lane_uniqueness()
@@ -677,6 +724,54 @@ class Database:
             ).fetchone()
         )
 
+    def update_sprint(self, sprint_id: int, **values: Any) -> dict[str, Any]:
+        allowed = {
+            "base_sha",
+            "branch",
+            "workspace_id",
+            "workspace_url",
+            "integration_head_sha",
+            "delivery_pr_number",
+            "delivery_pr_url",
+            "delivery_sha",
+            "retro_state",
+            "retro_workspace_id",
+            "retro_agent_id",
+            "retro_requested_at",
+            "retro_sha",
+            "retro_verdict",
+            "retro_findings",
+            "last_error",
+        }
+        unknown = set(values).difference(allowed)
+        if unknown:
+            raise ValueError(f"unsupported sprint fields: {sorted(unknown)}")
+        if not values:
+            sprint = self._dict(
+                self.connection.execute("SELECT * FROM sprints WHERE id=?", (sprint_id,)).fetchone()
+            )
+            if sprint is None:
+                raise KeyError(f"sprint {sprint_id} not found")
+            return sprint
+        assignments = ", ".join(f"{name}=?" for name in values)
+        with self.transaction() as conn:
+            if conn.execute("SELECT id FROM sprints WHERE id=?", (sprint_id,)).fetchone() is None:
+                raise KeyError(f"sprint {sprint_id} not found")
+            conn.execute(
+                f"UPDATE sprints SET {assignments} WHERE id=?",
+                (*values.values(), sprint_id),
+            )
+            self.event(
+                "sprint.integration_updated",
+                {"sprint_id": sprint_id, **values},
+                connection=conn,
+            )
+        sprint = self._dict(
+            self.connection.execute("SELECT * FROM sprints WHERE id=?", (sprint_id,)).fetchone()
+        )
+        assert sprint is not None
+        return sprint
+
     def list_sprints(self) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -702,7 +797,12 @@ class Database:
             self.connection.execute(
                 """
                 SELECT si.*, s.number AS sprint_number, s.title AS sprint_title,
-                       s.state AS sprint_state, s.iteration_id, s.starts_at, s.ends_at
+                       s.state AS sprint_state, s.iteration_id, s.starts_at, s.ends_at,
+                       s.base_sha AS sprint_base_sha, s.branch AS sprint_branch,
+                       s.integration_head_sha AS sprint_head_sha,
+                       s.workspace_id AS sprint_workspace_id,
+                       s.workspace_url AS sprint_workspace_url,
+                       s.retro_state AS sprint_retro_state
                 FROM sprint_items si JOIN sprints s ON s.id=si.sprint_id
                 WHERE si.issue_number=? AND s.state='active'
                 ORDER BY s.number DESC LIMIT 1

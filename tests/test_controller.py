@@ -14,6 +14,8 @@ from alfred_code.audit import AuditLog
 from alfred_code.agent_security import (
     LAUNCH_REVISION,
     LAUNCH_STATUS,
+    REVIEW_RESULT,
+    SECURITY_POLICY,
     WORKER_RESULT,
     write_launch_status,
 )
@@ -58,6 +60,7 @@ class FakeGitHub:
         self.invalidated_prs = []
         self.auto_replans = []
         self.closed_prs = []
+        self.merged_prs = []
         self.failure_evidence = "gitleaks failed at docs/contract.md:234"
 
     def intake_issues(self):
@@ -160,6 +163,12 @@ class FakeGitHub:
             if pr and pr.number == number:
                 self.prs[branch] = replace(pr, state="CLOSED")
 
+    def merge_pr(self, number, *, head_sha):
+        self.merged_prs.append((number, head_sha))
+        for branch, pr in list(self.prs.items()):
+            if pr and pr.number == number:
+                self.prs[branch] = replace(pr, state="MERGED", merged_at="now")
+
 
 class FakePlanner:
     def __init__(self, plan, plan_hash):
@@ -261,11 +270,12 @@ class FakeSuperset:
         self.review_creates = 0
         self.agent_starts = 0
         self.agent_prompts = []
+        self.integration_creates = 0
 
     def workspace_by_name(self, name):
         return self.workspaces_by_name.get(name)
 
-    def create_worker(self, repo_path, issue_number, job, prompt):
+    def create_worker(self, repo_path, issue_number, job, prompt, base_branch="main"):
         self.worker_creates += 1
         name = worker_workspace_name(
             "alfred-code", issue_number, job["lane"], job["job_id"]
@@ -274,6 +284,16 @@ class FakeSuperset:
         self.workspaces_by_name[name] = workspace
         self.details[workspace.id] = {"id": workspace.id, "agents": [{"status": "RUNNING"}]}
         return workspace, f"a-{job['job_id']}"
+
+    def create_integration_workspace(self, *, repo_path, sprint_number, branch):
+        self.integration_creates += 1
+        name = f"alfred-code-sprint-{sprint_number}-integration"
+        workspace = self.workspaces_by_name.get(name)
+        if workspace is None:
+            workspace = Workspace(f"sprint-{sprint_number}", name, branch, f"superset://{name}")
+            self.workspaces_by_name[name] = workspace
+            self.details[workspace.id] = {"id": workspace.id, "agents": []}
+        return workspace
 
     def workspace_details(self, workspace_id):
         return self.details[workspace_id]
@@ -1280,6 +1300,150 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.planner.calls, 1)
         self.assertEqual(self.db.get_issue(12)["product_stage"], "active")
 
+    def test_reviewed_lane_auto_merges_only_into_its_sprint_branch(self):
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            sprint_integration_enabled=True,
+            sprint_auto_merge=True,
+            github=replace(self.config.github, project_number=3),
+        )
+        self.db.upsert_issue(self.issue)
+        self.db.set_product_stage(12, "sprint_queue")
+        sprint = self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        branch = "alfred-code/sprint-0-integration"
+        self.db.update_sprint(
+            sprint["id"],
+            base_sha=self.sha,
+            branch=branch,
+            integration_head_sha=self.sha,
+            workspace_id="sprint-0",
+        )
+        self.db.save_plan(12, self.plan_hash, self.plan)
+        self.db.record_approval(12, self.plan_hash, "owner", "approval", None, "now")
+        self.db.materialize_jobs(12, self.plan_hash, self.plan)
+        self.db.update_job("api-12", state="reviewing", review_sha=self.sha)
+        self.github.verdicts[(5, self.sha)] = "pass"
+        pr = PullRequestObservation(
+            5,
+            "https://example/pr/5",
+            "OPEN",
+            self.sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            "lane-1/12-api",
+            "## Smoke evidence\nreal output",
+            base_branch=branch,
+        )
+
+        self.controller._reconcile_pr(
+            self.db.get_issue(12), self.plan, self.db.get_job("api-12"), pr
+        )
+
+        self.assertEqual(self.github.merged_prs, [(5, self.sha)])
+        self.assertEqual(self.db.get_job("api-12")["state"], "ready_merge")
+
+    def test_sprint_closes_only_after_green_exact_sha_retro_and_final_merge(self):
+        project = FakeProject()
+        self.controller.project = project
+        self.controller.config = replace(
+            self.config,
+            sprint_integration_enabled=True,
+            sprint_auto_merge=True,
+            sprint_verify_command="true",
+            github=replace(self.config.github, project_number=3),
+        )
+        self.db.upsert_issue(self.issue)
+        self.db.set_product_stage(12, "sprint_queue")
+        sprint = self.db.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[12],
+        )
+        branch = "alfred-code/sprint-0-integration"
+        self.db.update_sprint(
+            sprint["id"],
+            base_sha=self.sha,
+            branch=branch,
+            integration_head_sha=self.sha,
+            workspace_id="sprint-0",
+        )
+        self.db.save_plan(12, self.plan_hash, self.plan)
+        self.db.record_approval(12, self.plan_hash, "owner", "approval", None, "now")
+        self.db.materialize_jobs(12, self.plan_hash, self.plan)
+        self.db.update_job("api-12", state="merged", head_sha=self.sha)
+        self.db.set_issue_state(12, "integrated")
+        self.db.set_sprint_item_status(12, "integrated")
+        self.controller._ensure_active_sprint_integration = (
+            lambda default_branch_sha=None: self.db.active_sprint()
+        )
+        self.controller._refresh_sprint_head = lambda value: value
+        self.controller._prepare_exact_branch = lambda review_branch, head_sha: None
+        delivery = PullRequestObservation(
+            99,
+            "https://example/pr/99",
+            "OPEN",
+            self.sha,
+            "GREEN",
+            "CLEAN",
+            "MERGEABLE",
+            False,
+            branch,
+            "",
+            base_branch="main",
+        )
+        self.github.prs[branch] = delivery
+
+        reviewing = self.controller._reconcile_active_sprint()
+        self.assertEqual(reviewing["retro_state"], "reviewing")
+        workspace_id = reviewing["retro_workspace_id"]
+        self.superset.details[workspace_id]["worktreePath"] = str(self.repo)
+        (self.repo / ".lane").write_text(
+            json.dumps(
+                {
+                    "lane": "review",
+                    "issue": 12,
+                    "allowed": ["file.txt"],
+                    "verify": "true",
+                    "controller_job": "sprint-0-retro",
+                    "role": "reviewer",
+                    "security_policy": SECURITY_POLICY,
+                }
+            )
+        )
+        (self.repo / REVIEW_RESULT).write_text(
+            json.dumps(
+                {
+                    "head_sha": self.sha,
+                    "verdict": "pass",
+                    "findings": "All committed work is present and the combined verification passed.",
+                }
+            )
+        )
+
+        merging = self.controller._reconcile_active_sprint()
+        self.assertEqual(merging["retro_state"], "merging")
+        self.assertEqual(self.github.merged_prs, [(99, self.sha)])
+        closed = self.controller._reconcile_active_sprint()
+
+        self.assertEqual(closed["state"], "closed")
+        self.assertEqual(closed["retro_state"], "passed")
+        self.assertIsNone(self.db.active_sprint())
+        self.assertEqual(self.db.get_issue(12)["controller_state"], "completed")
+        self.assertEqual(self.db.get_issue(12)["product_stage"], "done")
     def test_twenty_one_point_plan_is_not_executable_and_closes_sprint_for_refinement(self):
         self.db.upsert_issue(self.issue)
         self.db.start_sprint(

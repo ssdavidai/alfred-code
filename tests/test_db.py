@@ -456,6 +456,39 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.get_issue(8)["carryover_replan"], 1)
         self.assertEqual(self.database.get_issue(8)["controller_state"], "planning")
 
+    def test_sprint_integration_and_retro_state_are_durable(self):
+        self.database.set_product_stage(7, "sprint_queue")
+        sprint = self.database.start_sprint(
+            title="Sprint 0 — Calibration",
+            duration_days=14,
+            starts_at="2026-07-22T08:00:00Z",
+            ends_at="2026-08-05T08:00:00Z",
+            iteration_id="iteration-0",
+            issue_numbers=[7],
+        )
+
+        updated = self.database.update_sprint(
+            sprint["id"],
+            base_sha="a" * 40,
+            branch="alfred-code/sprint-0-integration",
+            workspace_id="workspace-0",
+            integration_head_sha="b" * 40,
+            delivery_pr_number=99,
+            delivery_pr_url="https://example/pr/99",
+            delivery_sha="b" * 40,
+            retro_state="passed",
+            retro_sha="b" * 40,
+            retro_verdict="pass",
+            retro_findings="combined verification passed",
+        )
+
+        self.assertEqual(updated["branch"], "alfred-code/sprint-0-integration")
+        self.assertEqual(updated["delivery_pr_number"], 99)
+        self.assertEqual(updated["retro_verdict"], "pass")
+        self.assertEqual(
+            self.database.current_sprint_item(7)["sprint_head_sha"], "b" * 40
+        )
+
     def test_manually_closed_sprint_item_is_terminal_without_carryover(self):
         self.database.set_product_stage(7, "sprint_queue")
         sprint = self.database.start_sprint(

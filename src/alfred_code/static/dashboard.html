@@ -520,11 +520,24 @@
       container.replaceChildren();
       const copy = node('div', 'sprint-copy');
       if (sprint) {
+        const integration = sprint.branch
+          ? ` · ${sprint.branch} · ${String(sprint.retro_state || 'pending').replaceAll('_', ' ')}`
+          : '';
         copy.append(
           node('strong', '', `${sprint.title}${sprint.overdue ? ' · overdue' : ''}`),
-          node('span', '', `${sprint.completed_points} completed · ${sprint.committed_points} committed · ${sprint.added_points} added · ${sprint.items.length} cards`)
+          node('span', '', `${sprint.completed_points} completed · ${sprint.committed_points} committed · ${sprint.added_points} added · ${sprint.items.length} cards${integration}`)
         );
-        container.append(copy, node('div', 'badge ready', sprint.state));
+        const actions = node('div', 'detail-actions');
+        if (sprint.workspace_url) actions.append(link('Sprint worktree', sprint.workspace_url));
+        if (sprint.delivery_pr_url) actions.append(link('Integration PR', sprint.delivery_pr_url));
+        if (sprint.last_error) {
+          const failure = node('span', 'badge blocked', 'needs attention');
+          failure.title = sprint.last_error;
+          actions.append(failure);
+        } else {
+          actions.append(node('span', 'badge ready', sprint.retro_state || sprint.state));
+        }
+        container.append(copy, actions);
         return;
       }
       const queued = state.snapshot.issues.filter((issue) => issue.column === 'sprint_queue').length;

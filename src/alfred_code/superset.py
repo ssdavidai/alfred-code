@@ -142,6 +142,7 @@ class SupersetClient:
         issue_number: int,
         job: dict[str, Any],
         prompt: str,
+        base_branch: str = "main",
     ) -> tuple[Workspace, str | None]:
         self._assert_scoped_agent(self.config.worker_agent)
         name = worker_workspace_name(
@@ -181,7 +182,7 @@ class SupersetClient:
                 "--branch",
                 job["branch"],
                 "--base-branch",
-                "main",
+                base_branch,
                 "--command",
                 command,
                 "--agent",
@@ -203,6 +204,56 @@ class SupersetClient:
         agent_data = result.get("agent") if isinstance(result.get("agent"), dict) else {}
         agent_id = agent_data.get("id") or result.get("agentId")
         return workspace, str(agent_id) if agent_id else None
+
+    def create_integration_workspace(
+        self,
+        *,
+        repo_path: Path,
+        sprint_number: int,
+        branch: str,
+    ) -> Workspace:
+        name = f"{self.config.workspace_prefix}-sprint-{sprint_number}-integration"
+        existing = self.workspace_by_name(name)
+        if existing:
+            if existing.branch != branch:
+                raise AuthorityUnavailable(
+                    f"workspace {name!r} uses {existing.branch!r}, expected {branch!r}"
+                )
+            return existing
+        branch_workspace = self.workspace_for_branch(branch)
+        if branch_workspace:
+            raise AuthorityUnavailable(
+                f"sprint branch {branch!r} already belongs to Superset workspace "
+                f"{branch_workspace.name!r}"
+            )
+        project_id = self.ensure_project(repo_path)
+        result = self._json(
+            [
+                "workspaces",
+                "create",
+                "--local",
+                "--project",
+                project_id,
+                "--name",
+                name,
+                "--branch",
+                branch,
+                "--base-branch",
+                "main",
+            ],
+            timeout=300,
+        )
+        if not isinstance(result, dict):
+            raise AuthorityUnavailable(
+                "Superset sprint integration workspace creation returned a non-object response"
+            )
+        data = result.get("workspace") if isinstance(result.get("workspace"), dict) else result
+        return Workspace(
+            id=self._id(data),
+            name=str(data.get("name") or name),
+            branch=str(data.get("branch") or data.get("branchName") or branch),
+            url=data.get("url") or data.get("deeplink") or data.get("webUrl"),
+        )
 
     def start_reviewer(self, workspace_id: str, prompt: str) -> str | None:
         return self.start_agent(workspace_id, self.config.reviewer_agent, prompt)
