@@ -33,7 +33,7 @@ api_key_env = "SUPERSET_API_KEY"
 cleanup_merged_workspaces = false
 worker_launch_timeout_seconds = 120
 worker_progress_timeout_seconds = 1200
-review_repair_max_attempts = 2
+review_repair_max_attempts = 4
 
 [slack]
 enabled = false

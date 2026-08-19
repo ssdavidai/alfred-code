@@ -1270,6 +1270,58 @@ class Database:
             result["children"].append(value)
         return result
 
+    def split_child_dependencies(self, child_issue_number: int) -> list[int]:
+        """Resolve a split child's job dependencies to their sibling issue numbers.
+
+        The split graph is controller-authored durable state. Child planners may
+        refine implementation details, but they must not be able to erase the
+        ordering that the operator approved when the parent was split.
+        """
+        child = self.connection.execute(
+            """
+            SELECT parent_issue_number, plan_hash, job_id, spec_json
+            FROM issue_split_children
+            WHERE child_issue_number=?
+            ORDER BY parent_issue_number DESC, ordinal
+            LIMIT 1
+            """,
+            (child_issue_number,),
+        ).fetchone()
+        if child is None:
+            return []
+        spec = json.loads(child["spec_json"])
+        dependency_ids = [str(value) for value in spec.get("depends_on") or []]
+        if not dependency_ids:
+            return []
+        placeholders = ",".join("?" for _ in dependency_ids)
+        rows = list(
+            self.connection.execute(
+                f"""
+                SELECT job_id, child_issue_number
+                FROM issue_split_children
+                WHERE parent_issue_number=? AND plan_hash=?
+                  AND job_id IN ({placeholders})
+                """,
+                (
+                    int(child["parent_issue_number"]),
+                    str(child["plan_hash"]),
+                    *dependency_ids,
+                ),
+            )
+        )
+        resolved = {
+            str(row["job_id"]): int(row["child_issue_number"])
+            for row in rows
+            if row["child_issue_number"] is not None
+        }
+        missing = [job_id for job_id in dependency_ids if job_id not in resolved]
+        if missing:
+            raise RuntimeError(
+                "split dependency graph is incomplete for child "
+                f"#{child_issue_number}: {', '.join(missing)}"
+            )
+        return [resolved[job_id] for job_id in dependency_ids]
+
     def record_split_child_created(
         self,
         issue_number: int,
@@ -1709,7 +1761,11 @@ class Database:
                         job["lane"],
                         job["title"],
                         job["branch"],
-                        None if job.get("depends_on") else plan["base_sha"],
+                        (
+                            None
+                            if job.get("depends_on") or plan.get("issue_dependencies")
+                            else plan["base_sha"]
+                        ),
                         canonical_json(job["paths"]),
                         job["verify"],
                         canonical_json(
@@ -1875,6 +1931,133 @@ class Database:
                     job_id=job_id,
                     connection=conn,
                 )
+        return self.get_job(job_id) or {}
+
+    def rotate_job_delivery_branch(
+        self,
+        job_id: str,
+        *,
+        expected_branch: str,
+        replacement_branch: str,
+        pr_url: str,
+        head_sha: str,
+    ) -> dict[str, Any]:
+        """Bind a job to a new non-destructive delivery branch.
+
+        This is intentionally narrower than making ``branch`` a generic mutable
+        job field. It is used only when a history-scanning CI check cannot be
+        repaired by an additive commit and the original branch is retained.
+        """
+        if not replacement_branch.startswith(f"{expected_branch}-clean-r"):
+            raise ValueError("replacement branch is not derived from the approved branch")
+        with self.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if previous is None:
+                raise KeyError(f"job {job_id} not found")
+            if str(previous["branch"]) != expected_branch:
+                raise ValueError(
+                    f"job {job_id} branch changed before clean-history rotation"
+                )
+            if str(previous["state"]) != "repairing":
+                raise ValueError(
+                    f"job {job_id} must be repairing before clean-history rotation"
+                )
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET branch=?, state='pr_open', pr_number=NULL, pr_url=?, head_sha=?,
+                    review_sha=NULL, review_workspace_id=NULL, review_agent_id=NULL,
+                    review_requested_at=NULL, repair_attempts=0, repair_sha=NULL,
+                    repair_agent_id=NULL, repair_requested_at=NULL,
+                    repair_token=NULL, last_error=NULL,
+                    updated_at=?
+                WHERE job_id=?
+                """,
+                (replacement_branch, pr_url, head_sha, now, job_id),
+            )
+            self.event(
+                "job.delivery_branch_rotated",
+                {
+                    "from_branch": expected_branch,
+                    "to_branch": replacement_branch,
+                    "pr_url": pr_url,
+                    "head_sha": head_sha,
+                },
+                issue_number=int(previous["issue_number"]),
+                job_id=job_id,
+                connection=conn,
+            )
+        return self.get_job(job_id) or {}
+
+    def reset_clean_delivery_repair_budget(
+        self,
+        job_id: str,
+        *,
+        expected_branch: str,
+        expected_head_sha: str,
+    ) -> dict[str, Any]:
+        """Recover repair accounting for a clean delivery created before this fix."""
+        with self.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if previous is None:
+                raise KeyError(f"job {job_id} not found")
+            if (
+                str(previous["branch"]) != expected_branch
+                or str(previous["head_sha"] or "") != expected_head_sha
+            ):
+                raise ValueError("clean delivery changed before repair-budget recovery")
+            rotations = conn.execute(
+                """
+                SELECT detail_json FROM events
+                WHERE job_id=? AND kind='job.delivery_branch_rotated'
+                ORDER BY id DESC
+                """,
+                (job_id,),
+            ).fetchall()
+            matched = False
+            for row in rotations:
+                try:
+                    detail = json.loads(row["detail_json"])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    detail.get("to_branch") == expected_branch
+                    and detail.get("head_sha") == expected_head_sha
+                ):
+                    matched = True
+                    break
+            if not matched:
+                raise ValueError("job has no matching clean-delivery rotation event")
+            previous_attempts = int(previous["repair_attempts"] or 0)
+            if previous_attempts == 0:
+                return dict(previous)
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE jobs
+                SET repair_attempts=0, repair_sha=NULL, repair_agent_id=NULL,
+                    repair_requested_at=NULL, repair_token=NULL,
+                    last_error=NULL, updated_at=?
+                WHERE job_id=?
+                """,
+                (now, job_id),
+            )
+            self.event(
+                "job.clean_delivery_repair_budget_reset",
+                {
+                    "branch": expected_branch,
+                    "head_sha": expected_head_sha,
+                    "previous_attempts": previous_attempts,
+                },
+                issue_number=int(previous["issue_number"]),
+                job_id=job_id,
+                connection=conn,
+            )
         return self.get_job(job_id) or {}
 
     def acquire_lane(self, lane: str, job_id: str) -> bool:

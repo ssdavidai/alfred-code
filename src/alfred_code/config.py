@@ -67,7 +67,7 @@ class SupersetConfig:
     cleanup_merged_workspaces: bool = False
     worker_launch_timeout_seconds: int = 120
     worker_progress_timeout_seconds: int = 1200
-    review_repair_max_attempts: int = 2
+    review_repair_max_attempts: int = 4
 
 
 @dataclass(frozen=True)
@@ -187,7 +187,7 @@ def load_config(path: Path | None = None) -> ControllerConfig:
                 superset_raw.get("worker_progress_timeout_seconds", 1200)
             ),
             review_repair_max_attempts=int(
-                superset_raw.get("review_repair_max_attempts", 2)
+                superset_raw.get("review_repair_max_attempts", 4)
             ),
         ),
         slack=SlackConfig(

@@ -2,7 +2,7 @@ import unittest
 
 from alfred_code.config import GitHubConfig, TRUSTED_GITHUB_OPERATOR
 from alfred_code.errors import AuthorityUnavailable
-from alfred_code.github import GitHubClient
+from alfred_code.github import GitHubClient, PullRequestObservation
 
 
 class FakeGitHub(GitHubClient):
@@ -523,6 +523,56 @@ class GitHubTests(unittest.TestCase):
             "PENDING",
         )
         self.assertEqual(GitHubClient._ci_state([{"conclusion": "FAILURE"}]), "RED")
+
+    def test_red_ci_evidence_includes_failed_check_log(self):
+        client = GitHubClient(GitHubConfig(repo="owner/repo", owner="owner"))
+        calls = []
+        client._run = lambda arguments, timeout=120: (
+            calls.append((arguments, timeout))
+            or "gitleaks: docs/contract.md:234 generic-api-key\n"
+        )
+        pr = PullRequestObservation(
+            9,
+            "https://example/pr/9",
+            "OPEN",
+            "a" * 40,
+            "RED",
+            "BLOCKED",
+            "MERGEABLE",
+            False,
+            "lane-1/9-api",
+            checks=(
+                {
+                    "name": "gitleaks",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/123/job/456",
+                },
+                {"name": "tests", "conclusion": "SUCCESS"},
+            ),
+        )
+
+        evidence = client.pr_failure_evidence(pr)
+
+        self.assertIn("gitleaks: FAILURE", evidence)
+        self.assertIn("docs/contract.md:234", evidence)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    [
+                        "run",
+                        "view",
+                        "123",
+                        "--repo",
+                        "owner/repo",
+                        "--job",
+                        "456",
+                        "--log-failed",
+                    ],
+                    180,
+                )
+            ],
+        )
 
     def test_review_feedback_is_exact_sha_allowlisted_and_timestamp_bound(self):
         client = FakeGitHub()

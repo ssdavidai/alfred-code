@@ -167,6 +167,41 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(parsed["hooks"]["state"][trust_key]["trusted_hash"], "sha256:test")
         self.assertNotIn("danger-full-access", profile)
 
+    def test_reviewer_paths_enable_read_only_dependency_discovery_without_source_writes(self):
+        package_root = self.workspace / "packages/learn"
+        package_root.mkdir(parents=True)
+        (package_root / "package.json").write_text(
+            json.dumps({"devDependencies": {"tsx": "1.0.0"}})
+        )
+        dependency_target = self.workspace.parent / f"{self.workspace.name}-review-deps"
+        (dependency_target / "tsx").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, dependency_target, True)
+        (package_root / "node_modules").symlink_to(
+            dependency_target, target_is_directory=True
+        )
+        reviewer = replace(
+            self.manifest,
+            role="reviewer",
+            allowed=("packages/learn/CONTRACT.md",),
+            verify="true",
+        )
+
+        profile = codex_profile(
+            reviewer,
+            profile_path=self.workspace / "reviewer.config.toml",
+            hook_trust_hash="sha256:test",
+            toolchain_paths=(Path("/trusted/bin"),),
+            git_metadata_paths=(Path("/trusted/git"),),
+        )
+
+        parsed = tomllib.loads(profile)
+        filesystem = parsed["permissions"]["alfred_scoped"]["filesystem"]
+        workspace_scope = filesystem[":workspace_roots"]
+        self.assertEqual(filesystem[str(dependency_target.resolve())], "read")
+        self.assertEqual(workspace_scope[REVIEW_RESULT], "write")
+        self.assertNotIn("packages/learn/CONTRACT.md", workspace_scope)
+        self.assertFalse(path_allowed("packages/learn/CONTRACT.md", reviewer))
+
     def test_codex_profile_rejects_unenforceable_filename_glob(self):
         manifest = replace(
             self.manifest,

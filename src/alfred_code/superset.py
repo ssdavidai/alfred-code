@@ -238,12 +238,16 @@ class SupersetClient:
         issue_number: int,
         controller_job: str,
         verify_command: str,
+        review_paths: list[str],
     ) -> tuple[Workspace, str | None]:
         self._assert_scoped_agent(self.config.reviewer_agent)
         lane_document = {
             "lane": "review",
             "issue": issue_number,
-            "allowed": [],
+            # Reviewer profiles remain read-only regardless of this list. The
+            # paths identify package roots whose validated dependency caches
+            # may be mounted read-only for acceptance-test reproduction.
+            "allowed": review_paths,
             "verify": verify_command,
             "controller_job": controller_job,
             "role": "reviewer",

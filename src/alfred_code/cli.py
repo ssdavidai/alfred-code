@@ -73,8 +73,8 @@ workspace_prefix = "alfred-code"
 api_key_env = "SUPERSET_API_KEY"
 # Workspace deletion is intentionally disabled. Enable only after auditing cleanup.
 cleanup_merged_workspaces = false
-# Failed exact-SHA reviews get at most two scoped repairs before escalation.
-review_repair_max_attempts = 2
+# Failed exact-SHA reviews get at most four scoped repairs before escalation.
+review_repair_max_attempts = 4
 
 [slack]
 enabled = false

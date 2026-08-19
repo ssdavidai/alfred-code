@@ -154,6 +154,8 @@ def test_operator_split_creates_native_children_in_inbox_and_is_idempotent(
     assert database.get_issue(1001)["product_stage"] == "inbox"
     assert plan_hash in github.issues[1001]["body"]
     assert "not approved work" in github.issues[1001]["body"]
+    assert database.split_child_dependencies(1001) == []
+    assert database.split_child_dependencies(1002) == [1001]
 
     repeated = splitter.split(42)
 

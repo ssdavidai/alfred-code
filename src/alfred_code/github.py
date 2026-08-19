@@ -29,6 +29,7 @@ class PullRequestObservation:
     branch: str
     body: str = ""
     merged_at: str = ""
+    checks: tuple[dict[str, Any], ...] = ()
 
     @property
     def merged(self) -> bool:
@@ -737,9 +738,85 @@ class GitHubClient:
             branch=str(pr.get("headRefName") or branch),
             body=str(pr.get("body") or ""),
             merged_at=str(pr.get("mergedAt") or ""),
+            checks=tuple(
+                check
+                for check in (pr.get("statusCheckRollup") or [])
+                if isinstance(check, dict)
+            ),
         )
         self._pull_requests[branch] = observation
         return observation
+
+    def pr_failure_evidence(self, pr: PullRequestObservation) -> str:
+        """Return bounded diagnostic evidence for failed PR checks.
+
+        Check output is untrusted diagnostic data. It is collected only for a
+        red PR and passed to the already-scoped repair worker; it never changes
+        the approved lane or write allowlist.
+        """
+        failed_states = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}
+        failed: list[dict[str, Any]] = []
+        for check in pr.checks:
+            state = str(
+                check.get("conclusion")
+                or check.get("state")
+                or check.get("status")
+                or ""
+            ).upper()
+            if state in failed_states:
+                failed.append(check)
+        if not failed:
+            return "GitHub reported red CI without exposing a failed check payload."
+
+        sections = ["Failed GitHub checks:"]
+        action_jobs: list[tuple[str, str | None]] = []
+        for check in failed:
+            name = str(
+                check.get("name")
+                or check.get("context")
+                or check.get("workflowName")
+                or "unnamed check"
+            )
+            state = str(
+                check.get("conclusion")
+                or check.get("state")
+                or check.get("status")
+                or "FAILURE"
+            ).upper()
+            url = str(
+                check.get("detailsUrl")
+                or check.get("targetUrl")
+                or check.get("details_url")
+                or ""
+            )
+            sections.append(f"- {name}: {state}" + (f" ({url})" if url else ""))
+            match = re.search(r"/actions/runs/(\d+)(?:/job/(\d+))?", url)
+            if match:
+                action_jobs.append((match.group(1), match.group(2)))
+
+        seen: set[tuple[str, str | None]] = set()
+        for run_id, job_id in action_jobs[:3]:
+            identity = (run_id, job_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            arguments = ["run", "view", run_id, "--repo", self.config.repo]
+            if job_id:
+                arguments.extend(["--job", job_id])
+            arguments.append("--log-failed")
+            try:
+                log = self._run(arguments, timeout=180).strip()
+            except AuthorityUnavailable as exc:
+                sections.append(
+                    f"Failed-log retrieval for run {run_id}"
+                    + (f" job {job_id}" if job_id else "")
+                    + f": {exc}"
+                )
+                continue
+            if log:
+                label = f"run {run_id}" + (f" job {job_id}" if job_id else "")
+                sections.extend(["", f"Failed log for {label}:", log[:12000]])
+        return "\n".join(sections)[:16000]
 
     def pr_files(self, number: int) -> list[str]:
         result = self._json(
