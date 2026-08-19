@@ -700,7 +700,8 @@
       const issue = state.snapshot.issues.find((item) => item.number === number);
       if (!issue) return;
       state.selected = number;
-      $('drawerKicker').textContent = `ISSUE #${number} · ${issue.column.replaceAll('_', ' ').toUpperCase()}`;
+      const columnLabel = state.snapshot.columns.find((column) => column.id === issue.column)?.label || issue.column.replaceAll('_', ' ');
+      $('drawerKicker').textContent = `ISSUE #${number} · ${columnLabel.toUpperCase()}`;
       $('drawerTitle').textContent = issue.title;
       const actions = $('drawerActions');
       actions.replaceChildren();
@@ -732,7 +733,7 @@
       const overview = node('section', 'detail-section');
       const grid = node('div', 'detail-grid');
       grid.append(
-        detailCell('State', issue.state.replaceAll('_', ' ')),
+        detailCell('State', issue.column === 'needs_split' ? 'needs splitting' : issue.state.replaceAll('_', ' ')),
         detailCell('Age', duration(issue.age_seconds)),
         detailCell('Events', issue.event_count),
         detailCell('Plan', issue.plan ? issue.plan.short_hash : 'None'),
