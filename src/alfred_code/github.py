@@ -555,6 +555,32 @@ class GitHubClient:
         )
         return self.post_issue_comment(issue_number, body)
 
+    def post_plan_approval(self, issue_number: int, plan_hash: str) -> dict[str, Any]:
+        """Post one exact, trusted approval command for the current immutable plan."""
+        if re.fullmatch(r"[0-9a-f]{64}", plan_hash) is None:
+            raise ValueError("plan approval requires the full 64-character lowercase hash")
+        self.assert_trusted_operator()
+        command = f"{self.config.approval_command} {plan_hash}"
+        for comment in reversed(self.issue_comments(issue_number)):
+            if not self._is_trusted_comment(comment):
+                continue
+            if str(comment.get("body") or "").strip() != command:
+                continue
+            return {
+                "created": False,
+                "actor": self._comment_actor(comment),
+                "comment_id": str(comment.get("id") or ""),
+                "comment_url": comment.get("html_url"),
+                "plan_hash": plan_hash,
+            }
+        return {
+            "created": True,
+            "actor": TRUSTED_GITHUB_OPERATOR,
+            "comment_id": "",
+            "comment_url": self.post_issue_comment(issue_number, command),
+            "plan_hash": plan_hash,
+        }
+
     def find_decision(self, issue_number: int, plan_hash: str) -> dict[str, Any] | None:
         expected = {
             f"{self.config.approval_command} {plan_hash}": "approve",

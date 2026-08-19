@@ -148,7 +148,11 @@ def test_needs_split_card_exposes_reason_proposed_children_and_action(tmp_path: 
         }
     ]
     assert card["split"] is None
-    assert snapshot["runtime"]["controlled_actions"] == ["start_sprint", "split_issue"]
+    assert snapshot["runtime"]["controlled_actions"] == [
+        "start_sprint",
+        "split_issue",
+        "approve_plan",
+    ]
 
 
 def test_split_http_action_requires_token_and_dispatches_explicit_click(tmp_path: Path) -> None:
@@ -196,6 +200,149 @@ def test_split_http_action_requires_token_and_dispatches_explicit_click(tmp_path
         thread.join(timeout=2)
 
 
+def test_approve_plan_posts_trusted_comment_without_shortcutting_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.upsert_issue(
+        {
+            "number": 42,
+            "title": "Bounded feature",
+            "body": "Ship one lane.",
+            "state": "OPEN",
+            "url": "https://example.test/issues/42",
+            "labels": [],
+        }
+    )
+    plan = {
+        "base_sha": "a" * 40,
+        "summary": "Implement one bounded feature.",
+        "risk": "low",
+        "story_points": 8,
+        "jobs": [],
+    }
+    digest = "b" * 64
+    database.save_plan(42, digest, plan)
+    database.close()
+
+    calls = []
+
+    class FakeGitHub:
+        def __init__(self, _config: GitHubConfig):
+            pass
+
+        def post_plan_approval(self, number: int, plan_hash: str) -> dict:
+            calls.append((number, plan_hash))
+            return {
+                "created": True,
+                "actor": "ssdavidai",
+                "comment_url": "https://example.test/comment",
+                "plan_hash": plan_hash,
+            }
+
+    monkeypatch.setattr(dashboard, "GitHubClient", FakeGitHub)
+    result = DashboardData(config).approve_plan(42, digest)
+
+    assert result["created"] is True
+    assert calls == [(42, digest)]
+    database = Database(config.database_path)
+    assert database.current_plan(42)["status"] == "awaiting_approval"
+    assert database.get_issue(42)["controller_state"] == "awaiting_approval"
+    assert database.is_approved(digest) is False
+    database.close()
+
+    with pytest.raises(ValueError, match="plan is stale"):
+        DashboardData(config).approve_plan(42, "c" * 64)
+
+
+def test_approve_plan_refuses_oversized_plan(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    database = Database(config.database_path)
+    database.upsert_issue(
+        {
+            "number": 42,
+            "title": "Oversized feature",
+            "body": "Split me.",
+            "state": "OPEN",
+            "url": "https://example.test/issues/42",
+            "labels": [],
+        }
+    )
+    digest = "d" * 64
+    database.save_plan(
+        42,
+        digest,
+        {
+            "base_sha": "a" * 40,
+            "summary": "Too much for one delivery.",
+            "risk": "high",
+            "story_points": 21,
+            "jobs": [],
+        },
+    )
+    database.close()
+
+    with pytest.raises(ValueError, match="must be split"):
+        DashboardData(config).approve_plan(42, digest)
+
+
+def test_approve_http_action_requires_token_and_full_hash(tmp_path: Path) -> None:
+    config = replace(
+        ControllerConfig(),
+        state_dir=tmp_path,
+        github=GitHubConfig(project_number=3),
+    )
+    Database(config.database_path).close()
+    data = DashboardData(config)
+    calls = []
+    data.approve_plan = lambda number, plan_hash: calls.append(  # type: ignore[method-assign]
+        (number, plan_hash)
+    ) or {"created": True, "plan_hash": plan_hash}
+    server = DashboardHTTPServer(("127.0.0.1", 0), data, b"dashboard")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/issues/42/approve"
+    digest = "e" * 64
+    try:
+        denied = request.Request(
+            url,
+            data=json.dumps({"token": "wrong", "plan_hash": digest}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(error.HTTPError) as raised:
+            request.urlopen(denied, timeout=2)
+        assert raised.value.code == 403
+        assert calls == []
+
+        allowed = request.Request(
+            url,
+            data=json.dumps(
+                {"token": server.action_token, "plan_hash": digest}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(allowed, timeout=2) as response:
+            payload = json.loads(response.read())
+            assert response.status == 201
+        assert payload["approval"]["plan_hash"] == digest
+        assert calls == [(42, digest)]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_dashboard_html_keeps_split_creation_behind_operator_button() -> None:
     html = (
         Path(__file__).parents[1]
@@ -209,6 +356,25 @@ def test_dashboard_html_keeps_split_creation_behind_operator_button() -> None:
     assert "Split into ${proposedJobs.length} child issue" in html
     assert "Nothing has been created yet" in html
     assert "splitIssue(number)" in html
+
+
+def test_dashboard_html_presents_complete_plan_and_operator_approval() -> None:
+    html = (
+        Path(__file__).parents[1]
+        / "src"
+        / "alfred_code"
+        / "static"
+        / "dashboard.html"
+    ).read_text()
+
+    assert "Plan for approval" in html
+    assert "Acceptance criteria" in html
+    assert "Contracts changed" in html
+    assert "Verification" in html
+    assert "Approve ${issue.plan.story_points}-point plan" in html
+    assert "approvePlan(number, issue.plan.hash)" in html
+    assert "plan_hash: planHash" in html
+    assert "exact full-hash command" in html
 
 
 def test_codex_session_uses_last_cumulative_token_count(tmp_path: Path) -> None:
